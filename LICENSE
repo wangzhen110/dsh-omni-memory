@@ -1,48 +1,29 @@
+Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)
+
 全息记忆（Omni Memory）
-Copyright (c) 2026 wangzhen110 · https://github.com/wangzhen110/dsh-omni-memory
+Copyright (c) 2026 wangzhen110
+https://github.com/wangzhen110/dsh-omni-memory
 
-本作品采用「知识共享 署名-非商业性使用 4.0 国际 (CC BY-NC 4.0)」许可协议授权。
+本作品采用「知识共享 署名-非商业性使用 4.0 国际 (CC BY-NC 4.0)」授权。
 This work is licensed under the Creative Commons
-Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0).
+Attribution-NonCommercial 4.0 International License.
 
-协议全文：https://creativecommons.org/licenses/by-nc/4.0/legalcode
-License text: https://creativecommons.org/licenses/by-nc/4.0/legalcode
+协议全文 / License text: https://creativecommons.org/licenses/by-nc/4.0/legalcode
 
 ────────────────────────────────────────────────────────
 中文摘要（非正式，以文末英文法律文本为准）
 ────────────────────────────────────────────────────────
 
-✅ 你可以自由地：
-  1. 分享：复制、转载本作品（含源码与二进制）；
-  2. 修改：改编、重构、二次开发，甚至在此基础上做自己的分支；
-  3. 借鉴：学习其中的设计、算法、文档，用于你自己的项目。
+✅ 允许：使用、复制、修改、二次开发、借鉴、再分发（非商业）。
+🚫 禁止：任何商业用途，包括公司内部生产使用、付费服务、SaaS/托管、
+   外包交付、销售、出租、转售、收费分发、捆绑进付费产品/硬件/课程。
+⚠️ 必须署名：保留作者、项目链接、协议声明；修改需注明「已修改」；
+   不得暗示作者为你的产品或服务背书。
+署名写法见 ATTRIBUTION.md。
+如需商业授权，请先取得作者书面许可。
 
-🚫 但必须遵守两条底线：
-
-  ① 不得商用（NonCommercial）
-     不得将本作品或其修改版用于任何以商业利益为目的的用途，包括但不限于：
-     - 公司/组织内部的生产经营使用
-     - 对外提供付费服务、SaaS / 托管服务
-     - 商业咨询、外包交付
-     - 出售、出租、转售、收费分发
-     - 捆绑进硬件、课程、会员或其他付费产品
-     如需商业授权，请先取得作者书面许可。
-
-  ② 必须署名（Attribution）
-     任何使用、复制、修改、借鉴、分发，都必须保留并展示作者信息：
-     - 作者/项目：全息记忆 (Omni Memory) · wangzhen110
-     - 项目地址：https://github.com/wangzhen110/dsh-omni-memory
-     - 许可协议：CC BY-NC 4.0
-     - 若你做过修改，必须注明「已修改」
-     - 若你转载了源码，必须保留本 LICENSE 文件与源码中的版权声明
-
-具体署名写法见同目录 ATTRIBUTION.md（附可复制的模板）。
-
-⚠️ 其他说明
-  - 本作品按「现状」提供，不附带任何担保。
-  - 不得暗示作者为你的产品或服务背书。
-  - 本许可**不是** OSI 开源许可证（因含非商业限制），属于
-    「源码公开可读、仅限非商业使用」的公开许可。
+本许可不是 OSI 开源许可证（因含非商业限制），属于「源码公开可读、
+仅限非商业使用」的公开许可。
 
 ────────────────────────────────────────────────────────
 以下为 CC BY-NC 4.0 官方英文法律文本（具有法律效力）
