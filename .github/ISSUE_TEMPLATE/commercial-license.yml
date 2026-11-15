@@ -1,0 +1,60 @@
+name: 商业授权申请
+description: 申请「全息记忆 (Omni Memory)」的商业使用许可
+title: "[商业授权] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        本仓库采用 **CC BY-NC 4.0**：禁止商业使用。如需商业授权，请填写以下信息，
+        作者会通过你留下的联系方式回复授权范围与费用（一般 3 个工作日内）。
+
+        > 提示：请勿在 Issue 中填写身份证号、银行卡等敏感信息。
+
+  - type: input
+    id: company
+    attributes:
+      label: 公司 / 团队名称
+      placeholder: 例如：某某科技有限公司（个人商用可填「个人」）
+    validations:
+      required: true
+
+  - type: textarea
+    id: usage
+    attributes:
+      label: 使用场景
+      description: 越具体越好，例如：内部工具 / 对外 SaaS / 客户项目交付 / 二次开发后销售
+      placeholder: |
+        - 使用方式：在内部知识库系统中集成
+        - 是否修改源码：是 / 否
+        - 预计部署规模：50 人 / 1000 用户
+    validations:
+      required: true
+
+  - type: input
+    id: contact
+    attributes:
+      label: 联系方式
+      description: 邮箱或其他可联系到你的方式
+      placeholder: name@example.com
+    validations:
+      required: true
+
+  - type: dropdown
+    id: license-type
+    attributes:
+      label: 期望的授权类型
+      options:
+        - 一次性商业授权
+        - 按年订阅授权
+        - OEM / 嵌入产品
+        - 暂不确定，希望先沟通
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: agree
+    attributes:
+      label: 确认
+      options:
+        - label: 我理解在获得书面授权前，商业使用本项目属于违反 LICENSE 的行为
+          required: true

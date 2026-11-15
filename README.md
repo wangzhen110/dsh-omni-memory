@@ -126,9 +126,11 @@ https://github.com/wangzhen110/dsh-omni-memory · CC BY-NC 4.0
 ### 商业授权
 
 需要商业使用（公司内部生产经营、付费服务、SaaS/托管、外包交付、销售/转售/捆绑收费等）时，
-请先取得作者书面许可：
+请先取得作者书面许可。
 
-- **邮箱**：64271785@qq.com（标题请注明「商业授权 + 用途」）
-- **或在仓库开 Issue**：https://github.com/wangzhen110/dsh-omni-memory/issues
+**优先渠道（推荐）**：在仓库开 Issue，公开可追踪、回复更快
+https://github.com/wangzhen110/dsh-omni-memory/issues
+
+**备用渠道**：64271785@qq.com（标题请注明「商业授权 + 用途」）
 
 作者会在 3 个工作日内回复授权范围与费用。
