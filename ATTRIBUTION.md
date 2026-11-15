@@ -74,7 +74,8 @@ https://github.com/wangzhen110/dsh-omni-memory
 可以，只要**非商业**且**保留署名**。修改版也必须使用同样的 CC BY-NC 4.0 授权。
 
 **Q：商业授权怎么拿？**
-在 GitHub 仓库开 Issue 说明用途，或在项目主页联系作者取得书面许可。
+发邮件到 **64271785@qq.com**（标题写「商业授权 + 用途」），或在 GitHub 仓库开 Issue：
+https://github.com/wangzhen110/dsh-omni-memory/issues 。作者会回复授权范围与费用。
 
 ---
 
