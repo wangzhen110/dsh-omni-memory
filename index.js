@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: CC-BY-NC-4.0
+// © 2026 wangzhen110 · https://github.com/wangzhen110/dsh-omni-memory
+// NonCommercial use only; attribution required. See LICENSE and ATTRIBUTION.md.
 /**
  * Omni memory — host half.
  *

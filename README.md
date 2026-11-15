@@ -3,7 +3,7 @@
 > 给 DeepSeek Harness 的长期记忆内核：**只增不改的原文留底 + 会自我校验的结论 + 按项目分层 + 三路混合召回**。
 
 [![tests](https://img.shields.io/badge/tests-152%2F152-brightgreen)](#测试)
-[![license](https://img.shields.io/badge/license-personal%20use%20only-orange)](LICENSE)
+[![license](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)](LICENSE)
 
 ---
 
@@ -107,9 +107,19 @@ npm run bench:golden   # 黄金集
 
 ## 许可证
 
-**仅限个人自用（非开源）**，见 [LICENSE](LICENSE)。
+**CC BY-NC 4.0**（署名 · 非商业）— 不是 OSI 开源许可，但源码完全公开可用。
 
-- ✅ 可以：个人学习、研究、自用；修改源码给自己用；数据完全归你
-- ❌ 不可以：任何商业用途、出售/出租/转售、捆绑进付费产品、公开再分发
+- ✅ 可以：个人使用、学习、复制、修改、二次开发、借鉴设计，甚至发布你的修改版
+- 🚫 不可以：任何商业用途（含公司内部生产使用、付费服务、SaaS、外包交付、销售/转售/捆绑收费）
+- ⚠️ 必须：**署名作者**（保留作者、项目链接、协议声明；修改需注明「已修改」）
 
-本软件是「源码可见（source-available）」而非开源软件；商业授权需取得作者书面许可。
+最低署名写法（可直接复制）：
+
+```markdown
+基于「全息记忆 (Omni Memory)」by wangzhen110
+https://github.com/wangzhen110/dsh-omni-memory · CC BY-NC 4.0
+已修改
+```
+
+完整署名规则与更多模板见 [ATTRIBUTION.md](ATTRIBUTION.md)，法律文本见 [LICENSE](LICENSE)。
+商业授权需取得作者书面许可。
