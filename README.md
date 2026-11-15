@@ -2,6 +2,9 @@
 
 > 给 DeepSeek Harness 的长期记忆内核：**只增不改的原文留底 + 会自我校验的结论 + 按项目分层 + 三路混合召回**。
 
+> ⚠️ **许可提醒**：本项目采用 **CC BY-NC 4.0** —— 可自由使用、修改、二次开发、借鉴，
+> 但**禁止任何商业用途**，且**必须署名作者**。商用请走 [商业授权](#商业授权) 流程。
+
 [![tests](https://img.shields.io/badge/tests-152%2F152-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)](LICENSE)
 
