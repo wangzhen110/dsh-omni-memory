@@ -1,0 +1,104 @@
+全息记忆（Omni Memory）· 仅限个人自用许可协议 v1.0
+Omni Memory for DeepSeek Harness · Personal-Use-Only License v1.0
+
+版权所有 (c) 2026 Omni Memory 作者。保留所有权利。
+Copyright (c) 2026 Omni Memory authors. All rights reserved.
+
+────────────────────────────────────────────────────────
+一、授权范围（仅限个人自用）
+────────────────────────────────────────────────────────
+
+在遵守本协议全部条款的前提下，作者授予你一项**免费的、非独占的、不可转让的**许可，
+仅用于你**本人**的**非商业**用途：
+
+1. 下载、安装、运行本软件；
+2. 复制本软件到你本人的设备；
+3. 修改本软件及其源码，供你本人使用；
+4. 在你本人的设备上使用本软件生成的任何数据（全部数据归你所有）。
+
+────────────────────────────────────────────────────────
+二、明确禁止（未经作者书面许可，一律不可）
+────────────────────────────────────────────────────────
+
+1. **任何商业用途**：包括但不限于在公司/组织内部用于生产经营、对外提供付费服务、
+   作为 SaaS / 托管服务、用于商业咨询或交付项目、用于获利的内部工具。
+2. **出售、出租、转售**：不得以任何形式收费分发本软件或其修改版、衍生版。
+3. **捆绑销售**：不得将本软件（含修改版）作为商品、硬件、课程、会员或其他付费
+   产品/服务的一部分进行分发或以此获利。
+4. **公开再分发**：不得公开分发本软件或其修改版的源码或二进制包（通过 GitHub
+   Fork 进行的个人学习除外，且 Fork 同样受本协议约束）。
+5. **再授权**：不得将上述权利转授给任何第三方。
+6. **移除声明**：不得删除或隐藏本文件、版权声明及出处说明。
+
+────────────────────────────────────────────────────────
+三、数据与隐私
+────────────────────────────────────────────────────────
+
+本软件的数据全部保存在你本机。你对自己的数据拥有完全所有权，
+作者不收集、不上传、不访问你的任何数据。
+
+────────────────────────────────────────────────────────
+四、终止
+────────────────────────────────────────────────────────
+
+你违反本协议任一条款时，本许可**立即自动终止**，你必须停止使用并删除
+本软件的全部副本及其修改版。
+
+────────────────────────────────────────────────────────
+五、免责声明
+────────────────────────────────────────────────────────
+
+本软件按「现状」提供，不附带任何明示或默示的担保，包括但不限于适销性、
+特定用途适用性与不侵权担保。在任何情况下，作者均不对因使用本软件产生的
+任何直接、间接、偶然、特殊或后果性损失承担责任。
+
+────────────────────────────────────────────────────────
+六、性质说明
+────────────────────────────────────────────────────────
+
+本协议**不是**开源许可证，不满足 OSI 开源定义。本软件属于
+「源码可见（source-available）、仅限个人自用」。
+
+如需商业使用或其他授权，请先取得作者的书面许可。
+
+════════════════════════════════════════════════════════
+ENGLISH VERSION
+════════════════════════════════════════════════════════
+
+1. GRANT (PERSONAL, NON-COMMERCIAL USE ONLY)
+   Subject to this License, you are granted a free, non-exclusive,
+   non-transferable license to download, install, run, copy for your own
+   devices, and modify the Software, solely for your own personal,
+   non-commercial use.
+
+2. PROHIBITED WITHOUT PRIOR WRITTEN PERMISSION
+   (a) any commercial use, including internal production use by a company,
+       paid services, SaaS/hosting, consulting deliverables, or profit-making
+       internal tooling;
+   (b) selling, renting, sublicensing, or charging for the Software or any
+       modified version;
+   (c) bundling the Software with any paid product, hardware, course,
+       membership, or service;
+   (d) publicly redistributing the Software or any modified version in source
+       or binary form (personal study via a GitHub fork is tolerated and
+       remains bound by this License);
+   (e) transferring any of the above rights to a third party;
+   (f) removing or obscuring this License or any copyright notice.
+
+3. DATA
+   All data stays on your machine and belongs to you. The authors collect,
+   upload, and access none of it.
+
+4. TERMINATION
+   This License terminates automatically upon any violation. You must then
+   stop using the Software and delete all copies and modifications.
+
+5. DISCLAIMER
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+   OTHER LIABILITY ARISING FROM THE USE OF THE SOFTWARE.
+
+6. NATURE OF THIS LICENSE
+   This is NOT an open-source license and does not meet the OSI definition.
+   The Software is source-available and personal-use-only. For commercial
+   licensing, obtain prior written permission from the authors.

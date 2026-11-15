@@ -1,0 +1,55 @@
+{
+  "name": "@local/dsh-memory",
+  "version": "2.3.0",
+  "private": true,
+  "type": "module",
+  "description": "Omni memory for DeepSeek Harness: append-only transcripts, bi-temporal facts, self-verifying notes, hybrid retrieval, project scoping and an interactive star map.",
+  "license": "SEE LICENSE IN LICENSE",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "memory",
+    "knowledge-base",
+    "sqlite",
+    "rag",
+    "star-map"
+  ],
+  "main": "./index.js",
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "bench": "node bench/bench.mjs",
+    "bench:golden": "node bench/golden.mjs",
+    "check": "node --check index.js && node --check client.js && node --check lib/embed.mjs && node --check lib/embed-provider.mjs && node -e \"['package.json','locale/zh.json','locale/en.json'].forEach(f=>JSON.parse(require('fs').readFileSync(f,'utf8')))\""
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "docs"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

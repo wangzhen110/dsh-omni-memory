@@ -1,0 +1,3 @@
+- insert:
+    - id: memory-core
+      name: '@local/dsh-memory'

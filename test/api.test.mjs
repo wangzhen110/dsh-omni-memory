@@ -1,0 +1,172 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { boot, fakeReq, fakePost, fakePostConsumed, fakeRes } from './helpers.mjs';
+
+test('six loopback routes are registered', async () => {
+  const app = await boot();
+  const paths = app.routes.map(route => route.path).sort();
+  assert.deepEqual(paths, [
+    '/omni-memory/forget',
+    '/omni-memory/graph',
+    '/omni-memory/list',
+    '/omni-memory/node',
+    '/omni-memory/search',
+    '/omni-memory/status',
+  ]);
+});
+
+test('GET /omni-memory/list returns stats and rows', async () => {
+  const app = await boot();
+  await app.call('memory_write', { kind: 'note', text: '列表接口测试' });
+  const { res, state, json } = fakeRes();
+  await app.route('/omni-memory/list').handler(fakeReq('/omni-memory/list?limit=10'), res);
+  assert.equal(state.statusCode, 200);
+  const body = json();
+  assert.equal(body.ok, true);
+  assert.equal(body.stats.notes, 1);
+  assert.equal(body.notes.length, 1);
+  assert.match(body.notes[0].text, /列表接口测试/);
+});
+
+test('non-loopback callers are rejected with 403', async () => {
+  const app = await boot();
+  for (const path of ['/omni-memory/list', '/omni-memory/search?q=x', '/omni-memory/forget?kind=note&id=1']) {
+    const { res, state } = fakeRes();
+    await app.route(path.split('?')[0]).handler(fakeReq(path, '10.1.2.3'), res);
+    assert.equal(state.statusCode, 403);
+  }
+});
+
+test('GET /omni-memory/node returns a note body', async () => {
+  const app = await boot();
+  const written = await app.call('memory_write', { kind: 'note', text: '点星弹卡测试' });
+  const { res, state, json } = fakeRes();
+  await app.route('/omni-memory/node').handler(fakeReq(`/omni-memory/node?node=n:${written.value.id}`), res);
+  assert.equal(state.statusCode, 200);
+  assert.equal(json().node.text, '点星弹卡测试');
+});
+
+test('GET /omni-memory/node explains an entity through its facts', async () => {
+  const app = await boot();
+  await app.call('memory_write', {
+    kind: 'fact', text: '记忆插件 包含 星图', subject: '记忆插件', relation: '包含', object: '星图',
+  });
+  const { res, state, json } = fakeRes();
+  await app.route('/omni-memory/node').handler(
+    fakeReq(`/omni-memory/node?node=e:${encodeURIComponent('记忆插件')}`),
+    res,
+  );
+  assert.equal(state.statusCode, 200);
+  assert.equal(json().node.kind, 'entity');
+  assert.ok(json().node.facts.length >= 1);
+});
+
+test('GET /omni-memory/node rejects an unknown node', async () => {
+  const app = await boot();
+  const { res, state } = fakeRes();
+  await app.route('/omni-memory/node').handler(fakeReq('/omni-memory/node?node=n:999999'), res);
+  assert.equal(state.statusCode, 404);
+});
+
+test('GET /omni-memory/list lists workspaces that have no memories yet', async () => {
+  const { mkdtempSync, mkdirSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const path = await import('node:path');
+  const home = mkdtempSync(path.join(tmpdir(), 'omni-ws-'));
+  mkdirSync(path.join(home, 'sessions', '--C-Users-Test-~9879~76EE-memory-demo--'), { recursive: true });
+  const app = await boot({ home });
+  const { res, state, json } = fakeRes();
+  await app.route('/omni-memory/list').handler(fakeReq('/omni-memory/list'), res);
+  assert.equal(state.statusCode, 200);
+  const entry = json().projects.find(item => String(item.label ?? '').includes('memory-demo'));
+  assert.ok(entry, 'workspace should be listed even without rows');
+  assert.equal(entry.empty, true);
+  assert.equal(entry.notes, 0);
+});
+
+test('GET /omni-memory/list keeps real layers ahead of empty ones', async () => {
+  const { mkdtempSync, mkdirSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const path = await import('node:path');
+  const home = mkdtempSync(path.join(tmpdir(), 'omni-ws-order-'));
+  mkdirSync(path.join(home, 'sessions', '--C-Users-Test-~9879~76EE-empty-slot--'), { recursive: true });
+  const app = await boot({ home });
+  await app.call('memory_write', { kind: 'note', text: '带数据的项目', scope: 'proj:with-data#abc123' });
+  const { res, json } = fakeRes();
+  await app.route('/omni-memory/list').handler(fakeReq('/omni-memory/list'), res);
+  const body = json();
+  assert.ok(body.projectTotal >= 2);
+  assert.equal(body.projects[0].scope, 'proj:with-data#abc123');
+  assert.equal(body.projects[0].empty, undefined);
+});
+
+test('GET /omni-memory/search returns ranked hits', async () => {  const app = await boot();
+  await app.call('memory_write', { kind: 'note', text: '搜索接口能命中这句话' });
+  const { res, state, json } = fakeRes();
+  await app.route('/omni-memory/search').handler(fakeReq('/omni-memory/search?q=' + encodeURIComponent('命中这句话')), res);
+  assert.equal(state.statusCode, 200);
+  assert.equal(json().hits.length, 1);
+});
+
+test('D-04 POST forget works when the host already consumed the request body', async () => {
+  const app = await boot();
+  const written = await app.call('memory_write', { kind: 'note', text: '宿主已读空 body 的场景' });
+  const { res, state, json } = fakeRes();
+  await app.route('/omni-memory/forget').handler(
+    fakePostConsumed(`/omni-memory/forget?kind=note&id=${written.value.id}`),
+    res,
+  );
+  assert.equal(state.statusCode, 200);
+  assert.equal(json().forgotten, true);
+});
+
+test('D-04 POST /omni-memory/forget tombstones the row', async () => {
+  const app = await boot();
+  const written = await app.call('memory_write', { kind: 'note', text: '接口遗忘测试' });
+  const { res, state, json } = fakeRes();
+  await app.route('/omni-memory/forget').handler(
+    fakePost({ kind: 'note', id: written.value.id }, '127.0.0.1', `/omni-memory/forget?kind=note&id=${written.value.id}`),
+    res,
+  );
+  assert.equal(state.statusCode, 200);
+  assert.equal(json().forgotten, true);
+  const hit = await app.call('memory_search', { query: '接口遗忘测试' });
+  assert.equal(hit.value.hits.length, 0);
+});
+
+test('D-04 GET forget still works for older clients', async () => {
+  const app = await boot();
+  const written = await app.call('memory_write', { kind: 'note', text: '兼容路径' });
+  const { res, state, json } = fakeRes();
+  await app.route('/omni-memory/forget').handler(fakeReq(`/omni-memory/forget?kind=note&id=${written.value.id}`), res);
+  assert.equal(state.statusCode, 200);
+  assert.equal(json().forgotten, true);
+});
+
+test('D-04 POST forget without id returns 400', async () => {
+  const app = await boot();
+  const { res, state } = fakeRes();
+  await app.route('/omni-memory/forget').handler(fakePost({ kind: 'note' }), res);
+  assert.equal(state.statusCode, 400);
+});
+
+test('D-04 POST forget rejects a non-loopback caller before touching data', async () => {
+  const app = await boot();
+  const written = await app.call('memory_write', { kind: 'note', text: '远程遗忘尝试' });
+  const { res, state } = fakeRes();
+  await app.route('/omni-memory/forget').handler(
+    fakePost({ kind: 'note', id: written.value.id }, '192.168.1.9'),
+    res,
+  );
+  assert.equal(state.statusCode, 403);
+  const hit = await app.call('memory_search', { query: '远程遗忘尝试' });
+  assert.equal(hit.value.hits.length, 1);
+});
+
+test('GET /omni-memory/search without a query returns an empty list', async () => {
+  const app = await boot();
+  const { res, state, json } = fakeRes();
+  await app.route('/omni-memory/search').handler(fakeReq('/omni-memory/search'), res);
+  assert.equal(state.statusCode, 200);
+  assert.deepEqual(json().hits, []);
+});

@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Omni memory",
+    "description": "Long-term memory for DeepSeek Harness: append-only transcripts, bi-temporal facts, notes with provenance and revision history, and hybrid lexical + vector + graph retrieval fused with RRF. Six tools: write, search, profile, timeline, forget and dream verification, plus a Memory panel in the left navigation.",
+    "detail": "docs/DESIGN.md"
+  }
+}

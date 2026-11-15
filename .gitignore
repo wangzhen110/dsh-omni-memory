@@ -1,0 +1,12 @@
+node_modules/
+*.log
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+coverage/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
