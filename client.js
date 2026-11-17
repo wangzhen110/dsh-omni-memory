@@ -66,6 +66,8 @@ const EMPTY_HIGHLIGHT = [];
         exportNow: '导出',
         restore: '恢复',
         rollback: '反替代',
+        spinOn: '自转中',
+        spinOff: '已暂停',
         personaTitle: '设定',
         personaName: '称呼',
         personaPersonality: '性格',
@@ -142,6 +144,8 @@ const EMPTY_HIGHLIGHT = [];
         exportNow: 'Export',
         restore: 'Restore',
         rollback: 'Roll back',
+        spinOn: 'Spinning',
+        spinOff: 'Paused',
         personaTitle: 'Persona',
         personaName: 'Name',
         personaPersonality: 'Personality',
@@ -810,6 +814,14 @@ const EMPTY_HIGHLIGHT = [];
             return Boolean(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
           } catch { return false; }
         })();
+        const [spin, setSpin] = React.useState(() => {
+          try {
+            const saved = window.localStorage?.getItem('omni-spin');
+            if (saved === '1') return true;
+            if (saved === '0') return false;
+          } catch { /* private mode */ }
+          return !reduceMotion;
+        });
 
         const resize = () => {
           try {
@@ -1001,7 +1013,7 @@ const EMPTY_HIGHLIGHT = [];
               ctx.textAlign = 'start';
             }
 
-            if (!view.dragging && !reduceMotion) {
+            if (!view.dragging && spin) {
               view.yaw += view.vx;
               view.pitch = Math.max(-1.3, Math.min(1.3, view.pitch + view.vy));
               view.vx *= 0.985;
@@ -1023,7 +1035,7 @@ const EMPTY_HIGHLIGHT = [];
           window.removeEventListener('resize', resize);
           if (observer) observer.disconnect();
         };
-      }, [t, active, collapsed, fill]);
+      }, [t, active, collapsed, fill, spin]);
 
       const distanceToSegment = (px, py, x1, y1, x2, y2) => {
         const dx = x2 - x1;
@@ -1103,6 +1115,19 @@ const EMPTY_HIGHLIGHT = [];
               color: scope.key === active ? '#9fd8ff' : 'rgba(170,190,220,.85)',
             },
           }, `${scopeLabel(scope)} ${scope.facts + scope.notes}`)),
+          h('button', {
+            type: 'button',
+            onClick: () => setSpin(value => {
+              const next = !value;
+              try { window.localStorage?.setItem('omni-spin', next ? '1' : '0'); } catch { /* ignore */ }
+              return next;
+            }),
+            style: {
+              fontSize: 11, padding: '3px 10px', borderRadius: 999, cursor: 'pointer',
+              border: '1px solid rgba(90,120,190,.45)', background: 'rgba(8,12,24,.55)',
+              color: spin ? '#9fd8ff' : 'rgba(170,190,220,.85)',
+            },
+          }, spin ? t('spinOn') : t('spinOff')),
           fill ? null : h('button', {
             type: 'button',
             onClick: () => setCollapsed(value => !value),
