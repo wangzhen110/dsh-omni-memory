@@ -1133,22 +1133,97 @@ function rank(items) {
  * characters, so without this a two-character query degenerated into a full
  * table LIKE scan.
  */
+/**
+ * Bounded lexical candidates.
+ *
+ * `ORDER BY bm25(...)` forces SQLite to materialise the whole match list before
+ * returning the first row: at 1M notes one common term cost ~600ms even though
+ * the same MATCH without ranking answers in 0.1ms. Lexical retrieval is now two
+ * stages: bounded candidate generation (recent-window LIKE, unranked FTS sample,
+ * bigram index capped by owner id) followed by JS scoring. Window size is
+ * configurable; the window never replaces exact matches, it adds recent ones.
+ */
+const SEARCH_WINDOW = Math.max(1000, Number(process.env.OMNI_SEARCH_WINDOW ?? 20000));
+const FTS_SAMPLE = 120;
+const BIGRAM_SAMPLE = 200;
+
+/** Recent-window substring scan: bounded by window size, recency biased. */
+function recentWindowRows(db, table, terms, columns, filter, limit, extra = '') {
+  const clause = likeClause(columns, terms);
+  try {
+    const max = Number(db.prepare(`SELECT MAX(id) AS n FROM ${table}`).get()?.n ?? 0);
+    if (!max) return [];
+    return db.prepare(`
+      SELECT * FROM ${table}
+      WHERE id > ? AND deleted_at IS NULL ${extra} AND ${clause.sql} ${filter.sql}
+      ORDER BY id DESC LIMIT ?
+    `).all(max - SEARCH_WINDOW, ...clause.params, ...filter.params, Math.max(limit * 4, 16));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Sample matching rowids only.
+ *
+ * Joining the FTS table to the source table and filtering *after* the join made
+ * LIMIT ineffective whenever the filter rejected the first matches (a project
+ * scope can reject almost everything): SQLite then walked the whole doclist.
+ * Sampling rowids first bounds the cost to the sample size, and scope/active
+ * checks happen in JS on the fetched rows.
+ */
+function ftsRowIds(db, ftsTable, term, limit) {
+  const quoted = `"${String(term).replaceAll('"', '""')}"`;
+  try {
+    return db.prepare(`SELECT rowid FROM ${ftsTable} WHERE ${ftsTable} MATCH ? LIMIT ?`)
+      .all(quoted, limit)
+      .map(row => Number(row.rowid));
+  } catch {
+    return [];
+  }
+}
+
+/** Fetch rows by id with the active-state filter pushed into SQL. */
+function rowsByIds(db, table, ids, extraSql = '') {
+  if (!ids.length) return [];
+  const placeholders = ids.map(() => '?').join(',');
+  try {
+    return db.prepare(`SELECT * FROM ${table} WHERE id IN (${placeholders}) ${extraSql}`).all(...ids);
+  } catch {
+    return [];
+  }
+}
+
+/** The JS twin of scopeClause for rows fetched by id. */
+function scopeAllows(value, scope, nulls = true) {
+  if (!scope || scope === 'all') return true;
+  if (value === scope || value === 'global') return true;
+  return nulls && (value === null || value === undefined);
+}
+
+/**
+ * Two-character CJK lookup through the bigram index. The inner query walks the
+ * (gram, layer, owner_id) index backwards and stops after the sample size, so a
+ * gram that appears in every row still costs O(sample) instead of O(rows).
+ */
 function searchBigrams(s, layer, table, term, limit, filter, extra = '') {
   if (!CJK_BIGRAM.test(term)) return [];
   try {
     return s.db.prepare(`
-      SELECT t.* FROM bigrams b
-      JOIN ${table} t ON t.id = b.owner_id
-      WHERE b.layer = ? AND b.gram = ? AND t.deleted_at IS NULL ${extra} ${filter.sql}
-      ORDER BY t.id DESC LIMIT ?
-    `).all(layer, term, ...filter.params, limit);
+      SELECT t.* FROM (
+        SELECT owner_id FROM bigrams
+        WHERE layer = ? AND gram = ?
+        ORDER BY owner_id DESC LIMIT ?
+      ) b JOIN ${table} t ON t.id = b.owner_id
+      WHERE t.deleted_at IS NULL ${extra} ${filter.sql}
+      ORDER BY t.id DESC
+    `).all(layer, term, Math.max(BIGRAM_SAMPLE, limit * 4), ...filter.params);
   } catch {
     return [];
   }
 }
 
 function searchChunks(s, terms, limit, scope) {
-  const { db, ftsMode } = s;
   if (!terms.length) return [];
   const out = [];
   const seen = new Set();
@@ -1169,38 +1244,21 @@ function searchChunks(s, terms, limit, scope) {
     });
   };
 
-  if (ftsMode !== "like") {
-    const filter = scopeClause('c.scope', scope);
+  const filter = scopeClause('scope', scope);
+  for (const row of recentWindowRows(s.db, 'chunks', terms, ['text', 'source'], filter, limit)) push(row, 0.5);
+  if (s.fts.chunks) {
     const bigramFilter = scopeClause('t.scope', scope);
     for (const term of terms.slice(0, 5)) {
       if (term.length === 2 && CJK_BIGRAM.test(term)) {
-        const rows = searchBigrams(s, 'chunk', 'chunks', term, limit, bigramFilter);
-        for (const row of rows) push(row, 1);
+        for (const row of searchBigrams(s, 'chunk', 'chunks', term, limit, bigramFilter)) {
+          if (scopeAllows(row.scope, scope)) push(row, 1);
+        }
         continue;
       }
       if (term.length < 3) continue;
-      try {
-        const rows = db.prepare(`
-          SELECT c.*, bm25(chunks_fts) AS r
-          FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid
-          WHERE chunks_fts MATCH ? AND c.deleted_at IS NULL
-          ${filter.sql}
-          ORDER BY r LIMIT ?
-        `).all(`"${term.replaceAll('"', '""')}"`, ...filter.params, limit);
-        for (const row of rows) push(row, 1 / (1 + Math.abs(Number(row.r ?? 1))));
-      } catch { /* term not indexable, LIKE covers it */ }
+      const rows = rowsByIds(s.db, 'chunks', ftsRowIds(s.db, 'chunks_fts', term, FTS_SAMPLE), 'AND deleted_at IS NULL');
+      for (const row of rows) if (scopeAllows(row.scope, scope)) push(row, 0.8);
     }
-  }
-
-  if (out.length < limit) {
-    const clause = likeClause(['text', 'source'], terms);
-    const filter = scopeClause('scope', scope);
-    const rows = db.prepare(`
-      SELECT * FROM chunks
-      WHERE deleted_at IS NULL AND ${clause.sql} ${filter.sql}
-      ORDER BY importance DESC, ts DESC LIMIT ?
-    `).all(...clause.params, ...filter.params, limit);
-    for (const row of rows) push(row, 0);
   }
   return out;
 }
@@ -1227,38 +1285,23 @@ function searchNotes(s, terms, limit, scope) {
     if (!previous || candidate.score > previous.score) found.set(id, candidate);
   };
 
+  const filter = scopeClause('scope', scope, false);
+  for (const row of recentWindowRows(s.db, 'notes', terms, ['text', 'scope'], filter, limit, 'AND superseded_by IS NULL')) {
+    push(row, 0.5);
+  }
   if (s.fts.notes) {
-    const filter = scopeClause('n.scope', scope, false);
     const bigramFilter = scopeClause('t.scope', scope, false);
     for (const term of terms.slice(0, 6)) {
       if (term.length === 2 && CJK_BIGRAM.test(term)) {
-        const rows = searchBigrams(s, 'note', 'notes', term, limit, bigramFilter, 'AND t.superseded_by IS NULL');
-        for (const row of rows) push(row, 1);
+        for (const row of searchBigrams(s, 'note', 'notes', term, limit, bigramFilter, 'AND t.superseded_by IS NULL')) {
+          if (scopeAllows(row.scope, scope, false)) push(row, 1);
+        }
         continue;
       }
       if (term.length < 3) continue;
-      try {
-        const rows = s.db.prepare(`
-          SELECT n.*, bm25(notes_fts) AS r
-          FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid
-          WHERE notes_fts MATCH ? AND n.deleted_at IS NULL AND n.superseded_by IS NULL
-          ${filter.sql}
-          ORDER BY r LIMIT ?
-        `).all(`"${term.replaceAll('"', '""')}"`, ...filter.params, limit);
-        for (const row of rows) push(row, 1 / (1 + Math.abs(Number(row.r ?? 1))));
-      } catch { /* term not indexable */ }
+      const rows = rowsByIds(s.db, 'notes', ftsRowIds(s.db, 'notes_fts', term, FTS_SAMPLE), 'AND deleted_at IS NULL AND superseded_by IS NULL');
+      for (const row of rows) if (scopeAllows(row.scope, scope, false)) push(row, 0.8);
     }
-  }
-
-  if (found.size < limit) {
-    const clause = likeClause(['text', 'scope'], terms);
-    const filter = scopeClause('scope', scope, false);
-    const rows = s.db.prepare(`
-      SELECT * FROM notes
-      WHERE deleted_at IS NULL AND superseded_by IS NULL AND ${clause.sql} ${filter.sql}
-      ORDER BY importance DESC, ts DESC LIMIT ?
-    `).all(...clause.params, ...filter.params, limit);
-    for (const row of rows) push(row, 0);
   }
   return [...found.values()];
 }
@@ -1289,38 +1332,23 @@ function searchFacts(s, terms, limit, scope) {
     if (!previous || candidate.score > previous.score) found.set(id, candidate);
   };
 
+  const filter = scopeClause('scope', scope);
+  for (const row of recentWindowRows(s.db, 'facts', terms, ['text', 'subject', 'object'], filter, limit, 'AND valid_to IS NULL')) {
+    push(row, 0.5);
+  }
   if (s.fts.facts) {
-    const filter = scopeClause('f.scope', scope);
     const bigramFilter = scopeClause('t.scope', scope);
     for (const term of terms.slice(0, 6)) {
       if (term.length === 2 && CJK_BIGRAM.test(term)) {
-        const rows = searchBigrams(s, 'fact', 'facts', term, limit, bigramFilter, 'AND t.valid_to IS NULL');
-        for (const row of rows) push(row, 1);
+        for (const row of searchBigrams(s, 'fact', 'facts', term, limit, bigramFilter, 'AND t.valid_to IS NULL')) {
+          if (scopeAllows(row.scope, scope)) push(row, 1);
+        }
         continue;
       }
       if (term.length < 3) continue;
-      try {
-        const rows = s.db.prepare(`
-          SELECT f.*, bm25(facts_fts) AS r
-          FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid
-          WHERE facts_fts MATCH ? AND f.deleted_at IS NULL AND f.valid_to IS NULL
-          ${filter.sql}
-          ORDER BY r LIMIT ?
-        `).all(`"${term.replaceAll('"', '""')}"`, ...filter.params, limit);
-        for (const row of rows) push(row, 1 / (1 + Math.abs(Number(row.r ?? 1))));
-      } catch { /* term not indexable */ }
+      const rows = rowsByIds(s.db, 'facts', ftsRowIds(s.db, 'facts_fts', term, FTS_SAMPLE), 'AND deleted_at IS NULL AND valid_to IS NULL');
+      for (const row of rows) if (scopeAllows(row.scope, scope)) push(row, 0.8);
     }
-  }
-
-  if (found.size < limit) {
-    const clause = likeClause(['text', 'subject', 'object'], terms);
-    const filter = scopeClause('scope', scope);
-    const rows = s.db.prepare(`
-      SELECT * FROM facts
-      WHERE deleted_at IS NULL AND valid_to IS NULL AND ${clause.sql} ${filter.sql}
-      ORDER BY confidence DESC, valid_from DESC LIMIT ?
-    `).all(...clause.params, ...filter.params, limit);
-    for (const row of rows) push(row, 0);
   }
   return [...found.values()];
 }
@@ -1458,8 +1486,12 @@ function dreamRun(s, apply) {
 /** Vector route: cosine over the stored hashed n-gram vectors. */
 const VECTOR_MIN_COSINE = 0.2;
 const RRF_K = 60;
+// Vectors are scanned in JS. An unbounded scan over 1M rows reads gigabytes per
+// query, so the route samples the most recent vectors and adds lexical candidates.
+// A real ANN index is the next step, not a requirement for bounded latency.
+const VECTOR_SAMPLE = Math.max(1000, Number(process.env.OMNI_VECTOR_SAMPLE ?? 5000));
 
-async function vectorSearch(s, queryText, limit, scope) {
+async function vectorSearch(s, queryText, limit, scope, candidates = []) {
   const config = backendConfig();
   let dim = activeVectorDim();
   if (!dim && config.kind === 'remote') dim = await ensureRemoteDim(s);
@@ -1486,19 +1518,45 @@ async function vectorSearch(s, queryText, limit, scope) {
     { kind: 'chunk', table: 'chunks', nulls: true, extra: '' },
   ];
   const out = [];
+  const candidateIds = new Map();
+  for (const hit of candidates) {
+    if (!hit || !hit.kind) continue;
+    const list = candidateIds.get(hit.kind) ?? [];
+    if (list.length < 400) list.push(Number(hit.id));
+    candidateIds.set(hit.kind, list);
+  }
+  const collected = new Map();
   for (const spec of specs) {
-    let rows;
-    const filter = scopeClause('t.scope', scope, spec.nulls);
+    // Sample owner ids first: a JOIN with a scope filter does not stop at LIMIT
+    // when the filter rejects the first rows, so a project-scoped search used to
+    // read every vector in the table.
+    const sampleIds = [];
     try {
-      rows = s.db.prepare(`
-        SELECT v.owner_id AS owner_id, v.vec AS vec, t.*
-        FROM vectors v JOIN ${spec.table} t ON t.id = v.owner_id
-        WHERE v.kind = ? AND v.dim = ? AND t.deleted_at IS NULL ${spec.extra} ${filter.sql}
-      `).all(spec.kind, dim, ...filter.params);
-    } catch {
-      continue;
+      for (const row of s.db.prepare(`
+        SELECT owner_id FROM vectors WHERE kind = ? AND dim = ?
+        ORDER BY owner_id DESC LIMIT ?
+      `).all(spec.kind, dim, VECTOR_SAMPLE)) sampleIds.push(Number(row.owner_id));
+    } catch { /* no vectors */ }
+    const candidateIdsForKind = (candidateIds.get(spec.kind) ?? []).filter(id => Number.isFinite(id) && id > 0);
+    const ids = [...new Set([...sampleIds, ...candidateIdsForKind])];
+    const rows = [];
+    for (let offset = 0; offset < ids.length; offset += 500) {
+      const chunk = ids.slice(offset, offset + 500);
+      const placeholders = chunk.map(() => '?').join(',');
+      try {
+        for (const row of s.db.prepare(`
+          SELECT v.owner_id AS owner_id, v.vec AS vec, t.*
+          FROM vectors v JOIN ${spec.table} t ON t.id = v.owner_id
+          WHERE v.kind = ? AND v.dim = ? AND v.owner_id IN (${placeholders})
+            AND t.deleted_at IS NULL ${spec.extra}
+        `).all(spec.kind, dim, ...chunk)) rows.push(row);
+      } catch { /* skip chunk */ }
     }
     for (const row of rows) {
+      if (!scopeAllows(row.scope, scope, spec.nulls)) continue;
+      const key = `${spec.kind}:${row.owner_id}`;
+      if (collected.has(key)) continue;
+      collected.set(key, true);
       let score = 0;
       try { score = dot(queryVector, fromBlob(row.vec, dim)); } catch { continue; }
       if (!Number.isFinite(score) || score < VECTOR_MIN_COSINE) continue;
@@ -1697,19 +1755,37 @@ function graphExpand(s, hits, limit, scope) {
   return out.slice(0, limit);
 }
 
+let lastSearchProfile = null;
+
 async function runSearch(s, query, limit, scope) {  const terms = queryTerms(query);
-  const lexical = terms.length
-    ? rank([
-        ...searchNotes(s, terms, limit, scope),
-        ...searchFacts(s, terms, limit, scope),
-        ...searchChunks(s, terms, limit, scope),
-      ])
-    : [];
+  const profile = process.env.OMNI_PROFILE === '1'
+    ? { terms: terms.length, notes: 0, facts: 0, chunks: 0, lexical: 0, vector: 0, graph: 0 }
+    : null;
+  const timed = async (key, fn) => {
+    if (!profile) return fn();
+    const started = process.hrtime.bigint();
+    try {
+      return await fn();
+    } finally {
+      profile[key] = Number(process.hrtime.bigint() - started) / 1e6;
+    }
+  };
+  const notesHits = terms.length ? await timed('notes', () => searchNotes(s, terms, limit, scope)) : [];
+  const factsHits = terms.length ? await timed('facts', () => searchFacts(s, terms, limit, scope)) : [];
+  const chunksHits = terms.length ? await timed('chunks', () => searchChunks(s, terms, limit, scope)) : [];
+  const lexicalStarted = process.hrtime.bigint();
+  const lexical = terms.length ? rank([...notesHits, ...factsHits, ...chunksHits]) : [];
+  if (profile) profile.lexical = Number(process.hrtime.bigint() - lexicalStarted) / 1e6;
   // Diagnostic switch: OMNI_DISABLE_VECTOR=1 measures the lexical route alone.
   const useVector = process.env.OMNI_DISABLE_VECTOR !== '1';
   if (useVector) await flushPendingVectors(s);
-  const vector = useVector ? await vectorSearch(s, query, limit, scope) : [];
-  const graph = graphExpand(s, [...lexical, ...vector], Math.min(limit, 10), scope);
+  const vector = useVector ? await timed('vector', () => vectorSearch(s, query, limit, scope, lexical)) : [];
+  const graph = await timed('graph', () => graphExpand(s, [...lexical, ...vector], Math.min(limit, 10), scope));
+  if (profile) {
+    profile.hits = lexical.length + vector.length + graph.length;
+    profile.at = now();
+    lastSearchProfile = profile;
+  }
   if (!vector.length && !graph.length) return finalizeHits(lexical, limit);
 
   const fused = new Map();
@@ -2895,6 +2971,7 @@ function registerRoutes(ctx) {
         ok: true,
         autoRecall: autoRecallEnabled(),
         lastInjection,
+        lastSearch: lastSearchProfile,
         lastJudge,
         embedding: {
           kind: backendConfig().kind,

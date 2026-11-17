@@ -5,7 +5,7 @@
 > ⚠️ **许可提醒**：本项目采用 **CC BY-NC 4.0** —— 可自由使用、修改、二次开发、借鉴，
 > 但**禁止任何商业用途**，且**必须署名作者**。商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-179%2F179-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-181%2F181-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)](LICENSE)
 
 ---
@@ -44,7 +44,7 @@
 
 ```bash
 cd memory-core
-npm test          # 179 个用例
+npm test          # 181 个用例
 npm run check     # 语法与 JSON 校验
 ```
 
@@ -91,8 +91,8 @@ npm run check     # 语法与 JSON 校验
 
 ## 测试与指标
 
-- 自动化用例：**179 / 179 通过**
-- 检索延迟：10,000 行语料 p95 ≈ **4ms**；100,000 行 ≈ 93ms；1,000,000 行 ≈ 911ms（超出 300ms 预算，见 DESIGN NFR-01）
+- 自动化用例：**181 / 181 通过**
+- 检索延迟：10,000 行语料 p95 ≈ **2.2ms**；100,000 行 ≈ 5.8ms；1,000,000 行 ≈ 13.3ms；1M + 5 万向量 + 100 万 bigram ≈ 56ms（两段式有界检索，见 ADR-020）
 - 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 混合检索 **0.927**
 
 ```bash
@@ -110,9 +110,10 @@ npm run bench:golden   # 黄金集
 ## 文档
 
 - [设计规格](docs/DESIGN.md)（需求、架构、数据模型、契约、失败模式、追溯矩阵）
-- [架构决策记录](docs/ADR)（19 份）
+- [架构决策记录](docs/ADR)（20 份）
 - [威胁模型](docs/THREAT-MODEL.md)（信任边界、残余风险、新增路由检查清单）
 - 备份/恢复设计见 [ADR-019](docs/ADR/019-backup-restore.md)
+- 1M 行检索改造见 [ADR-020](docs/ADR/020-bounded-retrieval.md)
 - [更新日志](docs/CHANGELOG.md)
 - [架构图](docs/architecture.png)
 

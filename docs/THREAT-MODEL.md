@@ -32,7 +32,7 @@
 |---|---|---|
 | 网络来源读取 | 绑定 loopback + `isLoopback` 校验 | 所有路由 |
 | 浏览器 CSRF 删除 | 写操作仅 POST + `Origin`/`Host` 同源 + `x-omni-csrf: 1` | `mutationAllowed()` |
-| 跨项目读取 | `scope` 过滤 + 裸请求默认 global + 工具上下文解析 + 未知上下文 fail-closed | `scopeClause` / `projectForScope` |
+| 跨项目读取 | `scope` 过滤 + 裸请求默认 global + 工具上下文解析 + 未知上下文 fail-closed | `scopeClause` / `projectForScope`；FTS/向量采样后由 `scopeAllows` 在 JS 复核（ADR-020） |
 | 历史状态污染 | 活跃读取统一排除 `superseded_by` / `valid_to` | 搜索/画像/图/节点/列表 |
 | 模型空输出提升 scope | 空输出保留规则判定 | `flushJudge` |
 | 默认上传正文 | `OMNI_SCOPE_JUDGE` 默认 `off`，README 明示 | `judgeMode()` |
