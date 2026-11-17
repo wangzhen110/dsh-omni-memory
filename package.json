@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-memory",
-  "version": "3.1.1",
+  "version": "3.1.2",
   "private": true,
   "type": "module",
   "description": "Omni memory for DeepSeek Harness: append-only transcripts, bi-temporal facts, self-verifying notes, hybrid retrieval, project scoping and an interactive star map.",
@@ -23,7 +23,7 @@
     "test": "node --test \"test/*.test.mjs\"",
     "bench": "node bench/bench.mjs",
     "bench:golden": "node bench/golden.mjs",
-    "check": "node scripts/check-docs.mjs && node scripts/check-client-hooks.mjs && node --check index.js && node --check client.js && node --check client.js && node --check lib/embed.mjs && node --check lib/embed-provider.mjs && node -e \"['package.json','locale/zh.json','locale/en.json'].forEach(f=>JSON.parse(require('fs').readFileSync(f,'utf8')))\"",
+    "check": "node scripts/check-docs.mjs && node scripts/check-client-hooks.mjs && node --check index.js && node --check client.js && node scripts/check-client-load.mjs && node --check lib/embed.mjs && node --check lib/embed-provider.mjs && node -e \"['package.json','locale/zh.json','locale/en.json'].forEach(f=>JSON.parse(require('fs').readFileSync(f,'utf8')))\"",
     "check:docs": "node scripts/check-docs.mjs"
   },
   "exports": {

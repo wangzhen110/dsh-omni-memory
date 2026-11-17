@@ -2,6 +2,12 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.1.2] — 2026-11-17
+
+### 修复
+- **导航与面板一起消失**：v3.1.1 加错误边界时覆盖掉了 `const LocalizedView = withLocale(MemoryView);` 声明，`apply()` 里引用未定义变量抛错，客户端插件整体注册失败。
+- 恢复声明；新增 `scripts/check-client-load.mjs` 冒烟：在假 loader + 桩 slots/locale 里真正执行 `apply()`，能抓到未定义引用这类 `node --check` 发现不了的问题，已接入 `npm run check`。
+
 ## [3.1.1] — 2026-11-17
 
 ### 修复

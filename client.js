@@ -1391,9 +1391,8 @@ const EMPTY_HIGHLIGHT = [];
           }
         }
 
+        const LocalizedView = withLocale(MemoryView);
         const BoundedView = props => h(PanelBoundary, null, h(LocalizedView, props));
-        const LocalizedView2 = LocalizedView;
-        void LocalizedView2;
         const LocalizedTail = withLocale(MemoryTail);
 
         ctx.effect(() => ctx.slots.inject('main', () => ctx.slots.register({
