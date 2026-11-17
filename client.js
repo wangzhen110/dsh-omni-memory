@@ -794,6 +794,19 @@ const EMPTY_HIGHLIGHT = [];
       const [active, setActive] = React.useState('global');
       const [collapsed, setCollapsed] = React.useState(false);
       const [broken, setBroken] = React.useState('');
+      const reduceMotion = (() => {
+        try {
+          return Boolean(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+        } catch { return false; }
+      })();
+      const [spin, setSpin] = React.useState(() => {
+        try {
+          const saved = window.localStorage?.getItem('omni-spin');
+          if (saved === '1') return true;
+          if (saved === '0') return false;
+        } catch { /* private mode */ }
+        return !reduceMotion;
+      });
 
       React.useEffect(() => {
         let alive = true;
@@ -828,20 +841,6 @@ const EMPTY_HIGHLIGHT = [];
           setBroken('canvas-2d-unavailable');
           return undefined;
         }
-
-        const reduceMotion = (() => {
-          try {
-            return Boolean(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
-          } catch { return false; }
-        })();
-        const [spin, setSpin] = React.useState(() => {
-          try {
-            const saved = window.localStorage?.getItem('omni-spin');
-            if (saved === '1') return true;
-            if (saved === '0') return false;
-          } catch { /* private mode */ }
-          return !reduceMotion;
-        });
 
         const resize = () => {
           try {
@@ -1365,13 +1364,42 @@ const EMPTY_HIGHLIGHT = [];
           return h(Component, { ...props, t });
         };
 
-        const LocalizedView = withLocale(MemoryView);
+        class PanelBoundary extends React.Component {
+          constructor(props) {
+            super(props);
+            this.state = { error: null };
+          }
+
+          static getDerivedStateFromError(error) {
+            return { error };
+          }
+
+          render() {
+            if (this.state.error) {
+              return h('div', {
+                style: {
+                  padding: 16, color: '#ffb4a8', background: '#0a0d16',
+                  fontFamily: 'system-ui, sans-serif', fontSize: 12, lineHeight: 1.6,
+                },
+              }, [
+                '全息记忆面板渲染失败：' + String(this.state.error?.message ?? this.state.error),
+                h('div', { key: 'hint', style: { marginTop: 8, opacity: 0.7 } },
+                  '先按 Ctrl+R 刷新；如果仍出现，把这段文字发给我。'),
+              ]);
+            }
+            return this.props.children;
+          }
+        }
+
+        const BoundedView = props => h(PanelBoundary, null, h(LocalizedView, props));
+        const LocalizedView2 = LocalizedView;
+        void LocalizedView2;
         const LocalizedTail = withLocale(MemoryTail);
 
         ctx.effect(() => ctx.slots.inject('main', () => ctx.slots.register({
           name: 'main',
           key: NS,
-        }, LocalizedView)), 'omni-memory: main panel');
+        }, BoundedView)), 'omni-memory: main panel');
 
         ctx.effect(() => ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
           name: 'conversation.composer.dock',

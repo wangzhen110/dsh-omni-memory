@@ -2,6 +2,13 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.1.1] — 2026-11-17
+
+### 修复
+- **面板白屏**：`React.useState` 被误写进星图的 `useEffect` 回调（无效 Hook 调用，挂载即抛错）。已移到组件顶层。
+- 新增面板错误边界：渲染异常时显示错误文本与刷新提示，而不是白屏。
+- 新增 `scripts/check-client-hooks.mjs` 并接入 `npm run check`：扫描 `useEffect` 体内是否出现 Hook 调用，防止同类问题再次发布。
+
 ## [3.1.0] — 2026-11-17
 
 ### 设定改为自动提炼（ADR-026 修订）
