@@ -549,8 +549,9 @@ function indexBigrams(db, layer, id, text) {
 const BIGRAM_BACKFILL_BATCH = 10_000;
 
 function backfillBigrams(db, options = {}) {
+  const report = { scanned: 0, remaining: false };
   try {
-    if (!options.force && metaGet(db, 'bigrams_version') === String(SCHEMA_VERSION)) return;
+    if (!options.force && metaGet(db, 'bigrams_version') === String(SCHEMA_VERSION)) return report;
     const limit = Math.max(1, Number(options.limit ?? BIGRAM_BACKFILL_BATCH));
     let remaining = false;
     for (const [layer, table] of [['note', 'notes'], ['fact', 'facts'], ['chunk', 'chunks']]) {
@@ -564,12 +565,43 @@ function backfillBigrams(db, options = {}) {
       `).all(cursor, limit);
       if (!rows.length) continue;
       for (const row of rows) indexBigrams(db, layer, row.id, row.text);
+      report.scanned += rows.length;
       cursor = Number(rows[rows.length - 1].id);
       metaSet(db, cursorKey, cursor);
       if (rows.length >= limit) remaining = true;
     }
     if (!remaining) metaSet(db, 'bigrams_version', SCHEMA_VERSION);
+    report.remaining = remaining;
   } catch { /* backfill is best effort */ }
+  return report;
+}
+
+/**
+ * Full rebuild of the CJK bigram index.
+ *
+ * Opening a large legacy database only backfills one batch per layer, so a big
+ * store needed many restarts before 2-character search was complete. This walks
+ * the whole corpus in batches inside one call; it is explicit (never on open)
+ * because it rewrites a derived index and can take a while on a large store.
+ */
+function reindexBigrams(s, options = {}) {
+  const { db } = s;
+  const limit = Math.max(1000, Math.min(50_000, Number(options.limit ?? BIGRAM_BACKFILL_BATCH)));
+  transaction(db, () => {
+    db.exec('DELETE FROM bigrams');
+    for (const layer of ['note', 'fact', 'chunk']) metaSet(db, `bigrams_cursor_${layer}`, 0);
+    metaSet(db, 'bigrams_version', '0');
+  });
+  let scanned = 0;
+  let passes = 0;
+  let report = { remaining: true, scanned: 0 };
+  while (report.remaining && passes < 10_000) {
+    report = backfillBigrams(db, { limit });
+    scanned += report.scanned;
+    passes += 1;
+    if (!report.scanned) break;
+  }
+  return { scanned, passes, done: !report.remaining };
 }
 
 /**
@@ -2301,27 +2333,33 @@ function defineTools(ctx) {
 
   disposers.push(ctx.tools.register({
     name: 'memory_reindex',
-    description: 'Rebuild missing vectors for the active embedding backend. Use after switching OMNI_EMBED_URL/model or restoring an old database.',
+    description: 'Rebuild derived indexes. Vectors: backfill for the active embedding backend (after switching OMNI_EMBED_URL/model or restoring an old database). bigrams: rebuild the whole CJK two-character index in one call (a large legacy store otherwise needs many restarts).',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        limit: { type: 'number', description: 'Maximum rows to process this call, default 200, max 1000.' },
+        limit: { type: 'number', description: 'Maximum vector rows to process this call, default 200, max 1000.' },
+        bigrams: { type: 'boolean', description: 'true rebuilds the entire CJK bigram index (explicit, can take a while on large stores).' },
+        vectors: { type: 'boolean', description: 'With bigrams: also run the vector backfill in the same call.' },
       },
     },
     output: {
-      schema: { type: 'object', properties: { processed: { type: 'number' }, queued: { type: 'number' }, backend: { type: 'string' } } },
-      render: (_args, value) => textBlock(`reindexed ${value.processed} rows (${value.backend}${value.queued ? `, ${value.queued} queued` : ''})`),
+      schema: { type: 'object', properties: { processed: { type: 'number' }, queued: { type: 'number' }, backend: { type: 'string' }, bigrams: { type: 'object' } } },
+      render: (_args, value) => textBlock(`reindexed ${value.processed} rows (${value.backend}${value.queued ? `, ${value.queued} queued` : ''})${value.bigrams ? `; bigrams ${value.bigrams.scanned} in ${value.bigrams.passes} pass(es)` : ''}`),
     },
     async execute(args = {}) {
       const s = openStore();
+      const bigrams = args.bigrams === true ? reindexBigrams(s) : null;
       const config = backendConfig();
       const limit = Math.min(1000, Math.max(1, Number(args.limit ?? 200)));
+      if (args.bigrams === true && args.vectors !== true) {
+        return { processed: 0, queued: 0, backend: config.kind, bigrams };
+      }
       if (config.kind === 'hashed') {
         const before = Number(s.db.prepare('SELECT COUNT(*) AS n FROM vectors').get().n);
         backfillVectors(s.db);
         const after = Number(s.db.prepare('SELECT COUNT(*) AS n FROM vectors').get().n);
-        return { processed: Math.max(0, after - before), queued: 0, backend: 'hashed' };
+        return { processed: Math.max(0, after - before), queued: 0, backend: 'hashed', ...(bigrams ? { bigrams } : {}) };
       }
       const dim = await ensureRemoteDim(s);
       if (!dim) throw new Error('remote embedding endpoint did not return a dimension');
@@ -2335,7 +2373,7 @@ function defineTools(ctx) {
         if (after >= before) break;
         processed += before - after;
       }
-      return { processed, queued: pendingVectors.size, backend: `remote:${dim}` };
+      return { processed, queued: pendingVectors.size, backend: `remote:${dim}`, ...(bigrams ? { bigrams } : {}) };
     },
   }));
 
