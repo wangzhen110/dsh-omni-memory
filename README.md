@@ -5,7 +5,7 @@
 > ⚠️ **许可提醒**：本项目采用 **CC BY-NC 4.0** —— 可自由使用、修改、二次开发、借鉴，
 > 但**禁止任何商业用途**，且**必须署名作者**。商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-152%2F152-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-163%2F163-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)](LICENSE)
 
 ---
@@ -24,13 +24,13 @@
 
 ## 核心能力
 
-- **混合检索**：词面（FTS5 trigram + 中文二元切分）+ 向量（512 维字符 n-gram，可选接真语义嵌入）+ 图游走，RRF 融合排序
+- **混合检索**：词面（FTS5 trigram + 中文二元索引）+ 向量（512 维字符 n-gram，可选接真语义嵌入）+ 图游走，RRF 融合排序
 - **自动召回**：每轮用你的消息预取 top-3 注入上下文（可关）
-- **模型复核归类**：写入先按规则落层，后台让模型复核，判错自动迁移并留痕
-- **冲突标记**：显式声明或近重复自动标记 `contested`，只标记不删除
+- **模型复核归类（可选）**：写入先按规则落层；显式开启后，后台让模型复核，判错自动迁移并留痕。默认关闭，不把正文发给外部模型
+- **冲突标记**：显式声明或近重复自动标记 `contested`，只标记不删除；画像与自动召回默认排除 contested
 - **做梦校验**：离线拿转录核对笔记，发现"与原文矛盾"时用证据生成替代笔记并保留旧行
 - **记忆星图**：整屏旋臂星系，拖拽旋转/滚轮缩放/分层切换；**单击任意星点弹出记忆卡**，搜索命中会亮起脉冲光环
-- **隐私**：全部数据在本地 SQLite（`$DSH_HOME/memory/omni.db`），HTTP 只监听 loopback
+- **隐私**：全部数据在本地 SQLite（`$DSH_HOME/memory/omni.db`），HTTP 只监听 loopback；写操作只接受 POST 并校验 Origin/CSRF 头
 
 ## 安装
 
@@ -42,7 +42,7 @@
 
 ```bash
 cd memory-core
-npm test          # 147 个用例
+npm test          # 163 个用例
 npm run check     # 语法与 JSON 校验
 ```
 
@@ -55,7 +55,7 @@ npm run check     # 语法与 JSON 校验
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `OMNI_AUTO_RECALL` | 开 | `0` 关闭每轮自动召回 |
-| `OMNI_SCOPE_JUDGE` | `always` | 模型复核归类：`off` / `auto` / `always` |
+| `OMNI_SCOPE_JUDGE` | `off` | 模型复核归类：`off` / `auto` / `always`；开启后写入正文会发给复核模型 |
 | `OMNI_JUDGE_PROVIDER` / `OMNI_JUDGE_MODEL` | 自动 | 指定复核用的模型 |
 | `OMNI_EMBED_URL` | 未设置 | 接 OpenAI 兼容 `/embeddings` 启用真语义 |
 | `OMNI_EMBED_MODEL` | `text-embedding-3-small` | 远程嵌入模型 |
@@ -76,18 +76,19 @@ npm run check     # 语法与 JSON 校验
 | `memory_forget` | 墓碑化一条记忆 |
 | `memory_dream` | 拿转录核对笔记（默认 dry-run） |
 | `memory_compact` | 转录增长治理（默认 dry-run） |
+| `memory_reindex` | 回填缺失向量（hashed / remote 两种后端均可） |
 
 ## 数据与隐私
 
-- 数据文件：`$DSH_HOME/memory/omni.db`（SQLite WAL，单文件，备份即复制）
-- 所有 HTTP 路由仅绑定 loopback，非本机请求返回 403
-- 不主动上传任何内容；只有你显式配置 `OMNI_EMBED_URL` 时，文本才会发送到该嵌入端点
+- 数据文件：`$DSH_HOME/memory/omni.db`（SQLite WAL，单文件，备份即复制；**默认明文落盘，未加密**）
+- 所有 HTTP 路由仅绑定 loopback，非本机请求返回 403；写操作只接受 POST，并校验 `Origin` 与 `x-omni-csrf` 头
+- 不主动上传任何内容；只有你显式配置 `OMNI_EMBED_URL` 时，文本才会发送到该嵌入端点；`OMNI_SCOPE_JUDGE` 默认 `off`，不会把写入正文发给模型
 
 ## 测试与指标
 
-- 自动化用例：**147 / 147 通过**
-- 检索延迟：10,000 行语料 p95 ≈ **10ms**
-- 黄金集（20 语料 / 24 问题）：词面 MRR 0.79 → 混合检索 **0.93**
+- 自动化用例：**163 / 163 通过**
+- 检索延迟：10,000 行语料 p95 ≈ **4ms**；100,000 行 ≈ 93ms；1,000,000 行 ≈ 911ms（超出 300ms 预算，见 DESIGN NFR-01）
+- 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 混合检索 **0.927**
 
 ```bash
 npm test
@@ -104,7 +105,7 @@ npm run bench:golden   # 黄金集
 ## 文档
 
 - [设计规格](docs/DESIGN.md)（需求、架构、数据模型、契约、失败模式、追溯矩阵）
-- [架构决策记录](docs/ADR)（13 份）
+- [架构决策记录](docs/ADR)（17 份）
 - [更新日志](docs/CHANGELOG.md)
 - [架构图](docs/architecture.png)
 

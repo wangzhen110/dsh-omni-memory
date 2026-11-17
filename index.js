@@ -48,8 +48,9 @@ let store;
 const SCOPE_GLOBAL = 'global';
 const cwdBySession = new Map();
 const projectByAgent = new Map();
-let lastProjectAny = null;
 let lastClaimAt = 0;
+const MAX_PENDING_VECTORS = 4096;
+const REMOTE_PROBE_TEXT = 'omni-memory embedding dimension probe';
 
 function fnv1a(text) {
   let hash = 0x811c9dc5;
@@ -146,10 +147,11 @@ function classifyScope(text, project) {
   return { scope: project, reason: 'default-to-project', confidence: 0.55 };
 }
 
-function decideScope(explicit, text) {
+function decideScope(explicit, text, project = currentProject()) {
   const given = String(explicit ?? '').trim();
-  if (given) return { scope: given, reason: 'explicit', confidence: 1 };
-  return classifyScope(text, currentProject());
+  if (given === 'all') throw new Error('scope=all is read-only; choose global or a project scope');
+  if (given) return { scope: given === SCOPE_GLOBAL ? SCOPE_GLOBAL : given, reason: 'explicit', confidence: 1 };
+  return classifyScope(text, project);
 }
 
 /**
@@ -158,16 +160,17 @@ function decideScope(explicit, text) {
  * Rules are cheap but keyword-blind; the host `llm` service can do better. Writes
  * never wait for it: the row lands immediately under the rule's verdict and a
  * background call re-checks ambiguous cases, moving the row when the model
- * disagrees. Mode: OMNI_SCOPE_JUDGE=off|auto|always (default auto = ambiguous only).
+ * disagrees. Mode: OMNI_SCOPE_JUDGE=off|auto|always (default off = no upload).
  */
 const judgeQueue = [];
+const MAX_JUDGE_QUEUE = 256;
 let judgeBusy = false;
 let lastJudge = null;
 
 function judgeMode() {
-  // Default is `always`: the user opted into model judgement for every write.
-  // `auto` keeps the old "only when unsure" behaviour.
-  return String(process.env.OMNI_SCOPE_JUDGE ?? 'always');
+  // Default is `off`: memory writes must not upload their body to a model
+  // unless the user explicitly opts in with OMNI_SCOPE_JUDGE=auto|always.
+  return String(process.env.OMNI_SCOPE_JUDGE ?? 'off');
 }
 
 async function pickJudgeRoute(llm) {
@@ -187,6 +190,10 @@ function enqueueJudge(ctx, item) {
   // Without a project there is no layer choice to make.
   if (!item.project) return;
   if (mode === 'auto' && Number(item.confidence ?? 0) >= 0.8) return;
+  // Never grow an unbounded queue when the host has no llm service or the
+  // user is offline. A dropped job keeps the rule verdict, which is safe.
+  if (judgeQueue.length >= MAX_JUDGE_QUEUE) return;
+  if (!ctx || typeof ctx.get !== 'function' || !ctx.get('llm')) return;
   judgeQueue.push(item);
   void flushJudge(ctx);
 }
@@ -222,8 +229,10 @@ async function flushJudge(ctx) {
           else if (chunk?.type === 'finish') break;
         }
         clearTimeout(timer);
-        const wantsProject = /project|项目/i.test(out);
-        const verdict = wantsProject ? (item.project ?? 'global') : 'global';
+        // An empty answer is not "global". It is a failed judgement: keep the
+        // rule's verdict rather than silently promoting a project note.
+        const answer = out.trim();
+        const verdict = answer ? (/(?:project|项目)/i.test(answer) ? (item.project ?? SCOPE_GLOBAL) : SCOPE_GLOBAL) : item.scope;
         const moved = verdict !== item.scope;
         if (moved) {
           const s = openStore();
@@ -242,9 +251,11 @@ async function flushJudge(ctx) {
   }
 }
 
-function currentProject() {
-  const project = lastInjection.project;
-  return project && project !== SCOPE_GLOBAL ? project : null;
+function currentProject(context = null) {
+  const raw = context?.agent?.id ?? context?.session?.id ?? context?.scope?.id ?? context?.scope ?? '';
+  const id = String(raw ?? '').trim();
+  if (!id) return null;
+  return projectForScope({ id });
 }
 
 /**
@@ -259,7 +270,6 @@ function currentProject() {
 const AUTO_RECALL_TTL_MS = 120_000;
 const lastUserByAgent = new Map();
 const recallByAgent = new Map();
-let lastRecallAny = null;
 let lastInjection = { at: 0, chars: 0, recall: 0, auto: false };
 
 function autoRecallEnabled() {
@@ -295,7 +305,6 @@ function openStore() {
       importance REAL NOT NULL DEFAULT 0.5,
       deleted_at INTEGER
     );
-    CREATE UNIQUE INDEX IF NOT EXISTS chunks_hash ON chunks(hash);
 
     CREATE TABLE IF NOT EXISTS notes (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -318,6 +327,7 @@ function openStore() {
       text TEXT NOT NULL,
       valid_from INTEGER NOT NULL,
       valid_to INTEGER,
+      recorded_at INTEGER,
       confidence REAL NOT NULL DEFAULT 0.7,
       source TEXT,
       contested INTEGER NOT NULL DEFAULT 0,
@@ -337,8 +347,17 @@ function openStore() {
       dst TEXT NOT NULL,
       valid_from INTEGER NOT NULL,
       valid_to INTEGER,
+      scope TEXT,
       source TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS bigrams (
+      layer TEXT NOT NULL,
+      owner_id INTEGER NOT NULL,
+      gram TEXT NOT NULL,
+      PRIMARY KEY (layer, owner_id, gram)
+    );
+    CREATE INDEX IF NOT EXISTS bigrams_gram ON bigrams(gram, layer, owner_id);
   `);
 
   // Trigram tokenisation is what makes CJK substring recall work; fall back to
@@ -367,6 +386,8 @@ function openStore() {
   const schemaVersion = migrate(db);
   if (notesMode) backfillFts(db, 'notes_fts', 'notes');
   if (factsMode) backfillFts(db, 'facts_fts', 'facts');
+  backfillBigrams(db);
+  restoreRemoteState(db);
   backfillVectors(db);
 
   db.prepare('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)').run('fts_mode', ftsMode);
@@ -379,7 +400,7 @@ function openStore() {
   return store;
 }
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 function columnExists(db, table, column) {
   try {
@@ -442,6 +463,49 @@ const MIGRATIONS = [
       } catch { /* column may be absent on very old databases */ }
     }
   },
+  // v7: revision-aware chunks and scoped edges.
+  //
+  // The old global UNIQUE(hash) index made a compacted chunk impossible to
+  // re-capture and made identical text in two projects collide. Deduplicate only
+  // among *active* rows in the same scope; tombstoned rows stay as audit history.
+  // Edges also need the fact scope, otherwise graph traversal can cross projects
+  // even after fact filters were added.
+  db => {
+    try { db.exec('DROP INDEX IF EXISTS chunks_hash'); } catch { /* absent */ }
+    try {
+      db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS chunks_hash_active
+        ON chunks(hash, IFNULL(scope, 'global'))
+        WHERE deleted_at IS NULL
+      `);
+    } catch { /* best effort; insertChunk still guards duplicates */ }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS bigrams (
+        layer TEXT NOT NULL,
+        owner_id INTEGER NOT NULL,
+        gram TEXT NOT NULL,
+        PRIMARY KEY (layer, owner_id, gram)
+      );
+      CREATE INDEX IF NOT EXISTS bigrams_gram ON bigrams(gram, layer, owner_id);
+    `);
+    addColumn(db, 'edges', 'scope', 'TEXT');
+    try {
+      db.exec(`
+        UPDATE edges
+        SET scope = (
+          SELECT f.scope FROM facts f
+          WHERE f.subject = edges.src AND f.relation = edges.rel AND f.object = edges.dst
+          ORDER BY f.valid_from DESC LIMIT 1
+        )
+        WHERE scope IS NULL
+      `);
+    } catch { /* legacy rows may not line up; null remains visible as global */ }
+    for (const [table, column, type] of [
+      ['facts', 'recorded_at', 'INTEGER'],
+    ]) {
+      addColumn(db, table, column, type);
+    }
+  },
 ];
 
 function migrate(db) {
@@ -470,6 +534,134 @@ function backfillFts(db, ftsTable, sourceTable) {
   } catch { /* backfill is best effort */ }
 }
 
+const CJK_BIGRAM = /^[\u4e00-\u9fff]{2}$/;
+
+/** Keep the two-character CJK index in sync with one source row. */
+function indexBigrams(db, layer, id, text) {
+  try {
+    const grams = [...new Set(tokenize(text).filter(token => CJK_BIGRAM.test(token)))];
+    db.prepare('DELETE FROM bigrams WHERE layer = ? AND owner_id = ?').run(layer, Number(id));
+    const insert = db.prepare('INSERT OR IGNORE INTO bigrams(layer, owner_id, gram) VALUES (?, ?, ?)');
+    for (const gram of grams) insert.run(layer, Number(id), gram);
+  } catch { /* optional index */ }
+}
+
+const BIGRAM_BACKFILL_BATCH = 10_000;
+
+function backfillBigrams(db, options = {}) {
+  try {
+    if (!options.force && metaGet(db, 'bigrams_version') === String(SCHEMA_VERSION)) return;
+    const limit = Math.max(1, Number(options.limit ?? BIGRAM_BACKFILL_BATCH));
+    let remaining = false;
+    for (const [layer, table] of [['note', 'notes'], ['fact', 'facts'], ['chunk', 'chunks']]) {
+      const cursorKey = `bigrams_cursor_${layer}`;
+      let cursor = options.force ? 0 : Number(metaGet(db, cursorKey) ?? 0);
+      if (options.force) metaSet(db, cursorKey, 0);
+      const rows = db.prepare(`
+        SELECT id, text FROM ${table}
+        WHERE deleted_at IS NULL AND id > ?
+        ORDER BY id LIMIT ?
+      `).all(cursor, limit);
+      if (!rows.length) continue;
+      for (const row of rows) indexBigrams(db, layer, row.id, row.text);
+      cursor = Number(rows[rows.length - 1].id);
+      metaSet(db, cursorKey, cursor);
+      if (rows.length >= limit) remaining = true;
+    }
+    if (!remaining) metaSet(db, 'bigrams_version', SCHEMA_VERSION);
+  } catch { /* backfill is best effort */ }
+}
+
+/**
+ * Vector indexing entry point.
+ *
+ * The hashed backend writes synchronously (microseconds). The remote backend
+ * needs the network, so rows are queued and flushed lazily before the next
+ * search: writes never block a turn, and retrieval never waits for a batch that
+ * a failed request left behind.
+ */
+const pendingVectors = new Map();
+let remoteDim = 0;
+let remoteSignatureValue = '';
+let remoteProbeFailedAt = 0;
+const REMOTE_PROBE_COOLDOWN_MS = 60_000;
+
+function metaGet(db, key) {
+  try {
+    return db.prepare('SELECT value FROM meta WHERE key = ?').get(key)?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function metaSet(db, key, value) {
+  try {
+    db.prepare('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)').run(key, String(value));
+  } catch { /* meta is best effort */ }
+}
+
+function remoteSignature(config = backendConfig()) {
+  if (config.kind !== 'remote') return '';
+  return hash(`${config.url}\u0000${config.model}`).slice(0, 16);
+}
+
+/**
+ * Remote dimensions are a property of the endpoint/model, not of the process.
+ * Persisting them is what makes a restart keep the vector route alive. A model
+ * or URL change starts a new signature; old vectors remain on disk as history
+ * but the active dimension is rebuilt from the new backend.
+ */
+function restoreRemoteState(db) {
+  const config = backendConfig();
+  if (config.kind !== 'remote') {
+    remoteDim = 0;
+    remoteSignatureValue = '';
+    return;
+  }
+  const signature = remoteSignature(config);
+  const storedSignature = metaGet(db, 'remote_signature');
+  const storedDim = Number(metaGet(db, 'remote_dim') ?? 0);
+  if (storedSignature === signature && Number.isFinite(storedDim) && storedDim > 0) {
+    remoteDim = storedDim;
+    remoteSignatureValue = signature;
+    return;
+  }
+  remoteDim = 0;
+  remoteSignatureValue = signature;
+  metaSet(db, 'remote_signature', signature);
+  metaSet(db, 'remote_dim', 0);
+}
+
+async function ensureRemoteDim(s) {
+  const config = backendConfig();
+  if (config.kind !== 'remote') return DIM;
+  if (remoteDim > 0) return remoteDim;
+  // An unreachable endpoint must not add its timeout to every search: remember
+  // the failure and retry the probe after a cooldown while lexical recall answers.
+  if (now() - remoteProbeFailedAt < REMOTE_PROBE_COOLDOWN_MS) return 0;
+  try {
+    const probe = await embedRemote([REMOTE_PROBE_TEXT], config);
+    remoteDim = probe[0]?.length ?? 0;
+    if (remoteDim > 0) {
+      remoteProbeFailedAt = 0;
+      remoteSignatureValue = remoteSignature(config);
+      metaSet(s.db, 'remote_signature', remoteSignatureValue);
+      metaSet(s.db, 'remote_dim', remoteDim);
+    } else {
+      remoteProbeFailedAt = now();
+    }
+  } catch {
+    remoteProbeFailedAt = now();
+  }
+  return remoteDim;
+}
+
+function enqueueVector(kind, id, text) {
+  const key = `${kind}:${id}`;
+  if (!pendingVectors.has(key) && pendingVectors.size >= MAX_PENDING_VECTORS) return;
+  pendingVectors.set(key, { kind, id: Number(id), text: String(text ?? '') });
+}
+
 /** Store (or refresh) one vector for a memory row. */
 function upsertVector(s, kind, id, text) {
   indexVector(s, kind, id, text);
@@ -483,9 +675,6 @@ function upsertVector(s, kind, id, text) {
  * search: writes never block a turn, and retrieval never waits for a batch that
  * a failed request left behind.
  */
-const pendingVectors = new Map();
-let remoteDim = 0;
-
 function indexVector(s, kind, id, text) {
   const config = backendConfig();
   if (config.kind === 'hashed') {
@@ -496,13 +685,37 @@ function indexVector(s, kind, id, text) {
     } catch { /* the vector route is optional */ }
     return;
   }
-  pendingVectors.set(`${kind}:${id}`, { kind, id: Number(id), text: String(text ?? '') });
+  enqueueVector(kind, id, text);
+}
+
+/** Queue a bounded batch of old rows that lack a vector at the active dimension. */
+async function backfillRemoteBatch(s) {
+  if (backendConfig().kind !== 'remote' || remoteDim <= 0) return;
+  for (const [kind, table] of [['note', 'notes'], ['fact', 'facts'], ['chunk', 'chunks']]) {
+    try {
+      const rows = s.db.prepare(`
+        SELECT t.id AS id, t.text AS text
+        FROM ${table} t
+        WHERE t.deleted_at IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM vectors v
+            WHERE v.kind = ? AND v.owner_id = t.id AND v.dim = ?
+          )
+        ORDER BY t.id
+        LIMIT 32
+      `).all(kind, remoteDim);
+      for (const row of rows) enqueueVector(kind, row.id, row.text);
+    } catch { /* backfill is best effort */ }
+  }
 }
 
 /** Flush queued rows through the remote embedder; never throws. */
 async function flushPendingVectors(s) {
   const config = backendConfig();
   if (config.kind !== 'remote') return;
+  const dim = await ensureRemoteDim(s);
+  if (!dim) return;
+  await backfillRemoteBatch(s);
   const entries = [...pendingVectors.values()].slice(0, 32);
   if (!entries.length) return;
   try {
@@ -513,6 +726,8 @@ async function flushPendingVectors(s) {
         .run(entry.kind, entry.id, remoteDim, toBlob(vectors[index]));
       pendingVectors.delete(`${entry.kind}:${entry.id}`);
     }
+    metaSet(s.db, 'remote_signature', remoteSignatureValue || remoteSignature(config));
+    metaSet(s.db, 'remote_dim', remoteDim);
   } catch { /* keep the queue; lexical recall still answers */ }
 }
 
@@ -534,8 +749,12 @@ function backfillVectors(db) {
       const rows = db.prepare(`
         SELECT t.id AS id, t.${column} AS text
         FROM ${table} t
-        WHERE t.id NOT IN (SELECT owner_id FROM vectors WHERE kind = ?)
-      `).all(kind);
+        WHERE t.deleted_at IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM vectors v
+            WHERE v.kind = ? AND v.owner_id = t.id AND v.dim = ?
+          )
+      `).all(kind, DIM);
       for (const row of rows) {
         const vector = embedText(row.text);
         db.prepare('INSERT OR REPLACE INTO vectors(kind, owner_id, dim, vec) VALUES (?, ?, ?, ?)')
@@ -545,34 +764,76 @@ function backfillVectors(db) {
   }
 }
 
+/** Run a multi-step write atomically. SQLite has no nested transaction here. */
+function transaction(db, fn) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = fn();
+    db.exec('COMMIT');
+    return result;
+  } catch (error) {
+    try { db.exec('ROLLBACK'); } catch { /* ignore rollback failure */ }
+    throw error;
+  }
+}
+
+/** Tombstone one row and keep its derived graph edges consistent. */
+function forgetMemory(s, kind, id) {
+  const table = { note: 'notes', fact: 'facts', chunk: 'chunks' }[String(kind)];
+  if (!table) throw new Error('kind must be note, fact or chunk');
+  return transaction(s.db, () => {
+    let fact = null;
+    if (table === 'facts') {
+      fact = s.db.prepare('SELECT subject, relation, object, scope FROM facts WHERE id = ?').get(Number(id));
+    }
+    const info = s.db.prepare(`UPDATE ${table} SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL`)
+      .run(now(), Number(id));
+    if (fact && Number(info.changes) > 0) {
+      s.db.prepare(`
+        UPDATE edges SET valid_to = ?
+        WHERE src = ? AND rel = ? AND dst = ? AND valid_to IS NULL
+          AND (scope = ? OR scope IS NULL)
+      `).run(now(), fact.subject, fact.relation, String(fact.object ?? ''), fact.scope ?? SCOPE_GLOBAL);
+    }
+    return Number(info.changes) > 0;
+  });
+}
+
 function insertChunk(s, input) {
   const { db, ftsMode } = s;
   const text = String(input.text ?? '').trim();
   if (!text) return null;
   const digest = hash(text);
-  const existing = db.prepare('SELECT id FROM chunks WHERE hash = ?').get(digest);
+  const scope = input.scope ?? null;
+  const existing = db.prepare(`
+    SELECT id FROM chunks
+    WHERE hash = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global') AND deleted_at IS NULL
+  `).get(digest, scope);
   if (existing) return { id: Number(existing.id), deduped: true };
-  const ts = Number(input.ts ?? now());
-  const info = db.prepare(
-    'INSERT INTO chunks(ts, session_id, role, text, hash, source, importance, scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(
-    ts,
-    input.sessionId ?? null,
-    input.role ?? 'note',
-    text,
-    digest,
-    input.source ?? null,
-    Number(input.importance ?? 0.5),
-    input.scope ?? null,
-  );
-  const id = Number(info.lastInsertRowid);
-  if (ftsMode !== 'like') {
-    try {
-      db.prepare('INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)').run(id, text);
-    } catch { /* index write is best effort */ }
-  }
-  upsertVector(s, 'chunk', id, text);
-  return { id, deduped: false };
+  return transaction(db, () => {
+    const ts = Number(input.ts ?? now());
+    const info = db.prepare(
+      'INSERT INTO chunks(ts, session_id, role, text, hash, source, importance, scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(
+      ts,
+      input.sessionId ?? null,
+      input.role ?? 'note',
+      text,
+      digest,
+      input.source ?? null,
+      Number(input.importance ?? 0.5),
+      scope,
+    );
+    const id = Number(info.lastInsertRowid);
+    if (ftsMode !== 'like') {
+      try {
+        db.prepare('INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)').run(id, text);
+      } catch { /* index write is best effort */ }
+    }
+    indexBigrams(db, 'chunk', id, text);
+    upsertVector(s, 'chunk', id, text);
+    return { id, deduped: false };
+  });
 }
 
 function recencyScore(ts) {
@@ -641,6 +902,25 @@ function rank(items) {
   return items.sort((a, b) => b.score - a.score);
 }
 
+/**
+ * Two-character CJK lookup through the bigram index. FTS5 trigram needs three
+ * characters, so without this a two-character query degenerated into a full
+ * table LIKE scan.
+ */
+function searchBigrams(s, layer, table, term, limit, filter, extra = '') {
+  if (!CJK_BIGRAM.test(term)) return [];
+  try {
+    return s.db.prepare(`
+      SELECT t.* FROM bigrams b
+      JOIN ${table} t ON t.id = b.owner_id
+      WHERE b.layer = ? AND b.gram = ? AND t.deleted_at IS NULL ${extra} ${filter.sql}
+      ORDER BY t.id DESC LIMIT ?
+    `).all(layer, term, ...filter.params, limit);
+  } catch {
+    return [];
+  }
+}
+
 function searchChunks(s, terms, limit, scope) {
   const { db, ftsMode } = s;
   if (!terms.length) return [];
@@ -665,7 +945,13 @@ function searchChunks(s, terms, limit, scope) {
 
   if (ftsMode !== "like") {
     const filter = scopeClause('c.scope', scope);
+    const bigramFilter = scopeClause('t.scope', scope);
     for (const term of terms.slice(0, 5)) {
+      if (term.length === 2 && CJK_BIGRAM.test(term)) {
+        const rows = searchBigrams(s, 'chunk', 'chunks', term, limit, bigramFilter);
+        for (const row of rows) push(row, 1);
+        continue;
+      }
       if (term.length < 3) continue;
       try {
         const rows = db.prepare(`
@@ -717,13 +1003,19 @@ function searchNotes(s, terms, limit, scope) {
 
   if (s.fts.notes) {
     const filter = scopeClause('n.scope', scope, false);
+    const bigramFilter = scopeClause('t.scope', scope, false);
     for (const term of terms.slice(0, 6)) {
+      if (term.length === 2 && CJK_BIGRAM.test(term)) {
+        const rows = searchBigrams(s, 'note', 'notes', term, limit, bigramFilter, 'AND t.superseded_by IS NULL');
+        for (const row of rows) push(row, 1);
+        continue;
+      }
       if (term.length < 3) continue;
       try {
         const rows = s.db.prepare(`
           SELECT n.*, bm25(notes_fts) AS r
           FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid
-          WHERE notes_fts MATCH ? AND n.deleted_at IS NULL
+          WHERE notes_fts MATCH ? AND n.deleted_at IS NULL AND n.superseded_by IS NULL
           ${filter.sql}
           ORDER BY r LIMIT ?
         `).all(`"${term.replaceAll('"', '""')}"`, ...filter.params, limit);
@@ -737,7 +1029,7 @@ function searchNotes(s, terms, limit, scope) {
     const filter = scopeClause('scope', scope, false);
     const rows = s.db.prepare(`
       SELECT * FROM notes
-      WHERE deleted_at IS NULL AND ${clause.sql} ${filter.sql}
+      WHERE deleted_at IS NULL AND superseded_by IS NULL AND ${clause.sql} ${filter.sql}
       ORDER BY importance DESC, ts DESC LIMIT ?
     `).all(...clause.params, ...filter.params, limit);
     for (const row of rows) push(row, 0);
@@ -773,13 +1065,19 @@ function searchFacts(s, terms, limit, scope) {
 
   if (s.fts.facts) {
     const filter = scopeClause('f.scope', scope);
+    const bigramFilter = scopeClause('t.scope', scope);
     for (const term of terms.slice(0, 6)) {
+      if (term.length === 2 && CJK_BIGRAM.test(term)) {
+        const rows = searchBigrams(s, 'fact', 'facts', term, limit, bigramFilter, 'AND t.valid_to IS NULL');
+        for (const row of rows) push(row, 1);
+        continue;
+      }
       if (term.length < 3) continue;
       try {
         const rows = s.db.prepare(`
           SELECT f.*, bm25(facts_fts) AS r
           FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid
-          WHERE facts_fts MATCH ? AND f.deleted_at IS NULL
+          WHERE facts_fts MATCH ? AND f.deleted_at IS NULL AND f.valid_to IS NULL
           ${filter.sql}
           ORDER BY r LIMIT ?
         `).all(`"${term.replaceAll('"', '""')}"`, ...filter.params, limit);
@@ -793,7 +1091,7 @@ function searchFacts(s, terms, limit, scope) {
     const filter = scopeClause('scope', scope);
     const rows = s.db.prepare(`
       SELECT * FROM facts
-      WHERE deleted_at IS NULL AND ${clause.sql} ${filter.sql}
+      WHERE deleted_at IS NULL AND valid_to IS NULL AND ${clause.sql} ${filter.sql}
       ORDER BY confidence DESC, valid_from DESC LIMIT ?
     `).all(...clause.params, ...filter.params, limit);
     for (const row of rows) push(row, 0);
@@ -820,12 +1118,15 @@ const DREAM_WEAK = 0.4;
 const DREAM_MAX_NOTES = 100;
 const DREAM_MAX_CHUNKS = 300;
 
-function dreamEvidence(s, note) {
+function dreamEvidence(s, note, scope = note.scope ?? SCOPE_GLOBAL) {
+  const scopeFilter = scopeClause('scope', scope);
   if (note.source) {
     try {
-      const rows = s.db.prepare(
-        'SELECT id, text, source FROM chunks WHERE source = ? AND deleted_at IS NULL LIMIT 1'
-      ).all(note.source);
+      const rows = s.db.prepare(`
+        SELECT id, text, source FROM chunks
+        WHERE source = ? AND deleted_at IS NULL ${scopeFilter.sql}
+        LIMIT 1
+      `).all(note.source, ...scopeFilter.params);
       if (rows.length) return rows[0];
     } catch { /* fall through to similarity */ }
   }
@@ -835,9 +1136,11 @@ function dreamEvidence(s, note) {
   let bestScore = 0;
   let rows = [];
   try {
-    rows = s.db.prepare(
-      'SELECT id, text, source FROM chunks WHERE deleted_at IS NULL ORDER BY ts DESC LIMIT ?'
-    ).all(DREAM_MAX_CHUNKS);
+    rows = s.db.prepare(`
+      SELECT id, text, source FROM chunks
+      WHERE deleted_at IS NULL ${scopeFilter.sql}
+      ORDER BY ts DESC LIMIT ?
+    `).all(...scopeFilter.params, DREAM_MAX_CHUNKS);
   } catch { return null; }
   for (const row of rows) {
     const haystack = String(row.text ?? '');
@@ -864,12 +1167,12 @@ function coverageScore(noteText, evidenceText) {
 function dreamRun(s, apply) {
   const notes = s.db.prepare(`
     SELECT * FROM notes
-    WHERE deleted_at IS NULL AND superseded_by IS NULL
+    WHERE deleted_at IS NULL AND superseded_by IS NULL AND COALESCE(revision, 1) < 3
     ORDER BY importance DESC, ts DESC LIMIT ?
   `).all(DREAM_MAX_NOTES);
   const actions = [];
   for (const note of notes) {
-    const evidence = dreamEvidence(s, note);
+    const evidence = dreamEvidence(s, note, note.scope ?? SCOPE_GLOBAL);
     let verdict = 'no_source';
     let score = 0;
     let evidenceRef = null;
@@ -897,25 +1200,28 @@ function dreamRun(s, apply) {
       ...(missingTokens.length ? { missingTokens } : {}),
     };
     if (apply) {
-      s.db.prepare('UPDATE notes SET verified_at = ?, verification = ?, evidence = ? WHERE id = ?')
-        .run(now(), verdict, evidenceRef, Number(note.id));
-      if ((verdict === 'unsupported' || verdict === 'contradicted') && evidence) {
-        s.db.prepare('UPDATE notes SET contested = 1 WHERE id = ?').run(Number(note.id));
-        const replacementText = String(evidence.text).slice(0, 600);
-        const info = s.db.prepare(
-          'INSERT INTO notes(ts, scope, text, importance, source, revision) VALUES (?, ?, ?, ?, ?, ?)'
-        ).run(now(), note.scope, replacementText, 0.5, `dream:${note.id}`, Number(note.revision ?? 1) + 1);
-        const replacementId = Number(info.lastInsertRowid);
-        s.db.prepare('UPDATE notes SET superseded_by = ? WHERE id = ?').run(replacementId, Number(note.id));
-        if (s.fts.notes) {
-          try {
-            s.db.prepare('INSERT INTO notes_fts(rowid, text) VALUES (?, ?)')
-              .run(replacementId, replacementText);
-          } catch { /* best effort */ }
+      transaction(s.db, () => {
+        s.db.prepare('UPDATE notes SET verified_at = ?, verification = ?, evidence = ? WHERE id = ?')
+          .run(now(), verdict, evidenceRef, Number(note.id));
+        if ((verdict === 'unsupported' || verdict === 'contradicted') && evidence) {
+          s.db.prepare('UPDATE notes SET contested = 1 WHERE id = ?').run(Number(note.id));
+          const replacementText = String(evidence.text).slice(0, 600);
+          const info = s.db.prepare(
+            'INSERT INTO notes(ts, scope, text, importance, source, revision) VALUES (?, ?, ?, ?, ?, ?)'
+          ).run(now(), note.scope, replacementText, 0.5, `dream:${note.id}`, Number(note.revision ?? 1) + 1);
+          const replacementId = Number(info.lastInsertRowid);
+          s.db.prepare('UPDATE notes SET superseded_by = ? WHERE id = ?').run(replacementId, Number(note.id));
+          if (s.fts.notes) {
+            try {
+              s.db.prepare('INSERT INTO notes_fts(rowid, text) VALUES (?, ?)')
+                .run(replacementId, replacementText);
+            } catch { /* best effort */ }
+          }
+          indexBigrams(s.db, 'note', replacementId, replacementText);
+          upsertVector(s, 'note', replacementId, replacementText);
+          action.replacementId = replacementId;
         }
-        upsertVector(s, 'note', replacementId, replacementText);
-        action.replacementId = replacementId;
-      }
+      });
     }
     actions.push(action);
   }
@@ -929,7 +1235,8 @@ const RRF_K = 60;
 
 async function vectorSearch(s, queryText, limit, scope) {
   const config = backendConfig();
-  const dim = activeVectorDim();
+  let dim = activeVectorDim();
+  if (!dim && config.kind === 'remote') dim = await ensureRemoteDim(s);
   if (!dim) return [];
   let queryVector;
   try {
@@ -948,9 +1255,9 @@ async function vectorSearch(s, queryText, limit, scope) {
   // backend only; a real embedding model has no such limitation.
   const queryTokens = config.kind === 'hashed' ? new Set(tokenize(queryText)) : null;
   const specs = [
-    { kind: 'note', table: 'notes', nulls: false },
-    { kind: 'fact', table: 'facts', nulls: true },
-    { kind: 'chunk', table: 'chunks', nulls: true },
+    { kind: 'note', table: 'notes', nulls: false, extra: 'AND t.superseded_by IS NULL' },
+    { kind: 'fact', table: 'facts', nulls: true, extra: 'AND t.valid_to IS NULL' },
+    { kind: 'chunk', table: 'chunks', nulls: true, extra: '' },
   ];
   const out = [];
   for (const spec of specs) {
@@ -960,7 +1267,7 @@ async function vectorSearch(s, queryText, limit, scope) {
       rows = s.db.prepare(`
         SELECT v.owner_id AS owner_id, v.vec AS vec, t.*
         FROM vectors v JOIN ${spec.table} t ON t.id = v.owner_id
-        WHERE v.kind = ? AND v.dim = ? AND t.deleted_at IS NULL ${filter.sql}
+        WHERE v.kind = ? AND v.dim = ? AND t.deleted_at IS NULL ${spec.extra} ${filter.sql}
       `).all(spec.kind, dim, ...filter.params);
     } catch {
       continue;
@@ -1018,20 +1325,24 @@ const ENTITY_CACHE_MS = 30_000;
  * can declare a contradiction explicitly (`contradicts`), and near-identical
  * text is flagged by cosine similarity for human review.
  */
-function markContradictions(s, noteId, text, explicit) {
+function markContradictions(s, noteId, text, explicit, scope = null) {
   const ids = new Set();
-  const exists = s.db.prepare('SELECT id FROM notes WHERE id = ? AND deleted_at IS NULL');
+  const scopeFilter = scope ? 'AND scope = ?' : '';
+  const exists = s.db.prepare(`SELECT id FROM notes WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL ${scopeFilter}`);
   for (const value of Array.isArray(explicit) ? explicit : []) {
     const id = Number(value);
     if (!Number.isFinite(id) || id <= 0 || id === noteId) continue;
-    if (!exists.get(id)) continue;
+    const row = scope ? exists.get(id, scope) : exists.get(id);
+    if (!row) continue;
     ids.add(id);
   }
   try {
     const vector = embedText(text);
-    const rows = s.db.prepare(
-      'SELECT id, text FROM notes WHERE deleted_at IS NULL AND id != ? ORDER BY ts DESC LIMIT 500'
-    ).all(noteId);
+    const rows = s.db.prepare(`
+      SELECT id, text FROM notes
+      WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0 AND id != ? ${scopeFilter}
+      ORDER BY ts DESC LIMIT 500
+    `).all(...(scope ? [noteId, scope] : [noteId]));
     for (const row of rows) {
       const id = Number(row.id);
       if (ids.has(id)) continue;
@@ -1090,10 +1401,14 @@ function graphExpand(s, hits, limit, scope) {
     const next = [];
     for (const node of frontier) {
       let rows = [];
+      const edgeScope = scopeClause('scope', scope);
       try {
-        rows = s.db.prepare(
-          'SELECT src, rel, dst FROM edges WHERE (src = ? OR dst = ?) AND (valid_to IS NULL OR valid_to > ?) LIMIT 50'
-        ).all(node, node, now());
+        rows = s.db.prepare(`
+          SELECT src, rel, dst FROM edges
+          WHERE (src = ? OR dst = ?) AND (valid_to IS NULL OR valid_to > ?)
+          ${edgeScope.sql}
+          LIMIT 50
+        `).all(node, node, now(), ...edgeScope.params);
       } catch { continue; }
       for (const row of rows) {
         const other = row.src === node ? row.dst : row.src;
@@ -1145,7 +1460,8 @@ function graphExpand(s, hits, limit, scope) {
     try {
       const row = s.db.prepare(`
         SELECT * FROM facts
-        WHERE deleted_at IS NULL AND subject = ? AND relation = ? AND object = ?
+        WHERE deleted_at IS NULL AND valid_to IS NULL
+          AND subject = ? AND relation = ? AND object = ?
         ${scopeClause('scope', scope).sql}
         ORDER BY valid_from DESC LIMIT 1
       `).get(edge.subject, edge.relation, edge.object, ...scopeClause('scope', scope).params);
@@ -1208,7 +1524,7 @@ async function runSearch(s, query, limit, scope) {  const terms = queryTerms(que
 function buildProfileText(projectKey) {
   const s = openStore();
   const rows = s.db.prepare(
-    'SELECT id, text, importance, scope FROM notes WHERE deleted_at IS NULL ORDER BY importance DESC, ts DESC LIMIT 60'
+    'SELECT id, text, importance, scope FROM notes WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0 ORDER BY importance DESC, ts DESC LIMIT 60'
   ).all();
   // Global notes follow the model everywhere; project notes only in their own
   // project. Unknown project => global only, so one project cannot leak into
@@ -1258,10 +1574,9 @@ function inboxText(message) {
 /** Precompute recall for an incoming user message; never blocks the turn. */
 async function precomputeRecall(agentId, text) {
   try {
-    const project = projectByAgent.get(agentId) ?? null;
+    const project = projectByAgent.get(agentId) ?? SCOPE_GLOBAL;
     const result = await runSearch(openStore(), text, 3, project);
     recallByAgent.set(agentId, { hits: result.hits, query: text, at: now(), project });
-    lastRecallAny = { agentId, ...recallByAgent.get(agentId) };
   } catch { /* recall is best effort */ }
 }
 
@@ -1277,14 +1592,14 @@ function projectForAgentId(agentId) {
 /**
  * Resolve the project for one prompt assembly.
  *
- * `AssembleContext.scope` is an opaque ScopeKey: in the live host it does not
- * expose `.id`, so the agent-keyed lookup can miss even though the session's
- * workspace is known. Falling back to the project of the most recent claimed
- * message keeps the judgement working instead of silently degrading to global.
+ * `AssembleContext.scope` is an opaque ScopeKey. If it cannot be resolved, only
+ * the global layer may be injected. The previous fallback to the last project
+ * seen anywhere turned a concurrent or unknown session into a cross-project
+ * leak, so it is deliberately gone.
  */
 function projectForScope(scope) {
   const id = scope?.id ? String(scope.id) : '';
-  if (!id) return lastProjectAny;
+  if (!id) return null;
   const known = projectForAgentId(id);
   if (known) return known;
   // The host may hand over a truncated or opaque id (for example `session-b707`).
@@ -1316,7 +1631,6 @@ function rememberUserMessage(agent, message) {
     if (cwd) {
       const project = projectKeyFromCwd(cwd);
       projectByAgent.set(agentId, project);
-      lastProjectAny = project;
     }
     if (!autoRecallEnabled()) return;
     void precomputeRecall(agentId, text);
@@ -1326,7 +1640,8 @@ function rememberUserMessage(agent, message) {
 function recallFor(scope) {
   if (!autoRecallEnabled()) return null;
   const agentId = String(scope?.id ?? '');
-  const entry = (agentId && recallByAgent.get(agentId)) || lastRecallAny;
+  if (!agentId) return null;
+  const entry = recallByAgent.get(agentId);
   if (!entry) return null;
   if (now() - entry.at > AUTO_RECALL_TTL_MS) return null;
   return entry;
@@ -1350,9 +1665,6 @@ function captureEvent(session, event) {
     if (!text) return;
     const sessionId = String(session?.id ?? '');
     const scope = scopeForSession(session);
-    // Keep the last known project fresh from any captured message, so prompt
-    // assembly has a fallback even before the next inbox claim arrives.
-    if (scope && scope !== SCOPE_GLOBAL) lastProjectAny = scope;
     const role = type === 'user/message' ? 'user' : 'assistant';
     const source = `session:${sessionId}#${String(event.seq ?? '')}`;
     insertChunk(openStore(), {
@@ -1390,7 +1702,7 @@ function defineTools(ctx) {
         text: { type: 'string', description: 'The memory, stated so it is useful without the original conversation.' },
         scope: {
           type: 'string',
-          description: 'Optional. Omit to let the plugin judge: project-specific wording goes to the current project layer, cross-project rules to global. Pass a project key, global, or all to override.',
+          description: 'Optional. Omit to let the plugin judge: project-specific wording goes to the current project layer, cross-project rules to global. Pass a project key or global to override; all is read-only and rejected.',
         },
         importance: { type: 'number', description: '0..1; higher survives prompt-budget trimming longer.' },
         source: { type: 'string', description: 'Where this came from, e.g. session id plus turn, or a file path.' },
@@ -1414,55 +1726,73 @@ function defineTools(ctx) {
       return textBlock(`stored ${value.kind} #${value.id}${detail}${reason}${value.deduped ? ' (duplicate)' : ''}`);
     },
     },
-    async execute(args) {
+    async execute(args, toolContext = {}) {
       const s = openStore();
       const kind = String(args.kind ?? 'note');
       const text = String(args.text ?? '');
       const importance = Number.isFinite(args.importance) ? Number(args.importance) : 0.5;
+      const project = currentProject(toolContext);
       if (kind === 'fact') {
         const subject = String(args.subject ?? '').trim();
         const relation = String(args.relation ?? 'is').trim();
         const object = String(args.object ?? args.text ?? '').trim();
         if (!subject) throw new Error('subject is required for kind=fact');
-        // Contradiction handling: same subject+relation with a different object is
-        // invalidated, not deleted, so "what did we believe then" stays answerable.
-        const previous = s.db.prepare(
-          'SELECT id FROM facts WHERE subject = ? AND relation = ? AND valid_to IS NULL AND deleted_at IS NULL'
-        ).all(subject, relation);
-        const ts = now();
-        for (const row of previous) {
-          s.db.prepare('UPDATE facts SET valid_to = ? WHERE id = ?').run(ts, Number(row.id));
-        }
-        const decision = decideScope(args.scope, text);
+        const decision = decideScope(args.scope, text, project);
         const factScope = decision.scope;
-        const info = s.db.prepare(`
-          INSERT INTO facts(subject, relation, object, text, valid_from, valid_to, confidence, source, scope)
-          VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)
-        `).run(
-          subject, relation, object, text || `${subject} ${relation} ${object}`,
-          ts, 0.7, args.source ?? null, factScope,
-        );
-        if (s.fts.facts) {
-          try {
-            s.db.prepare('INSERT INTO facts_fts(rowid, text) VALUES (?, ?)')
-              .run(Number(info.lastInsertRowid), text || `${subject} ${relation} ${object}`);
-          } catch { /* index write is best effort */ }
-        }
-        upsertVector(s, 'fact', Number(info.lastInsertRowid), text || `${subject} ${relation} ${object}`);
-        s.db.prepare('INSERT OR IGNORE INTO entities(name) VALUES (?)').run(subject);
-        if (object && object.length <= 80) s.db.prepare('INSERT OR IGNORE INTO entities(name) VALUES (?)').run(object);
+        const ts = now();
+        // Contradiction handling: same subject+relation in the same layer with a
+        // different object is invalidated, not deleted. A project write must not
+        // expire a global fact, and a global write must not expire project facts.
+        const scopeFilter = factScope === SCOPE_GLOBAL
+          ? "(scope = 'global' OR scope IS NULL)"
+          : 'scope = ?';
+        const previous = s.db.prepare(`
+          SELECT id, object, scope FROM facts
+          WHERE subject = ? AND relation = ? AND valid_to IS NULL AND deleted_at IS NULL
+            AND ${scopeFilter}
+        `).all(subject, relation, ...(factScope === SCOPE_GLOBAL ? [] : [factScope]));
+        const result = transaction(s.db, () => {
+          for (const row of previous) {
+            s.db.prepare('UPDATE facts SET valid_to = ? WHERE id = ?').run(ts, Number(row.id));
+            // Edges are the graph projection of a fact. If the fact stops being
+            // current, the edge must stop being traversable too.
+            s.db.prepare(`
+              UPDATE edges SET valid_to = ?
+              WHERE src = ? AND rel = ? AND dst = ? AND valid_to IS NULL
+                AND (scope = ? OR scope IS NULL)
+            `).run(ts, subject, relation, String(row.object ?? ''), row.scope ?? SCOPE_GLOBAL);
+          }
+          const info = s.db.prepare(`
+            INSERT INTO facts(subject, relation, object, text, valid_from, valid_to, recorded_at, confidence, source, scope)
+            VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+          `).run(
+            subject, relation, object, text || `${subject} ${relation} ${object}`,
+            ts, ts, 0.7, args.source ?? null, factScope,
+          );
+          const factId = Number(info.lastInsertRowid);
+          if (s.fts.facts) {
+            try {
+              s.db.prepare('INSERT INTO facts_fts(rowid, text) VALUES (?, ?)')
+                .run(factId, text || `${subject} ${relation} ${object}`);
+            } catch { /* index write is best effort */ }
+          }
+          indexBigrams(s.db, 'fact', factId, text || `${subject} ${relation} ${object}`);
+          upsertVector(s, 'fact', factId, text || `${subject} ${relation} ${object}`);
+          s.db.prepare('INSERT OR IGNORE INTO entities(name) VALUES (?)').run(subject);
+          if (object && object.length <= 80) s.db.prepare('INSERT OR IGNORE INTO entities(name) VALUES (?)').run(object);
+          s.db.prepare('INSERT INTO edges(src, rel, dst, valid_from, scope, source) VALUES (?, ?, ?, ?, ?, ?)')
+            .run(subject, relation, object, ts, factScope, args.source ?? null);
+          return { factId };
+        });
         entityCache = { names: [], at: 0 };
-        s.db.prepare('INSERT INTO edges(src, rel, dst, valid_from, source) VALUES (?, ?, ?, ?, ?)')
-          .run(subject, relation, object, ts, args.source ?? null);
         invalidateProfile();
         enqueueJudge(ctx, {
-          kind: 'fact', table: 'facts', id: Number(info.lastInsertRowid),
+          kind: 'fact', table: 'facts', id: Number(result.factId),
           text: text || `${subject} ${relation} ${object}`,
-          project: currentProject(),
-          scope: factScope, confidence: decision.confidence, reason: decision.reason,
+          project, scope: factScope, confidence: decision.confidence, reason: decision.reason,
         });
         return {
-          id: Number(info.lastInsertRowid),
+          id: Number(result.factId),
           kind: 'fact',
           deduped: false,
           invalidated: previous.length,
@@ -1471,7 +1801,7 @@ function defineTools(ctx) {
         };
       }
       if (kind === 'episode') {
-        const decision = decideScope(args.scope, text);
+        const decision = decideScope(args.scope, text, project);
         const row = insertChunk(s, {
           text, role: 'note', importance, source: args.source, sessionId: null,
           scope: decision.scope,
@@ -1480,19 +1810,18 @@ function defineTools(ctx) {
         invalidateProfile();
         enqueueJudge(ctx, {
           kind: 'episode', table: 'chunks', id: Number(row.id), text,
-          project: currentProject(),
-          scope: decision.scope, confidence: decision.confidence, reason: decision.reason,
+          project, scope: decision.scope, confidence: decision.confidence, reason: decision.reason,
         });
         return { id: row.id, kind: 'episode', deduped: row.deduped, scope: decision.scope, scopeReason: decision.reason };
       }
       const ts = now();
-      const decision = decideScope(args.scope, text);
+      const decision = decideScope(args.scope, text, project);
       const scope = decision.scope;
       if (!text.trim()) throw new Error('text is required');
       // Scope is part of a note's identity: the same wording in two layers is two
       // deliberate records (a global rule and its project-specific restatement).
       const prev = s.db.prepare(
-        'SELECT id FROM notes WHERE scope = ? AND text = ? AND deleted_at IS NULL'
+        'SELECT id FROM notes WHERE scope = ? AND text = ? AND deleted_at IS NULL AND superseded_by IS NULL'
       ).get(scope, text);
       if (prev) {
         return {
@@ -1503,30 +1832,33 @@ function defineTools(ctx) {
           scopeReason: decision.reason,
         };
       }
-      const info = s.db.prepare(
-        'INSERT INTO notes(ts, scope, text, importance, source) VALUES (?, ?, ?, ?, ?)'
-      ).run(ts, scope, text, importance, args.source ?? null);
-      if (s.fts.notes) {
-        try {
-          s.db.prepare('INSERT INTO notes_fts(rowid, text) VALUES (?, ?)')
-            .run(Number(info.lastInsertRowid), text);
-        } catch { /* index write is best effort */ }
-      }
-      upsertVector(s, 'note', Number(info.lastInsertRowid), text);
-      const noteId = Number(info.lastInsertRowid);
-      const contestedWith = markContradictions(s, noteId, text, args.contradicts);
+      const result = transaction(s.db, () => {
+        const info = s.db.prepare(
+          'INSERT INTO notes(ts, scope, text, importance, source) VALUES (?, ?, ?, ?, ?)'
+        ).run(ts, scope, text, importance, args.source ?? null);
+        const noteId = Number(info.lastInsertRowid);
+        if (s.fts.notes) {
+          try {
+            s.db.prepare('INSERT INTO notes_fts(rowid, text) VALUES (?, ?)')
+              .run(noteId, text);
+          } catch { /* index write is best effort */ }
+        }
+        indexBigrams(s.db, 'note', noteId, text);
+        upsertVector(s, 'note', noteId, text);
+        const contestedWith = markContradictions(s, noteId, text, args.contradicts, scope);
+        return { noteId, contestedWith };
+      });
       invalidateProfile();
       enqueueJudge(ctx, {
-        kind: 'note', table: 'notes', id: noteId, text,
-        project: currentProject(),
-        scope, confidence: decision.confidence, reason: decision.reason,
+        kind: 'note', table: 'notes', id: Number(result.noteId), text,
+        project, scope, confidence: decision.confidence, reason: decision.reason,
       });
       return {
-        id: noteId,
+        id: Number(result.noteId),
         kind: 'note',
         deduped: false,
-        contested: contestedWith.length > 0,
-        contestedWith,
+        contested: result.contestedWith.length > 0,
+        contestedWith: result.contestedWith,
         scope,
         scopeReason: decision.reason,
       };
@@ -1562,33 +1894,87 @@ function defineTools(ctx) {
         return textBlock(`matched ${value.total} (scope ${value.scope ?? 'all'})\n${lines.join('\n')}`);
       },
     },
-    async execute(args) {
+    async execute(args, toolContext = {}) {
       const s = openStore();
       const limit = Math.min(30, Math.max(1, Number(args.limit ?? 8)));
       const query = String(args.query ?? '');
-      if (!queryTerms(query).length) return { total: 0, scope: 'all', hits: [] };
       const requested = String(args.scope ?? '').trim();
       // Retrieval judgement: an explicit request wins; otherwise scope to the
-      // current project (plus the global layer) instead of scanning everything.
-      const scope = requested === 'all' ? null : (requested || currentProject() || null);
+      // current project (plus the global layer), never to every project.
+      const scope = requested === 'all' ? null : (requested || currentProject(toolContext) || SCOPE_GLOBAL);
+      if (!queryTerms(query).length) return { total: 0, scope: scope ?? 'all', hits: [] };
       const result = await runSearch(s, query, limit, scope);
       return { ...result, scope: scope ?? 'all' };
     },
   }));
 
   disposers.push(ctx.tools.register({
+    name: 'memory_reindex',
+    description: 'Rebuild missing vectors for the active embedding backend. Use after switching OMNI_EMBED_URL/model or restoring an old database.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        limit: { type: 'number', description: 'Maximum rows to process this call, default 200, max 1000.' },
+      },
+    },
+    output: {
+      schema: { type: 'object', properties: { processed: { type: 'number' }, queued: { type: 'number' }, backend: { type: 'string' } } },
+      render: (_args, value) => textBlock(`reindexed ${value.processed} rows (${value.backend}${value.queued ? `, ${value.queued} queued` : ''})`),
+    },
+    async execute(args = {}) {
+      const s = openStore();
+      const config = backendConfig();
+      const limit = Math.min(1000, Math.max(1, Number(args.limit ?? 200)));
+      if (config.kind === 'hashed') {
+        const before = Number(s.db.prepare('SELECT COUNT(*) AS n FROM vectors').get().n);
+        backfillVectors(s.db);
+        const after = Number(s.db.prepare('SELECT COUNT(*) AS n FROM vectors').get().n);
+        return { processed: Math.max(0, after - before), queued: 0, backend: 'hashed' };
+      }
+      const dim = await ensureRemoteDim(s);
+      if (!dim) throw new Error('remote embedding endpoint did not return a dimension');
+      let processed = 0;
+      while (processed < limit) {
+        await backfillRemoteBatch(s);
+        const before = pendingVectors.size;
+        if (!before) break;
+        await flushPendingVectors(s);
+        const after = pendingVectors.size;
+        if (after >= before) break;
+        processed += before - after;
+      }
+      return { processed, queued: pendingVectors.size, backend: `remote:${dim}` };
+    },
+  }));
+
+  disposers.push(ctx.tools.register({
     name: 'memory_profile',
-    description: 'Read the hot memory profile: the highest-importance notes that fit the always-injected budget, plus store statistics.',
-    parameters: { type: 'object', additionalProperties: false, properties: {} },
+    description: 'Read the hot memory profile: the highest-importance notes that fit the always-injected budget, plus store statistics. Scope defaults to the current project, or global when unknown.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        scope: {
+          type: 'string',
+          description: "Optional layer filter: a project scope (returns that project plus global), 'global', or 'all'. Omit to use the current project when known.",
+        },
+      },
+    },
     output: {
       schema: { type: 'object', properties: { text: { type: 'string' }, stats: { type: 'object' } } },
       render: (_args, value) => textBlock(value.text || 'memory is empty'),
     },
-    async execute() {
+    async execute(args = {}, toolContext = {}) {
       const s = openStore();
-      const rows = s.db.prepare(
-        'SELECT id, text, importance, source, scope FROM notes WHERE deleted_at IS NULL ORDER BY importance DESC, ts DESC LIMIT 60'
-      ).all();
+      const requested = String(args.scope ?? '').trim();
+      const scope = requested === 'all' ? null : (requested || currentProject(toolContext) || SCOPE_GLOBAL);
+      const filter = scope ? scopeClause('scope', scope) : { sql: '', params: [] };
+      const rows = s.db.prepare(`
+        SELECT id, text, importance, source, scope FROM notes
+        WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0 ${filter.sql}
+        ORDER BY importance DESC, ts DESC LIMIT 60
+      `).all(...filter.params);
       let used = 0;
       const picked = [];
       for (const row of rows) {
@@ -1602,7 +1988,7 @@ function defineTools(ctx) {
         notes: count('notes'),
         facts: Number(s.db.prepare('SELECT COUNT(*) AS n FROM facts WHERE deleted_at IS NULL AND valid_to IS NULL').get().n),
         chunks: count('chunks'),
-        db: DB_FILE,
+        db: path.basename(DB_FILE),
         fts: s.ftsMode,
       };
       const text = picked.length
@@ -1618,7 +2004,13 @@ function defineTools(ctx) {
     parameters: {
       type: 'object',
       additionalProperties: false,
-      properties: { entity: { type: 'string', description: 'Subject or object name.' } },
+      properties: {
+        entity: { type: 'string', description: 'Subject or object name.' },
+        scope: {
+          type: 'string',
+          description: "Optional layer filter: a project scope (returns that project plus global), 'global', or 'all'. Omit to use the current project when known.",
+        },
+      },
       required: ['entity'],
     },
     output: {
@@ -1638,14 +2030,19 @@ function defineTools(ctx) {
         }).join('\n'));
       },
     },
-    async execute(args) {
+    async execute(args = {}, toolContext = {}) {
       const s = openStore();
       const name = String(args.entity ?? '').trim();
       if (!name) throw new Error('entity is required');
+      const requested = String(args.scope ?? '').trim();
+      const scope = requested === 'all' ? null : (requested || currentProject(toolContext) || SCOPE_GLOBAL);
+      const factFilter = scope ? scopeClause('scope', scope) : { sql: '', params: [] };
+      const noteFilter = scope ? scopeClause('scope', scope, false) : { sql: '', params: [] };
       const facts = s.db.prepare(`
-        SELECT * FROM facts WHERE (subject = ? OR object LIKE ?) AND deleted_at IS NULL
+        SELECT * FROM facts
+        WHERE (subject = ? OR object LIKE ?) AND deleted_at IS NULL ${factFilter.sql}
         ORDER BY valid_from ASC LIMIT 50
-      `).all(name, `%${name}%`).map(row => ({
+      `).all(name, `%${name}%`, ...factFilter.params).map(row => ({
         kind: 'fact',
         subject: row.subject,
         relation: row.relation,
@@ -1655,9 +2052,9 @@ function defineTools(ctx) {
       }));
       const notes = s.db.prepare(`
         SELECT id, ts, text, scope FROM notes
-        WHERE deleted_at IS NULL AND text LIKE ?
+        WHERE deleted_at IS NULL AND text LIKE ? ${noteFilter.sql}
         ORDER BY ts ASC LIMIT 30
-      `).all(`%${name}%`).map(row => ({
+      `).all(`%${name}%`, ...noteFilter.params).map(row => ({
         kind: 'note',
         id: Number(row.id),
         ts: Number(row.ts),
@@ -1688,12 +2085,9 @@ function defineTools(ctx) {
     },
     async execute(args) {
       const s = openStore();
-      const table = { note: 'notes', fact: 'facts', chunk: 'chunks' }[String(args.kind)];
-      if (!table) throw new Error('kind must be note, fact or chunk');
-      const info = s.db.prepare(`UPDATE ${table} SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL`)
-        .run(now(), Number(args.id));
+      const forgotten = forgetMemory(s, String(args.kind), Number(args.id));
       invalidateProfile();
-      return { forgotten: Number(info.changes) > 0 };
+      return { forgotten };
     },
   }));
 
@@ -1769,11 +2163,13 @@ function defineTools(ctx) {
       const excess = Math.max(0, total - keep);
       let tombstoned = 0;
       if (apply && excess > 0) {
-        const rows = s.db.prepare(
-          'SELECT id FROM chunks WHERE deleted_at IS NULL ORDER BY ts ASC, id ASC LIMIT ?'
-        ).all(excess);
-        const stmt = s.db.prepare('UPDATE chunks SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL');
-        for (const row of rows) tombstoned += Number(stmt.run(now(), Number(row.id)).changes);
+        transaction(s.db, () => {
+          const rows = s.db.prepare(
+            'SELECT id FROM chunks WHERE deleted_at IS NULL ORDER BY ts ASC, id ASC LIMIT ?'
+          ).all(excess);
+          const stmt = s.db.prepare('UPDATE chunks SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL');
+          for (const row of rows) tombstoned += Number(stmt.run(now(), Number(row.id)).changes);
+        });
       }
       return { total, excess, tombstoned, applied: apply };
     },
@@ -1787,6 +2183,28 @@ export const inject = ['tools'];
 function isLoopback(req) {
   const address = req.socket?.remoteAddress ?? '';
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
+/**
+ * Request-forgery guard for mutating routes.
+ *
+ * A browser sends Origin on cross-site POSTs; a local non-browser client may
+ * omit it. The custom header is deliberately simple: a malicious page cannot
+ * send it without a CORS preflight, which this server never grants. This blocks
+ * browser CSRF but does not authenticate another process running as the same
+ * user -- that requires a host-level credential this plugin does not own.
+ */
+function sameOrigin(req) {
+  const origin = String(req.headers?.origin ?? '').trim();
+  if (!origin) return true;
+  const host = String(req.headers?.host ?? '').trim();
+  if (!host) return false;
+  return origin === `http://${host}` || origin === `https://${host}`;
+}
+
+function mutationAllowed(req) {
+  if (!sameOrigin(req)) return false;
+  return String(req.headers?.['x-omni-csrf'] ?? '') === '1';
 }
 
 function json(res, status, body) {
@@ -1939,7 +2357,7 @@ function registerRoutes(ctx) {
 
       return json(res, 200, {
         ok: true,
-        db: DB_FILE,
+        db: path.basename(DB_FILE),
         fts: s.ftsMode,
         schema: s.schemaVersion,
         index: s.fts,
@@ -2023,7 +2441,7 @@ function registerRoutes(ctx) {
       // Notes are bright stars attached to the entities they mention.
       const notes = s.db.prepare(`
         SELECT id, text, scope, importance FROM notes
-        WHERE deleted_at IS NULL ${clause.sql}
+        WHERE deleted_at IS NULL AND superseded_by IS NULL ${clause.sql}
         ORDER BY importance DESC, ts DESC LIMIT 120
       `).all(...clause.params);
       for (const note of notes) {
@@ -2075,11 +2493,18 @@ function registerRoutes(ctx) {
       const s = openStore();
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       const node = String(url.searchParams.get('node') ?? '').trim();
+      const requestedScope = String(url.searchParams.get('scope') ?? '').trim();
+      const scope = requestedScope === 'all' ? null : (requestedScope || SCOPE_GLOBAL);
+      const noteFilter = scope ? scopeClause('scope', scope, false) : { sql: '', params: [] };
+      const factFilter = scope ? scopeClause('scope', scope) : { sql: '', params: [] };
 
       if (node.startsWith('n:')) {
         const id = Number(node.slice(2));
         if (!Number.isFinite(id)) return json(res, 400, { ok: false });
-        const row = s.db.prepare('SELECT * FROM notes WHERE id = ? AND deleted_at IS NULL').get(id);
+        const row = s.db.prepare(`
+          SELECT * FROM notes
+          WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL ${noteFilter.sql}
+        `).get(id, ...noteFilter.params);
         if (!row) return json(res, 404, { ok: false });
         return json(res, 200, {
           ok: true,
@@ -2103,8 +2528,9 @@ function registerRoutes(ctx) {
         const facts = s.db.prepare(`
           SELECT subject, relation, object, scope, confidence, valid_from FROM facts
           WHERE deleted_at IS NULL AND valid_to IS NULL AND (subject = ? OR object = ?)
+          ${factFilter.sql}
           ORDER BY confidence DESC, valid_from DESC LIMIT 40
-        `).all(name, name);
+        `).all(name, name, ...factFilter.params);
         return json(res, 200, { ok: true, node: { kind: 'entity', name, facts } });
       }
 
@@ -2124,6 +2550,11 @@ function registerRoutes(ctx) {
         autoRecall: autoRecallEnabled(),
         lastInjection,
         lastJudge,
+        embedding: {
+          kind: backendConfig().kind,
+          dim: activeVectorDim(),
+          pending: pendingVectors.size,
+        },
         stats: {
           notes: count('notes'),
           facts: Number(s.db.prepare('SELECT COUNT(*) AS n FROM facts WHERE deleted_at IS NULL AND valid_to IS NULL').get().n),
@@ -2145,8 +2576,12 @@ function registerRoutes(ctx) {
       const query = url.searchParams.get('q') ?? '';
       if (!queryTerms(query).length) return json(res, 200, { ok: true, hits: [] });
       const limit = Math.min(60, Math.max(1, Number(url.searchParams.get('limit') ?? 30)));
-      const result = await runSearch(s, query, limit, null);
-      return json(res, 200, { ok: true, hits: result.hits });
+      const requestedScope = String(url.searchParams.get('scope') ?? '').trim();
+      // A bare HTTP request gets global only. "all" is an explicit audit choice;
+      // project keys include that project plus global.
+      const scope = requestedScope === 'all' ? null : (requestedScope || SCOPE_GLOBAL);
+      const result = await runSearch(s, query, limit, scope);
+      return json(res, 200, { ok: true, scope: requestedScope || SCOPE_GLOBAL, hits: result.hits });
     },
   });
 
@@ -2157,12 +2592,14 @@ function registerRoutes(ctx) {
       if (!isLoopback(req)) return json(res, 403, { ok: false });
       const s = openStore();
       const method = String(req.method ?? 'GET').toUpperCase();
+      if (method !== 'POST') return json(res, 405, { ok: false, error: 'forget requires POST' });
+      if (!mutationAllowed(req)) return json(res, 403, { ok: false, error: 'forbidden' });
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       let kind = url.searchParams.get('kind') ?? '';
       let id = Number(url.searchParams.get('id') ?? 0);
       // The host server may pre-consume the request stream, so the body is only a
-      // fallback: parameters travel in the query string for both GET and POST.
-      if (method === 'POST' && (!kind || !id)) {
+      // fallback: parameters travel in the query string.
+      if (!kind || !id) {
         const body = await readJsonBody(req);
         kind = String(body.kind ?? kind);
         id = Number(body.id ?? id);
@@ -2171,10 +2608,9 @@ function registerRoutes(ctx) {
       if (!table || !id) {
         return json(res, 400, { ok: false, error: 'kind and id required' });
       }
-      const info = s.db.prepare(`UPDATE ${table} SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL`)
-        .run(now(), id);
+      const forgotten = forgetMemory(s, kind, id);
       invalidateProfile();
-      return json(res, 200, { ok: true, forgotten: Number(info.changes) > 0 });
+      return json(res, 200, { ok: true, forgotten });
     },
   });
 
@@ -2243,17 +2679,24 @@ export function apply(ctx) {
           lines.push(`Current project scope: ${project}. Pass it as \`scope\` to memory_write/memory_search for project-only knowledge; omit it for cross-project rules.`);
         }
         const recalled = recallFor(assemblyContext?.scope);
-        if (recalled?.hits?.length) {
+        const safeHits = (recalled?.hits ?? []).filter(hit => !hit.contested && !hit.superseded_by);
+        if (safeHits.length) {
           lines.push('Recalled for this request (ranked by the same hybrid search; verify before acting on it):');
-          for (const hit of recalled.hits.slice(0, 3)) {
+          for (const hit of safeHits.slice(0, 3)) {
             lines.push(`- [${hit.kind}#${hit.id}] ${String(hit.text).replace(/\s+/g, ' ').slice(0, 180)}`);
           }
         }
-        const text = lines.join('\n');
+        // The budget applies to the whole injected section, including the header,
+        // project line and recalled hits -- not just the profile body.
+        let text = lines.join('\n');
+        if (text.length > PROFILE_BUDGET) {
+          const withoutRecall = lines.filter(line => !line.startsWith('Recalled for this request') && !line.startsWith('- ['));
+          text = withoutRecall.join('\n').slice(0, PROFILE_BUDGET);
+        }
         lastInjection = {
           at: now(),
           chars: text.length,
-          recall: recalled?.hits?.length ?? 0,
+          recall: safeHits.length,
           auto: autoRecallEnabled(),
           project: project ?? SCOPE_GLOBAL,
           // Diagnostics: whether the assembly handed us a usable scope id at all.

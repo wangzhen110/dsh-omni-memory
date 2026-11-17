@@ -19,6 +19,7 @@ export async function boot(options = {}) {
   const listeners = new Map();
   const routes = [];
   let section = null;
+  let lastSessionId = 'session-test';
 
   const ctx = {
     tools: {
@@ -62,12 +63,13 @@ export async function boot(options = {}) {
   const call = async (name, args = {}) => {
     const tool = tools.get(name);
     if (!tool) throw new Error(`missing tool ${name}`);
-    const value = await tool.execute(args, {});
+    const value = await tool.execute(args, { agent: { id: lastSessionId }, session: { id: lastSessionId } });
     const rendered = tool.output.render(args, value);
     return { value, text: rendered.map(block => block.text).join('\n') };
   };
 
   const fire = (type, text, seq = 1, sessionId = 'session-test') => {
+    lastSessionId = sessionId;
     const listener = listeners.get('session/event');
     if (!listener) throw new Error('capture listener is not registered');
     listener({ id: sessionId }, {
@@ -89,6 +91,7 @@ export async function boot(options = {}) {
   };
 
   const fireWithCwd = (cwd, type, text, seq = 1, sessionId = 'session-test') => {
+    lastSessionId = sessionId;
     const listener = listeners.get('session/event');
     if (!listener) throw new Error('capture listener is not registered');
     listener({ id: sessionId, header: { cwd } }, {

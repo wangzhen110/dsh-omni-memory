@@ -34,7 +34,7 @@ Recalled for this request (ranked by the same hybrid search; verify before actin
 ### 小尾巴：读同一份统计
 
 - 每次装配都会更新 `lastInjection = { at, chars, recall, auto }`。
-- 新增 `GET /api/memory/status` 返回 `lastInjection` 与存储统计。
+- 新增 `GET /omni-memory/status` 返回 `lastInjection` 与存储统计。
 - 客户端在 `conversation.composer.dock`（id `memory-tail`，order 3）渲染一行：
   `● 记忆 · 注入 812 字 · 召回 3 · 共 7 条`，5 秒轮询；60 秒内有注入时圆点变绿。
 
@@ -50,4 +50,4 @@ Recalled for this request (ranked by the same hybrid search; verify before actin
 
 ## 验证
 
-`test/autorecall.test.mjs`（5 个用例）：开关开启时召回出现在提示段；`OMNI_AUTO_RECALL=0` 时不出现；`/api/memory/status` 返回注入统计；状态路由仅 loopback；未收到消息时降级为仅画像。
+`test/autorecall.test.mjs`（5 个用例）：开关开启时召回出现在提示段；`OMNI_AUTO_RECALL=0` 时不出现；`/omni-memory/status` 返回注入统计；状态路由仅 loopback；未收到消息时降级为仅画像。

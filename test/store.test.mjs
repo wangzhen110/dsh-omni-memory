@@ -20,8 +20,8 @@ test('NFR-04 the database file lives under DSH_HOME/memory', async () => {
   const home = mkdtempSync(path.join(tmpdir(), 'omni-path-'));
   const app = await boot({ home });
   const profile = await app.call('memory_profile');
-  const expected = path.join(home, 'memory', 'omni.db');
-  assert.equal(profile.value.stats.db, expected);
+  assert.equal(profile.value.stats.db, 'omni.db');
+  assert.equal(profile.value.stats.db.includes(home), false, 'stats must not disclose the absolute path');
 });
 
 test('NFR-06 forgetting keeps the audit row reachable by id', async () => {

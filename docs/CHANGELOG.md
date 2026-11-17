@@ -2,6 +2,27 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [2.3.2] — 2026-11-17
+
+### 可靠性（代码级评审修复）
+- **历史状态过滤**：`searchNotes` / `searchFacts` / `searchChunks`、向量召回和图游走统一排除 `superseded_by` 与过期的 `valid_to`；画像与自动召回不再注入 superseded / contested 笔记；事实失效时同步失效对应 `edges`。
+- **Schema v7**：`chunks.hash` 的全局唯一索引改为按 `(hash, scope)` 的部分唯一索引，墓碑后同文可以重新捕获；`edges` 增加 `scope`，`facts` 增加 `recorded_at`；新增 `bigrams` 表支撑 2 字 CJK 查询。
+- **远程嵌入生命周期**：持久化 `remote_dim` / `remote_signature`，重启后恢复维度；固定探针探测维度；旧库缺向量按批回填；新增第 8 个工具 `memory_reindex`（hashed / remote 两种后端均可回填）。
+- **Scope 隔离**：HTTP 搜索、画像、时间线、节点详情支持 `scope`；裸请求默认 `global`；未知项目不再继承上一项目；`scope=all` 只读，写入直接报错；删除跨请求的 `lastProjectAny` / `lastRecallAny` 回退；工具调用不再回退到最近一次装配，无 context 时只走 `global`。
+- **HTTP 安全**：`forget` 只接受 POST，GET 返回 405；写请求校验 `Origin` 与 `x-omni-csrf` 头；`OMNI_SCOPE_JUDGE` 默认从 `always` 改为 `off`，默认不把正文发给模型；judge 队列上限 256，无 `llm` 时不入队；模型空输出保留规则判定。
+- **事务与去重**：`insertChunk`、事实/笔记写入、做梦应用、compact 全部包事务；`transaction()` 使用 `BEGIN IMMEDIATE`，失败回滚；compact 批量墓碑不再留下半截状态。
+- **2 字中文**：`searchNotes` / `searchFacts` / `searchChunks` 对 2 字 CJK 查询走 `bigrams` 索引，不再直接退化为 `LIKE` 全表扫描。旧库索引采用增量回填：每次打开每层最多处理 10,000 行，游标持久化在 `meta`，需要完全补齐时多次打开或显式重建。
+
+### 测试
+- 新增 `test/fixes.test.mjs` 11 个回归用例（由本仓库独立编写，非评审补丁附带）：superseded / valid_to 过滤、跨 scope 事实隔离、HTTP scope 默认值、`scope=all` 写入拒绝、无 context fail-closed、CSRF（GET 405 / 缺头 403 / 跨站 403）、墓碑后同文重捕、跨项目同文各存一条、`memory_reindex`、v6→v7 迁移。
+- **163 / 163 通过**。
+- 真实库副本迁移验证：12 notes / 6 facts / 423 chunks 行数不变；`chunks_hash_active` 部分唯一索引建立；`edges.scope` 回填 8/9；`bigrams` 回填 41,241 条。
+- 远程嵌入补充**失败退避**：端点不可用时 60 秒内不再探测，避免每次检索叠加超时。
+
+### 文档
+- DESIGN 更新到 2.3.2 / schema v7 / 8 工具 / 6 路由 / 新行数；NFR-08 明确“数据库未加密、loopback 无进程级鉴权”的边界；ADR-017 记录 HTTP 安全与默认隐私决策。
+- README 更新测试数、配置默认值、隐私边界与 `memory_reindex`。
+
 ## [2.3.1] — 2026-11-15
 
 ### 许可协议：CC BY-NC 4.0
@@ -181,7 +202,7 @@
 - 写入仍按规则立即落层（不阻塞），随后由后台 `llm` 服务复核：含糊项让模型只回答 `global` / `project`，判错则迁移归属并留痕（`lastJudge`）。
 - 模式开关 `OMNI_SCOPE_JUDGE=off|auto|always`（默认 `auto`，只复核规则没把握的项）。
 - 模型路由：`OMNI_JUDGE_PROVIDER` / `OMNI_JUDGE_MODEL`，否则自动挑便宜的（flash/mini/haiku/small/lite）。
-- 复核失败（无服务/超时/抛错）保留规则判定，写入不受影响；`/api/memory/status` 暴露 `lastJudge`。
+- 复核失败（无服务/超时/抛错）保留规则判定，写入不受影响；`/omni-memory/status` 暴露 `lastJudge`。
 
 ### 事故与修复
 - 修复过程中误用 PowerShell 文本替换重写 `index.js`，导致 UTF-8 中文被 GBK 往返破坏。已按字节级逆变换 + 逐行重建恢复，1376 行全部通过 `node --check` 与 136 项用例；此后禁止用 shell 改 UTF-8 源文件。
@@ -249,7 +270,7 @@
 ### 新增
 - **自动召回开关**（FR-24）：`OMNI_AUTO_RECALL=0` 关闭，默认开启。监听 `agent/inbox/claimed` 捕获用户消息并异步预取 top-3，装配时同步读缓存追加到提示段（ADR-012）。竞态未命中时降级为仅画像。
 - **对话结尾状态条**（FR-25）：`conversation.composer.dock`（id `memory-tail`, order 3）显示 `● 记忆 · 注入 N 字 · 召回 M · 共 K 条`，5 秒轮询，60 秒内生效亮绿点。
-- **状态接口** `GET /api/memory/status`：返回 `autoRecall`、`lastInjection{at,chars,recall}` 与存储统计（仅 loopback）。
+- **状态接口** `GET /omni-memory/status`：返回 `autoRecall`、`lastInjection{at,chars,recall}` 与存储统计（仅 loopback）。
 
 ### 测试与指标
 - 自动化用例：**114 / 114 通过（100%）**。

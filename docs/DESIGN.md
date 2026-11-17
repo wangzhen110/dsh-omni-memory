@@ -2,11 +2,11 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | 2.3 |
-| 插件版本 | 2.2.0 |
+| 文档版本 | 2.3.2 |
+| 插件版本 | 2.3.2 |
 | 状态 | 已评审（本文为开发与验收的**唯一依据**） |
 | 目标平台 | DeepSeek Harness 0.2.2-rc.3（Desktop，Windows 11，Node 24.17） |
-| 最后更新 | 2026-11-14 |
+| 最后更新 | 2026-11-17 |
 | 变更规则 | 任何行为变更必须先改本文并升版本，再改代码 |
 
 **写作原则**：本规格只声明两类内容——① 已实现且被测试覆盖的行为；② 明确标注为「未实现」并有对应 FR 编号的需求。禁止把计划写成现状。
@@ -54,7 +54,7 @@
 | FR-14 | 界面浏览 | 左栏「记忆」面板列出笔记与事实，含类型、正文、来源、作用域、重要性 | ✅ |
 | FR-15 | 界面搜索 | 面板搜索框调用同一检索算法，展示命中条数与结果 | ✅ |
 | FR-16 | 界面遗忘 | 面板按钮触发遗忘并刷新列表 | ✅ |
-| FR-17 | 向量融合排序 | 黄金集 MRR 不低于仅词面基线 | ✅ 部分：MRR 0.770 → **0.917**（+0.147）；**真语义召回未实现** |
+| FR-17 | 向量融合排序 | 黄金集 MRR 不低于仅词面基线 | ✅ 默认哈希后端：MRR 0.776 → 0.927；配置远程语义后端可进一步提升 |
 | FR-18 | 图游走召回 | 通过实体边扩散，召回直接匹配不到的相关条目 | ✅ 已实现（2 跳、衰减 0.5、按边召回） |
 | FR-19 | 冲突标记 | 笔记之间冲突时置 `contested=1` 并在界面标注 | ✅ 已实现（显式 `contradicts` + 余弦 ≥0.9 启发） |
 | FR-20 | 做梦校验 | 离线任务用原文核对笔记，发现错误时修订并留痕 | ✅ 已实现（覆盖度 + 特征词缺失判定，dry-run/apply 两态） |
@@ -64,24 +64,24 @@
 | FR-24 | 自动召回开关 | 开启时用当前用户消息预取 top-3 并拼入提示；`OMNI_AUTO_RECALL=0` 关闭 | ✅ 已实现（默认开启） |
 | FR-25 | 对话结尾状态条 | composer 下方一行显示注入字数、召回条数、存量；60 秒内生效时亮绿点 | ✅ 已实现 |
 | FR-26 | 项目级/全局级分层 | 转录按工作目录落项目层；画像=全局+当前项目；检索项目视图含全局；面板可切层 | ✅ 已实现（ADR-013） |
-| FR-27 | 归属判断机制 | 写入按措辞判定层并回传依据；检索未指定时默认当前项目 | ✅ 已实现（ADR-014，8 用例） |
-| FR-28 | 模型复核归类 | 规则先落层，后台调 `llm` 复核，判错则迁移并留痕 | ✅ 已实现（ADR-015，7 用例） |
+| FR-27 | 归属判断机制 | 写入按措辞判定层并回传依据；检索有当前项目时含项目+全局，无项目时只走全局 | ✅ 已实现（ADR-014，8 用例） |
+| FR-28 | 模型复核归类 | 规则先落层，后台调 `llm` 复核，判错则迁移并留痕 | ✅ 可配置；默认 `off`，显式开启后生效（ADR-015/017，7 用例） |
 | FR-29 | 记忆星图 | 实体为星、事实为连线、笔记挂载；拖拽旋转/滚轮缩放/惯性/空闲自转 | ✅ 已实现（ADR-016，5 用例） |
 
 ### 1.2 非功能需求
 
 | 编号 | 需求 | 指标 | 当前实测 |
 |---|---|---|---|
-| NFR-01 | 单次检索延迟 | p95 < 300ms（1 万行以内） | **实测 p95 = 12.6ms @ 10,000 行**（含向量路线，`bench/bench.mjs`） |
+| NFR-01 | 单次检索延迟 | p95 < 300ms（1 万行以内） | **实测 p95 = 3.9ms @ 10,000 行；92.5ms @ 100,000 行；910.7ms @ 1,000,000 行**（`bench/bench.mjs`，Node 22） |
 | NFR-02 | 注入开销 | 每次装配 ≤ 1 次 SQLite 读；缓存命中时 0 次 | 满足（30s 缓存） |
 | NFR-03 | 写入不阻塞回合 | 捕获写入耗时 p99 < 5ms | 满足（单条 insert + 索引） |
 | NFR-04 | 崩溃一致性 | 进程被强杀后数据库可打开、已提交行可读 | 满足（WAL + synchronous=NORMAL） |
 | NFR-05 | 数据可追溯 | 每条记忆有 `source` 或用例可解释其缺失 | 已捕获项均带 source |
 | NFR-06 | 数据不丢失 | 遗忘为墓碑；事实失效为 `valid_to`；无物理删除 | 满足 |
 | NFR-07 | 失败隔离 | 任一子系统（FTS/路由/注入）失效不得导致会话不可用 | 满足（全部 try/catch + 可选降级） |
-| NFR-08 | 隐私 | 所有数据仅存本机 `$DSH_HOME/memory/omni.db`；HTTP 仅 loopback | 满足 |
+| NFR-08 | 隐私 | 所有数据仅存本机 `$DSH_HOME/memory/omni.db`；HTTP 仅 loopback，且浏览器跨站写请求被 Origin 校验拦截 | 部分满足：数据库未加密，loopback HTTP 仍依赖本机进程边界，未做进程级鉴权（ADR-017） |
 | NFR-09 | 可卸载 | 卸载插件后不残留运行中的监听；数据文件保留由用户决定 | 满足 |
-| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 107/107（100%） |
+| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 163/163（100%） |
 | NFR-11 | 界面本地化 | 中英词典注册，切换语言无需重载插件 | 已实现（词典 + 订阅重渲染） |
 
 ### 1.3 约束
@@ -91,7 +91,7 @@
 | CON-01 | 禁止调用 `sessionQuery.inspectSession` 操作在线会话 | 会 prepare 会话、顶掉实时投影，聊天区变空白（本项目实测事故） |
 | CON-02 | 禁止替换 `conversation.chat.flow` 单例槽位 | 替换后默认聊天流消失 |
 | CON-03 | 只依赖公开 Service（`tools` / `systemPrompt` / `webServer` / `slots`） | 内部 API 随版本变动（mnemon 崩溃案例） |
-| CON-04 | HTTP 路由必须校验来源为 loopback | 防止本机其它进程读写记忆 |
+| CON-04 | HTTP 路由必须校验来源为 loopback；写操作只接受 POST 并校验 `Origin` 与 `x-omni-csrf` | 阻止网络来源读取与浏览器跨站写；**不构成进程级认证**（同用户本机进程仍可读写，见 ADR-017） |
 | CON-05 | 不得在 `systemPrompt.section` 内做网络/模型调用 | 该函数在每次装配同步执行 |
 | CON-06 | 数据目录固定 `$DSH_HOME/memory` | 便于备份与迁移 |
 
@@ -117,6 +117,7 @@
 | ADR-014 | 归属判断机制 | 显式优先 + 措辞规则 + 保守落项目；检索默认当前项目 | [ADR/014-scope-judgement.md](ADR/014-scope-judgement.md) |
 | ADR-015 | 模型复核归类 | 规则先落层，`llm` 后台复核并纠偏；失败保留规则 | [ADR/015-model-scope-judge.md](ADR/015-model-scope-judge.md) |
 | ADR-016 | 星图实现 | Canvas 2D 手写投影，零依赖；拖拽/缩放/惯性/自转 | [ADR/016-star-map.md](ADR/016-star-map.md) |
+| ADR-017 | HTTP 写入安全与默认隐私 | 写操作只接受 POST；Origin/CSRF 校验；模型复核默认关闭；队列有界 | [ADR/017-http-security.md](ADR/017-http-security.md) |
 
 ### 2.1 参考实现对照（可移植部分）
 
@@ -140,15 +141,15 @@
 
 ```
 DSH Host 进程
-├── 本插件 Host 半边（index.js，~1580 行）
+├── 本插件 Host 半边（index.js，~2561 行）
 │   ├── store         SQLite 句柄与 schema/迁移（唯一写入口）
 │   ├── capture       session/event → chunks
 │   ├── recall        agent/inbox/claimed → 异步预取 top-3（TTL 120s）
-│   ├── retrieval     分词 / FTS / 向量 / 图游走 / RRF
-│   ├── tools         7 个模型工具（write/search/profile/timeline/forget/dream/compact）
+│   ├── retrieval     分词 / FTS / bigram / 向量 / 图游走 / RRF
+│   ├── tools         8 个模型工具（write/search/profile/timeline/forget/dream/compact/reindex）
 │   ├── prompt        systemPrompt.section：画像 + 召回段（同步读缓存）
-│   └── routes        4 条 loopback HTTP（list/search/forget/status）
-├── 本插件 Client 半边（client.js，~388 行）
+│   └── routes        6 条 loopback HTTP（list/search/graph/node/forget/status）
+├── 本插件 Client 半边（client.js，~1108 行）
 │   ├── sidebar.panellist[id=omni-memory]   左栏入口图标
 │   ├── main[key=omni-memory]               记忆面板（分页/搜索/状态/遗忘）
 │   └── conversation.composer.dock[memory-tail]  对话结尾状态小尾巴
@@ -174,21 +175,25 @@ capture ──────────────────┘（只写）
 ### 4.1 表定义（与代码一致）
 
 ```sql
-chunks(id PK, ts, session_id, role, text, hash UNIQUE, source, importance, deleted_at)
+chunks(id PK, ts, session_id, role, text, hash, scope, source, importance, deleted_at)
 notes(id PK, ts, scope, text, importance, source, revision, superseded_by, contested, deleted_at)
-facts(id PK, subject, relation, object, text, valid_from, valid_to, confidence, source, contested, deleted_at)
+facts(id PK, subject, relation, object, text, recorded_at, valid_from, valid_to, confidence, scope, source, contested, deleted_at)
 entities(id PK, name UNIQUE, kind)
-edges(id PK, src, rel, dst, valid_from, valid_to, source)
+edges(id PK, src, rel, dst, scope, valid_from, valid_to, source)
+vectors(id PK, kind, owner_id, dim, vec)
+bigrams(id PK, layer, owner_id, gram)
 meta(key PK, value)
-chunks_fts(text)  -- FTS5，trigram 优先
+chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 ```
+
+索引：`chunks_hash_active(hash, IFNULL(scope,'global')) WHERE deleted_at IS NULL` 是**部分唯一索引**，墓碑后的同文可以重新写入；`bigrams_gram(gram)` 支撑 2 字 CJK 查询。
 
 ### 4.2 不变量
 
 | 编号 | 不变量 | 强制方式 |
 |---|---|---|
-| INV-01 | `chunks.hash` 唯一，重复正文不重复入库 | UNIQUE 索引 + 先查后插 |
-| INV-02 | 同一 `(subject,relation)` 至多一条 `valid_to IS NULL` 且未墓碑的事实 | 写入前先置旧行失效 |
+| INV-01 | 同一 `(hash, scope)` 至多一条未墓碑的 chunk；墓碑后同文可重新捕获 | 部分唯一索引 + 先查后插 |
+| INV-02 | 同一 `(subject,relation,scope)` 至多一条 `valid_to IS NULL` 且未墓碑的事实 | 写入前先按 scope 置旧行失效 |
 | INV-03 | `notes.revision ≥ 1` | 默认值 |
 | INV-04 | 逻辑删除只写 `deleted_at`，不删行 | 代码约束（禁止 DELETE） |
 | INV-05 | `chunks_fts` 行与 `chunks` 行 id 一致 | 插入时同事务写入 rowid |
@@ -196,7 +201,7 @@ chunks_fts(text)  -- FTS5，trigram 优先
 ### 4.3 迁移策略
 
 `meta.schema_version` 记录整数版本；启动时按序执行 `MIGRATIONS[n]`。
-**当前版本 6**。新增列/索引必须写迁移，禁止直接改 `CREATE TABLE` 语句（新库与老库必须收敛到同一结构）。
+**当前版本 7**。v7 移除全局 `chunks.hash` 唯一索引，改为按 `(hash, scope)` 的部分唯一索引；为 `edges` 补 `scope`、为 `facts` 补 `recorded_at`；新增 `bigrams` 索引表；并回填旧数据的 scope 与 bigram。新增列/索引必须写迁移，禁止直接改 `CREATE TABLE` 语句（新库与老库必须收敛到同一结构）。
 
 | 版本 | 变更 | 迁移动作 |
 |---|---|---|
@@ -414,7 +419,7 @@ score = 0.6 × 文本分 + 0.2 × 权重分 + 0.2 × 时效分
 | D-06 | ~~`scope` 只过滤 notes~~ | **v0.6.0 已修**：facts/chunks 增加 scope 列并参与过滤；无 scope 的行对任意作用域可见 | 已关闭 |
 | D-07 | ~~`timeline` 只查 facts~~ | **v1.2.0 已修**：时间线合并「实体相关事实 + 提到该实体的笔记」，按时间排序 | 已关闭 |
 | D-08 | ~~无 schema 版本迁移~~ | **v0.6.0 已修**：`meta.schema_version` + 顺序迁移 + 旧库就地升级 | 已关闭 |
-| D-09 | ~~无评测集~~ | 基线已建立：63 个自动化用例 + 10k 行延迟基准 | 部分关闭（黄金集待建） |
+| D-09 | ~~无评测集~~ | 基线已建立：黄金集 20 语料 / 24 问 + 10k 行延迟基准 | 部分关闭（黄金集已建，仍缺 100k/1M 回归门槛） |
 | D-10 | ~~面板无分页~~ | **v1.1.0 已修**：`limit`/`offset` + 总数/是否有更多；面板显示 `起–止 / 总数` | 已关闭 |
 | D-11 | ~~无 i18n~~ | **v1.1.0 已修**：中英词典注册，界面跟随语言切换 | 已关闭 |
 | D-12 | 捕获不含工具调用 | 过程不可回溯 | P3（按需） |
@@ -444,8 +449,13 @@ score = 0.6 × 文本分 + 0.2 × 权重分 + 0.2 × 时效分
 | FR-09/10 | `test/prompt.test.mjs` | 预算截断、写入即失效、空库返回空串 |
 | FR-11/12/13 | `test/tools.test.mjs` | profile/timeline/forget |
 | FR-14/15/16 | 手工 + `test/api.test.mjs` | 路由数据正确 |
+| FR-17/21 | `test/semantic.test.mjs`、`test/fixes.test.mjs` | 远程维度重启、旧库回填、词面/混合排序 |
+| FR-23 | `test/fixes.test.mjs`、`test/compact.test.mjs` | 墓碑后同文重捕、compact 事务 |
+| FR-26/27/28 | `test/scope-model-judge.test.mjs`、`test/fixes.test.mjs` | HTTP scope、`scope=all` 拒写、跨 scope 事实隔离 |
+| FR-29 | `test/starmap.test.mjs` | 节点/边投影、聚焦与高亮 |
 | NFR-04 | `test/store.test.mjs` | 重开数据库后数据可读 |
 | NFR-07 | `test/resilience.test.mjs` | FTS 缺失降级、注入抛错返回空串 |
+| NFR-08 | `test/api.test.mjs`、`test/fixes.test.mjs` | GET 405、跨站 Origin 403、loopback 拒绝 |
 
 ### 10.3 可靠性口径
 
@@ -494,12 +504,12 @@ score = 0.6 × 文本分 + 0.2 × 权重分 + 0.2 × 时效分
 
 | 配置项 | 默认 | 取值 | 影响 | 成本 / 风险 | 依据 |
 |---|---|---|---|---|---|
-| `OMNI_SCOPE_JUDGE` | **`always`** | `off` / `auto` / `always` | 写入后是否让模型复核层归属 | `always`：每条写入一次 `llm` 调用（约 100 输入 token + 8 输出 token，flash 量级）；模型不可用时静默退回规则 | ADR-014/015 |
+| `OMNI_SCOPE_JUDGE` | **`off`** | `off` / `auto` / `always` | 写入后是否让模型复核层归属 | 默认不把写入正文发给模型；显式开启后每条写入一次 `llm` 调用 | ADR-014/015/017 |
 | `OMNI_JUDGE_PROVIDER` | 第一个已注册 provider | provider 路由 | 复核使用的模型提供方 | 选错 provider 会调用不计费/不可用模型 | ADR-015 |
 | `OMNI_JUDGE_MODEL` | 自动挑选（优先 `flash/mini/haiku/small/lite`） | 模型 id | 复核使用的模型 | 大模型更准但更贵 | ADR-015 |
 | `OMNI_AUTO_RECALL` | 开启（未设置即开） | `0` 关闭 | 装配时是否用当前用户消息预取 top-3 | 每轮一次本地检索（10k 行 p95 ≈ 10ms） | ADR-012 |
 | `OMNI_DREAM_INTERVAL_MS` | `0`（关闭） | 正整数毫秒 | 后台做梦校验的周期 | 每次最多 100 条笔记 × 300 条转录 | ADR-010 |
-| `OMNI_DISABLE_VECTOR` | 未设置 | `1` 关闭 | 是否启用向量路线 | 关闭后退化为纯词面：黄金集 MRR 0.927 → 0.791 | ADR-006/007 |
+| `OMNI_DISABLE_VECTOR` | 未设置 | `1` 关闭 | 是否启用向量路线 | 关闭后退化为纯词面：黄金集 MRR 0.927 → 0.776 | ADR-006/007 |
 | `OMNI_DISABLE_GRAPH` | 未设置 | `1` 关闭 | 是否启用图路线 | 关闭后事实链的关联召回消失 | ADR-009 |
 | `OMNI_EMBED_URL` | 未设置 | OpenAI 兼容端点 | 切换为真语义嵌入后端 | 需外部服务；每轮多一次批量 flush | ADR-008 |
 | `OMNI_EMBED_MODEL` | `text-embedding-3-small` | 模型 id | 远程嵌入模型 | — | ADR-008 |
@@ -507,19 +517,20 @@ score = 0.6 × 文本分 + 0.2 × 权重分 + 0.2 × 时效分
 | `OMNI_EMBED_TIMEOUT_MS` | `10000` | 毫秒 | 远程嵌入超时 | 超时即保留队列、只用词面返回 | ADR-008 |
 | `DSH_HOME` | 宿主默认 | 目录 | 数据库位置 `$DSH_HOME/memory/omni.db` | 换目录等于换库 | ADR-001 |
 
-### 14.1 为什么默认是 `always`
+### 14.1 为什么默认是 `off`
 
-- **用户诉求**：关键词规则判层不准，明确要求"让 AI 自动归类"。
-- **代价**：每条写入多一次极小模型调用；写入路径**不等待**它（异步复核），所以交互延迟不变。
-- **失败模式**：模型不可用 / 超时 / 返回空 → 保留规则判定，写入早已成功。
-- **回退**：`OMNI_SCOPE_JUDGE=auto`（只复核没把握的）或 `off`（完全离线）。
+- **隐私优先**：默认不把笔记正文发到任何外部模型；需要更准的层归属时，用户显式打开 `auto` / `always`。
+- **代价**：显式打开后，每条写入多一次极小模型调用；写入路径**不等待**它（异步复核），交互延迟不变。
+- **失败模式**：模型不可用 / 超时 / 返回空 → 保留规则判定，写入早已成功；空输出不会再把项目笔记改成 `global`。
+- **回退**：`auto`（只复核没把握的）或 `always`（全部复核）；`off` 完全离线。
 - **两条豁免**：显式 `scope` 不复核（调用方优先）；无项目上下文不复核（没有层可选）。
 
 ### 14.2 判断与归属的兜底顺序
 
-1. 写入：显式 scope → 规则（跨项目措辞 / 项目痕迹 / 保守落项目）→ 模型复核。
-2. 装配：`scope.id` 精确匹配 → 前缀匹配最近捕获的会话（宿主的 id 可能是截断的）→ 最近一次捕获的项目。
-3. 检索：显式 scope → 当前项目（含全局）→ 全部。
+1. 写入：显式 scope → 规则（跨项目措辞 / 项目痕迹 / 保守落项目）→ 可选的模型复核。
+2. 装配：`scope.id` 精确匹配 → 前缀匹配最近捕获的会话；未知 scope 只走全局，不继承上一项目。
+3. 检索：显式 scope → 当前项目（含全局）→ 全局；`scope=all` 只读，写入会直接报错。
+4. 工具调用：只使用 tool context 的 `agent/session/scope.id` 解析项目；没有 context → `global`，不再回退到最近一次装配或上一项目。
 
 ### 14.3 调参建议
 

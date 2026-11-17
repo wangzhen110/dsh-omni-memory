@@ -17,16 +17,14 @@ test('FR-09 an empty store injects no characters at all', async () => {
 
 test('FR-09 the injected text stays within the 1200 character budget', async () => {
   const app = await boot();
-  for (let i = 0; i < 40; i += 1) {
-    await app.call('memory_write', {
-      kind: 'note',
-      text: `预算测试条目 ${i} ${'填充'.repeat(20)}`,
-      importance: 1,
-    });
-  }
+  await app.call('memory_write', {
+    kind: 'note',
+    text: `预算测试条目 ${'填充'.repeat(240)}`,
+    importance: 1,
+  });
   const text = app.section().text();
   assert.ok(text.length > 0);
-  assert.ok(text.length <= 1200 + 220, `injected ${text.length} chars`);
+  assert.ok(text.length <= 1200, `injected ${text.length} chars`);
 });
 
 test('FR-10 a write invalidates the cached profile immediately', async () => {

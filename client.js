@@ -246,9 +246,11 @@ const EMPTY_HIGHLIGHT = [];
         const q = query.trim();
         if (!q) { setOffset(0); return load(0); }
         try {
-          const response = await fetch(`/omni-memory/search?q=${encodeURIComponent(q)}&limit=40`, {
-            headers: { accept: 'application/json' },
-          });
+          const searchScope = scopeFilter === 'project' ? 'all' : scopeFilter;
+          const response = await fetch(
+            `/omni-memory/search?q=${encodeURIComponent(q)}&limit=40&scope=${encodeURIComponent(searchScope)}`,
+            { headers: { accept: 'application/json' } },
+          );
           const body = await response.json();
           const hits = body?.ok ? body.hits : [];
           setState(prev => ({ ...prev, hits }));
@@ -265,7 +267,7 @@ const EMPTY_HIGHLIGHT = [];
         try {
           await fetch(`/omni-memory/forget?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`, {
             method: 'POST',
-            headers: { accept: 'application/json' },
+            headers: { accept: 'application/json', 'x-omni-csrf': '1' },
           });
         } finally {
           await load(offset);
@@ -275,7 +277,8 @@ const EMPTY_HIGHLIGHT = [];
       const openNode = async node => {
         setSelected({ node, loading: true, detail: null });
         try {
-          const response = await fetch(`/omni-memory/node?node=${encodeURIComponent(node.id)}`);
+          const searchScope = scopeFilter === 'project' ? 'all' : scopeFilter;
+          const response = await fetch(`/omni-memory/node?node=${encodeURIComponent(node.id)}&scope=${encodeURIComponent(searchScope)}`);
           const body = await response.json();
           setSelected(body?.ok
             ? { node, loading: false, detail: body.node }

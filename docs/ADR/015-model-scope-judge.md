@@ -15,15 +15,15 @@ ADR-014 的归属判断靠措辞规则，快但关键词盲：**说法稍微绕�
 
 1. **写入不等待**：按规则立即判定并落库，工具调用保持毫秒级返回。
 2. **后台复核**：把写入项放进队列，用 `llm.stream` 发一条极短请求（`maxTokens: 8`、`temperature: 0`、4 秒超时），让模型只回答 `global` 或 `project`。
-3. **判错即迁移**：模型答案与当前层不同时，`UPDATE ... SET scope = ?`，同时清空画像缓存并在 `/api/memory/status` 的 `lastJudge` 里留痕（from → to、模型名、时间）。
+3. **判错即迁移**：模型答案与当前层不同时，`UPDATE ... SET scope = ?`，同时清空画像缓存并在 `/omni-memory/status` 的 `lastJudge` 里留痕（from → to、模型名、时间）。
 
 ### 何时复核
 
 | `OMNI_SCOPE_JUDGE` | 行为 |
 |---|---|
-| `off` | 从不调用模型 |
+| `off`（默认） | 从不调用模型 |
 | `auto` | 只复核规则**没把握**的项（confidence < 0.8），即 `default-to-project` |
-| `always`（默认） | 除下面两种豁免外，每条都复核 |
+| `always` | 除下面两种豁免外，每条都复核 |
 
 两条豁免即使 `always` 也不调用模型：
 
@@ -51,7 +51,7 @@ ADR-014 的归属判断靠措辞规则，快但关键词盲：**说法稍微绕�
 
 ## 默认值与成本（定稿）
 
-- 默认 `always`（见 DESIGN §14）：用户要求"AI 自动归类"，且复核不阻塞写入。
-- 成本：每条写入约 100 输入 token + 8 输出 token，用 `deepseek-flash` 量级模型。
+- 默认 `off`（见 DESIGN §14）：默认离线，不把笔记正文发给外部模型；需要更准时显式打开 `auto` / `always`。
+- 成本：显式开启后每条复核约 100 输入 token + 8 输出 token，用 `deepseek-flash` 量级模型。
 - 回退：`auto`（只复核规则没把握的）/ `off`（完全离线）。
-- 线上事实记录：2026-11-14 真机 `note #12` 由规则判 `project`，被 `deepseek-official/deepseek-flash` 改判为 `global`，`lastJudge` 可查。
+- 线上事实记录：2026-11-14 真机 `note #12` 由规则判 `project`，被 `deepseek-official/deepseek-flash` 改判为 `global`，`lastJudge` 可查；该实验是显式开启 `always` 时做的，不是默认行为。

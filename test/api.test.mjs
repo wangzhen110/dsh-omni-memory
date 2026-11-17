@@ -112,10 +112,9 @@ test('D-04 POST forget works when the host already consumed the request body', a
   const app = await boot();
   const written = await app.call('memory_write', { kind: 'note', text: '宿主已读空 body 的场景' });
   const { res, state, json } = fakeRes();
-  await app.route('/omni-memory/forget').handler(
-    fakePostConsumed(`/omni-memory/forget?kind=note&id=${written.value.id}`),
-    res,
-  );
+  const req = fakePostConsumed(`/omni-memory/forget?kind=note&id=${written.value.id}`);
+  req.headers = { host: '127.0.0.1', 'x-omni-csrf': '1' };
+  await app.route('/omni-memory/forget').handler(req, res);
   assert.equal(state.statusCode, 200);
   assert.equal(json().forgotten, true);
 });
@@ -124,29 +123,31 @@ test('D-04 POST /omni-memory/forget tombstones the row', async () => {
   const app = await boot();
   const written = await app.call('memory_write', { kind: 'note', text: '接口遗忘测试' });
   const { res, state, json } = fakeRes();
-  await app.route('/omni-memory/forget').handler(
-    fakePost({ kind: 'note', id: written.value.id }, '127.0.0.1', `/omni-memory/forget?kind=note&id=${written.value.id}`),
-    res,
-  );
+  const req = fakePost({ kind: 'note', id: written.value.id }, '127.0.0.1', `/omni-memory/forget?kind=note&id=${written.value.id}`);
+  req.headers = { host: '127.0.0.1', 'x-omni-csrf': '1' };
+  await app.route('/omni-memory/forget').handler(req, res);
   assert.equal(state.statusCode, 200);
   assert.equal(json().forgotten, true);
   const hit = await app.call('memory_search', { query: '接口遗忘测试' });
   assert.equal(hit.value.hits.length, 0);
 });
 
-test('D-04 GET forget still works for older clients', async () => {
+test('D-04 GET forget is rejected instead of mutating', async () => {
   const app = await boot();
   const written = await app.call('memory_write', { kind: 'note', text: '兼容路径' });
-  const { res, state, json } = fakeRes();
+  const { res, state } = fakeRes();
   await app.route('/omni-memory/forget').handler(fakeReq(`/omni-memory/forget?kind=note&id=${written.value.id}`), res);
-  assert.equal(state.statusCode, 200);
-  assert.equal(json().forgotten, true);
+  assert.equal(state.statusCode, 405);
+  const hit = await app.call('memory_search', { query: '兼容路径' });
+  assert.equal(hit.value.hits.length, 1, 'GET must not tombstone the row');
 });
 
 test('D-04 POST forget without id returns 400', async () => {
   const app = await boot();
   const { res, state } = fakeRes();
-  await app.route('/omni-memory/forget').handler(fakePost({ kind: 'note' }), res);
+  const req = fakePost({ kind: 'note' });
+  req.headers = { host: '127.0.0.1', 'x-omni-csrf': '1' };
+  await app.route('/omni-memory/forget').handler(req, res);
   assert.equal(state.statusCode, 400);
 });
 
