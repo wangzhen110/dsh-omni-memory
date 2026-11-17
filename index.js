@@ -400,7 +400,7 @@ function openStore() {
   return store;
 }
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 function columnExists(db, table, column) {
   try {
@@ -506,6 +506,18 @@ const MIGRATIONS = [
       addColumn(db, table, column, type);
     }
   },
+  // v8: multi-valued relations. Existing facts stay single-valued.
+  db => {
+    addColumn(db, 'facts', 'cardinality', "TEXT NOT NULL DEFAULT 'single'");
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS relations (
+        name TEXT PRIMARY KEY,
+        cardinality TEXT NOT NULL DEFAULT 'single',
+        aliases TEXT,
+        updated_at INTEGER
+      );
+    `);
+  },
 ];
 
 function migrate(db) {
@@ -518,6 +530,11 @@ function migrate(db) {
   for (let next = version + 1; next <= SCHEMA_VERSION; next += 1) {
     const step = MIGRATIONS[next];
     if (typeof step === 'function') step(db);
+  }
+  // Repair path: never trust the version marker alone. A database whose marker
+  // says v8 but lacks the v8 artifacts is repaired in place (add column, table).
+  if (SCHEMA_VERSION >= 8 && !columnExists(db, 'facts', 'cardinality')) {
+    MIGRATIONS[8](db);
   }
   db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)")
     .run(String(SCHEMA_VERSION));
@@ -1227,6 +1244,23 @@ function rowsByIds(db, table, ids, extraSql = '') {
 }
 
 /** The JS twin of scopeClause for rows fetched by id. */
+function relationCardinality(db, name) {
+  try {
+    return db.prepare('SELECT cardinality FROM relations WHERE name = ?').get(name)?.cardinality ?? 'single';
+  } catch {
+    return 'single';
+  }
+}
+
+function setRelationCardinality(db, name, cardinality) {
+  try {
+    db.prepare(`
+      INSERT INTO relations(name, cardinality, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(name) DO UPDATE SET cardinality = excluded.cardinality, updated_at = excluded.updated_at
+    `).run(name, cardinality, now());
+  } catch { /* registry is best effort */ }
+}
+
 function scopeAllows(value, scope, nulls = true) {
   if (!scope || scope === 'all') return true;
   if (value === scope || value === 'global') return true;
@@ -2132,6 +2166,11 @@ function defineTools(ctx) {
         subject: { type: 'string', description: 'fact only: the entity.' },
         relation: { type: 'string', description: 'fact only: the predicate.' },
         object: { type: 'string', description: 'fact only: the value.' },
+        cardinality: {
+          type: 'string',
+          enum: ['single', 'multi'],
+          description: 'fact only: single (default) replaces the previous value; multi keeps several active values for the same subject+relation.',
+        },
         contradicts: {
           type: 'array',
           items: { type: 'number' },
@@ -2162,6 +2201,8 @@ function defineTools(ctx) {
         if (!subject) throw new Error('subject is required for kind=fact');
         const decision = decideScope(args.scope, text, project);
         const factScope = decision.scope;
+        const requested = args.cardinality === 'single' || args.cardinality === 'multi' ? args.cardinality : null;
+        const cardinality = requested ?? relationCardinality(s.db, relation);
         const ts = now();
         // Contradiction handling: same subject+relation in the same layer with a
         // different object is invalidated, not deleted. A project write must not
@@ -2175,6 +2216,41 @@ function defineTools(ctx) {
             AND ${scopeFilter}
         `).all(subject, relation, ...(factScope === SCOPE_GLOBAL ? [] : [factScope]));
         const result = transaction(s.db, () => {
+          if (requested) setRelationCardinality(s.db, relation, requested);
+          const insertFact = () => {
+            const info = s.db.prepare(`
+              INSERT INTO facts(subject, relation, object, text, valid_from, valid_to, recorded_at, confidence, source, scope, cardinality)
+              VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+            `).run(
+              subject, relation, object, text || `${subject} ${relation} ${object}`,
+              ts, ts, 0.7, args.source ?? null, factScope, cardinality,
+            );
+            const factId = Number(info.lastInsertRowid);
+            if (s.fts.facts) {
+              try {
+                s.db.prepare('INSERT INTO facts_fts(rowid, text) VALUES (?, ?)')
+                  .run(factId, text || `${subject} ${relation} ${object}`);
+              } catch { /* index write is best effort */ }
+            }
+            indexBigrams(s.db, 'fact', factId, text || `${subject} ${relation} ${object}`);
+            upsertVector(s, 'fact', factId, text || `${subject} ${relation} ${object}`);
+            s.db.prepare('INSERT OR IGNORE INTO entities(name) VALUES (?)').run(subject);
+            if (object && object.length <= 80) s.db.prepare('INSERT OR IGNORE INTO entities(name) VALUES (?)').run(object);
+            s.db.prepare('INSERT INTO edges(src, rel, dst, valid_from, scope, source) VALUES (?, ?, ?, ?, ?, ?)')
+              .run(subject, relation, object, ts, factScope, args.source ?? null);
+            return factId;
+          };
+          if (cardinality === 'multi') {
+            // Several values may be true at once: keep siblings active, and treat
+            // a repeated identical value as the same fact rather than a new one.
+            const same = previous.find(row => String(row.object ?? '') === object);
+            if (same) {
+              s.db.prepare('UPDATE facts SET recorded_at = ?, source = COALESCE(?, source) WHERE id = ?')
+                .run(ts, args.source ?? null, Number(same.id));
+              return { factId: Number(same.id), deduped: true, invalidated: 0 };
+            }
+            return { factId: insertFact(), deduped: false, invalidated: 0 };
+          }
           for (const row of previous) {
             s.db.prepare('UPDATE facts SET valid_to = ? WHERE id = ?').run(ts, Number(row.id));
             // Edges are the graph projection of a fact. If the fact stops being
@@ -2185,27 +2261,7 @@ function defineTools(ctx) {
                 AND (scope = ? OR scope IS NULL)
             `).run(ts, subject, relation, String(row.object ?? ''), row.scope ?? SCOPE_GLOBAL);
           }
-          const info = s.db.prepare(`
-            INSERT INTO facts(subject, relation, object, text, valid_from, valid_to, recorded_at, confidence, source, scope)
-            VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
-          `).run(
-            subject, relation, object, text || `${subject} ${relation} ${object}`,
-            ts, ts, 0.7, args.source ?? null, factScope,
-          );
-          const factId = Number(info.lastInsertRowid);
-          if (s.fts.facts) {
-            try {
-              s.db.prepare('INSERT INTO facts_fts(rowid, text) VALUES (?, ?)')
-                .run(factId, text || `${subject} ${relation} ${object}`);
-            } catch { /* index write is best effort */ }
-          }
-          indexBigrams(s.db, 'fact', factId, text || `${subject} ${relation} ${object}`);
-          upsertVector(s, 'fact', factId, text || `${subject} ${relation} ${object}`);
-          s.db.prepare('INSERT OR IGNORE INTO entities(name) VALUES (?)').run(subject);
-          if (object && object.length <= 80) s.db.prepare('INSERT OR IGNORE INTO entities(name) VALUES (?)').run(object);
-          s.db.prepare('INSERT INTO edges(src, rel, dst, valid_from, scope, source) VALUES (?, ?, ?, ?, ?, ?)')
-            .run(subject, relation, object, ts, factScope, args.source ?? null);
-          return { factId };
+          return { factId: insertFact(), deduped: false, invalidated: previous.length };
         });
         entityCache = { names: [], at: 0 };
         invalidateProfile();
@@ -2217,8 +2273,9 @@ function defineTools(ctx) {
         return {
           id: Number(result.factId),
           kind: 'fact',
-          deduped: false,
-          invalidated: previous.length,
+          deduped: result.deduped,
+          invalidated: result.invalidated,
+          cardinality,
           scope: factScope,
           scopeReason: decision.reason,
         };
@@ -2649,7 +2706,7 @@ function defineTools(ctx) {
 
   disposers.push(ctx.tools.register({
     name: 'memory_dream',
-    description: 'Verify stored notes against the transcripts they came from. Dry run by default; apply=true records each verdict, flags unsupported notes as contested, and supersedes them with a note built from the evidence (the old row stays readable).',
+    description: 'Verify stored notes against the transcripts they came from. Dry run by default; apply=true records each verdict and flags unsupported notes as contested, but never replaces anything. commit=true (with apply) or memory_dream_replace performs a reversible replacement.',
     parameters: {
       type: 'object',
       additionalProperties: false,

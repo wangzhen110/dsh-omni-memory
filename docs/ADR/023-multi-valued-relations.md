@@ -1,8 +1,21 @@
 # ADR-023：多值关系与实体消歧（设计提案，未实施）
 
-- 状态：提案（需要数据模型迁移与独立立项）
+- 状态：已实施（v2.8.0；实体消歧仍未实施）
 - 日期：2026-11-17
 - 关联：ADR-003（facts 时间语义）、路线第 7 项
+
+## 实施记录（v2.8.0）
+
+已按提案落地第一层（关系基数），未做实体消歧：
+
+- Schema v8：`facts.cardinality`（默认 `single`）+ `relations(name, cardinality, aliases, updated_at)`；
+- `memory_write({ kind: 'fact', cardinality: 'multi' })`：显式声明后写入关系注册表，同 `subject+relation` 的其它值**不再过期**；
+- 未显式声明时沿用注册表里的基数（默认 `single`），老库全部按 `single` 迁移，行为不变；
+- 多值下重复写入同一 object 视为同一条事实（`deduped: true`），不产生重复行；
+- scope 隔离不变：项目层 multi 不会过期全局 single，反之亦然；
+- 测试：`test/multi-value.test.mjs` 4 例（单值过期、多值并存、重复去重、跨层隔离）+ `test/migration-v8.test.mjs` 2 例（v7→v8、版本标记已为 8 但缺列的修复路径）。
+
+实体消歧、别名合并、多值画像 top-N 仍按本 ADR 的"未实施"部分保留。
 
 ## 背景
 

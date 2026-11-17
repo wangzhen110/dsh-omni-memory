@@ -3,7 +3,7 @@
 | 项 | 值 |
 |---|---|
 | 文档版本 | 2.3.2 |
-| 插件版本 | 2.7.0 |
+| 插件版本 | 2.8.0 |
 | 状态 | 已评审（本文为开发与验收的**唯一依据**） |
 | 目标平台 | DeepSeek Harness 0.2.2-rc.3（Desktop，Windows 11，Node 24.17） |
 | 最后更新 | 2026-11-17 |
@@ -81,7 +81,7 @@
 | NFR-07 | 失败隔离 | 任一子系统（FTS/路由/注入）失效不得导致会话不可用 | 满足（全部 try/catch + 可选降级） |
 | NFR-08 | 隐私 | 所有数据仅存本机 `$DSH_HOME/memory/omni.db`；HTTP 仅 loopback，且浏览器跨站写请求被 Origin 校验拦截 | 部分满足：数据库未加密，loopback HTTP 仍依赖本机进程边界，未做进程级鉴权（ADR-017） |
 | NFR-09 | 可卸载 | 卸载插件后不残留运行中的监听；数据文件保留由用户决定 | 满足 |
-| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 191/191（100%） |
+| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 197/197（100%） |
 | NFR-11 | 界面本地化 | 中英词典注册，切换语言无需重载插件 | 已实现（词典 + 订阅重渲染） |
 
 ### 1.3 约束
@@ -210,6 +210,7 @@ chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 | 3 | 向量索引 | `vectors(kind, owner_id, dim, vec)` |
 | 4 | 维度变更 | 清空 `vectors`，由写入/回填重建 |
 | 5 | 做梦校验 | `notes.verified_at / verification / evidence` |
+| 5b | 多值关系（v2.8.0） | `facts.cardinality`、`relations(name, cardinality, aliases, updated_at)` |
 | 6 | 旧作用域归一 | 无哈希的 `proj:*` 旧值改为 `global`（升级前它们本就全局可见） |
 
 未带版本的旧库按 v1 处理，自动补齐到当前版本；旧行不受影响（迁移只加列、不删数据）。

@@ -5,7 +5,7 @@
 > ⚠️ **许可提醒**：本项目采用 **CC BY-NC 4.0** —— 可自由使用、修改、二次开发、借鉴，
 > 但**禁止任何商业用途**，且**必须署名作者**。商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-191%2F191-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-197%2F197-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)](LICENSE)
 
 ---
@@ -44,7 +44,7 @@
 
 ```bash
 cd memory-core
-npm test          # 191 个用例
+npm test          # 197 个用例
 npm run check     # 语法与 JSON 校验
 ```
 
@@ -71,7 +71,7 @@ npm run check     # 语法与 JSON 校验
 
 | 工具 | 作用 |
 |---|---|
-| `memory_write` | 写入笔记 / 事实 / 原始观察 |
+| `memory_write` | 写入笔记 / 事实 / 原始观察（事实可声明 `cardinality: multi` 保留多值） |
 | `memory_search` | 混合检索（支持全局 / 项目 / 全部） |
 | `memory_profile` | 读取常驻画像 |
 | `memory_timeline` | 某实体的时间线（事实 + 相关笔记） |
@@ -94,7 +94,7 @@ npm run check     # 语法与 JSON 校验
 
 ## 测试与指标
 
-- 自动化用例：**191 / 191 通过**
+- 自动化用例：**197 / 197 通过**
 - 检索延迟：10,000 行语料 p95 ≈ **2.2ms**；100,000 行 ≈ 5.8ms；1,000,000 行 ≈ 13.3ms；1M + 5 万向量 + 100 万 bigram ≈ 56ms（两段式有界检索，见 ADR-020）
 - 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 混合检索 **0.927**
 

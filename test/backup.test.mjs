@@ -34,7 +34,7 @@ test('export writes a portable snapshot that includes tombstones by default', as
 
   const snapshot = JSON.parse(readFileSync(file, 'utf8'));
   assert.equal(snapshot.format, 'omni-memory-backup');
-  assert.equal(snapshot.schema, 7);
+  assert.equal(snapshot.schema, 8);
   assert.ok(snapshot.notes.some(note => note.id === active.value.id && note.deleted_at === null));
   assert.ok(snapshot.notes.some(note => note.id === gone.value.id && note.deleted_at !== null));
 
