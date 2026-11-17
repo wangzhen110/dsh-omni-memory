@@ -61,6 +61,11 @@ const EMPTY_HIGHLIGHT = [];
         kindNote: '笔记',
         relationMentions: '提到',
         focusMode: '聚焦',
+        auditMode: '审计',
+        auditHint: '审计模式：显示历史（被替代/已删除/失效）',
+        exportNow: '导出',
+        restore: '恢复',
+        deleted: '已删除',
         kindEntity: '实体',
         nodeMeta: '层级 {scope} · 重要度 {importance}',
         nodeEmpty: '这条记忆已不可读取',
@@ -122,6 +127,11 @@ const EMPTY_HIGHLIGHT = [];
         kindNote: 'Note',
         relationMentions: 'mentions',
         focusMode: 'Focus',
+        auditMode: 'Audit',
+        auditHint: 'Audit view: history (superseded / deleted / expired)',
+        exportNow: 'Export',
+        restore: 'Restore',
+        deleted: 'Deleted',
         kindEntity: 'Entity',
         nodeMeta: 'layer {scope} · importance {importance}',
         nodeEmpty: 'This memory can no longer be read',
@@ -164,7 +174,7 @@ const EMPTY_HIGHLIGHT = [];
       return String(template).replace(/\{(\w+)\}/g, (_, key) => String(vars[key] ?? ''));
     }
 
-    function Card({ item, t, onForget }) {
+    function Card({ item, t, onForget, onRestore }) {
       const [busy, setBusy] = React.useState(false);
       const kindLabel = item.kind === 'note' ? t('note') : item.kind === 'fact' ? t('fact') : item.kind === 'chunk' ? t('transcript') : item.kind;
       const verdictKey = {
@@ -176,6 +186,12 @@ const EMPTY_HIGHLIGHT = [];
         if (busy) return;
         setBusy(true);
         try { await onForget(item.kind, item.id); } finally { setBusy(false); }
+      };
+
+      const restore = async () => {
+        if (busy || !onRestore) return;
+        setBusy(true);
+        try { await onRestore(item.kind, item.id); } finally { setBusy(false); }
       };
 
       return h('div', {
@@ -190,14 +206,20 @@ const EMPTY_HIGHLIGHT = [];
           item.contested ? h('span', { style: { ...CHIP, color: 'var(--dsw-alias-label-dangerous, #d9483b)', borderColor: 'var(--dsw-alias-label-dangerous, #d9483b)' } }, t('contested')) : null,
           verdictKey ? h('span', { style: { ...CHIP, color: verificationColor(item.verification), borderColor: verificationColor(item.verification) } }, t(verdictKey)) : null,
           item.superseded_by ? h('span', { style: MUTED }, t('superseded')) : null,
+          item.deleted_at ? h('span', { style: { ...CHIP, color: 'var(--dsw-alias-label-dangerous, #d9483b)', borderColor: 'var(--dsw-alias-label-dangerous, #d9483b)' } }, t('deleted')) : null,
           h('span', { style: { ...MUTED, marginLeft: 'auto' } }, `#${item.id}`),
-          h('button', {
-            type: 'button', onClick: forget, disabled: busy,
-            style: {
-              ...BTN, fontSize: 10, padding: '1px 8px',
-              color: 'var(--dsw-alias-label-dangerous, #d9483b)',
-            },
-          }, busy ? '…' : t('forget'))),
+          item.deleted_at && onRestore
+            ? h('button', {
+                type: 'button', onClick: restore, disabled: busy,
+                style: { ...BTN, fontSize: 10, padding: '1px 8px' },
+              }, busy ? '…' : t('restore'))
+            : h('button', {
+                type: 'button', onClick: forget, disabled: busy,
+                style: {
+                  ...BTN, fontSize: 10, padding: '1px 8px',
+                  color: 'var(--dsw-alias-label-dangerous, #d9483b)',
+                },
+              }, busy ? '…' : t('forget'))),
         h('div', { style: { fontSize: 13, lineHeight: 1.6, wordBreak: 'break-word' } }, item.text),
         item.evidence ? h('div', { style: MUTED }, `${t('evidence')}: ${item.evidence}`) : null,
         (() => {
@@ -220,13 +242,14 @@ const EMPTY_HIGHLIGHT = [];
       const [selected, setSelected] = React.useState(null);
       const [hitIds, setHitIds] = React.useState([]);
       const [focusMode, setFocusMode] = React.useState(false);
+      const [audit, setAudit] = React.useState(false);
 
       const load = React.useCallback(async (nextOffset = offset) => {
         try {
-          const response = await fetch(
-            `/omni-memory/list?limit=${PAGE_SIZE}&offset=${nextOffset}&scope=${encodeURIComponent(scopeFilter)}`,
-            { headers: { accept: 'application/json' } },
-          );
+          const query = audit
+            ? `/omni-memory/list?limit=200&offset=0&scope=${encodeURIComponent(scopeFilter)}&audit=1`
+            : `/omni-memory/list?limit=${PAGE_SIZE}&offset=${nextOffset}&scope=${encodeURIComponent(scopeFilter)}`;
+          const response = await fetch(query, { headers: { accept: 'application/json' } });
           const body = await response.json();
           setState(prev => ({
             ...prev,
@@ -238,7 +261,7 @@ const EMPTY_HIGHLIGHT = [];
         } catch {
           setState(prev => ({ ...prev, loading: false, error: 'network' }));
         }
-      }, [offset, scopeFilter]);
+      }, [offset, scopeFilter, audit]);
 
       React.useEffect(() => { load(offset); }, [load, offset]);
 
@@ -261,6 +284,34 @@ const EMPTY_HIGHLIGHT = [];
         } catch {
           setState(prev => ({ ...prev, hits: [] }));
         }
+      };
+
+      const restore = async (kind, id) => {
+        try {
+          await fetch(`/omni-memory/restore?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`, {
+            method: 'POST',
+            headers: { accept: 'application/json', 'x-omni-csrf': '1' },
+          });
+        } finally {
+          await load(offset);
+        }
+      };
+
+      const exportBackup = async () => {
+        try {
+          const response = await fetch('/omni-memory/export?download=1', { headers: { accept: 'application/json' } });
+          const body = await response.json();
+          if (!body?.ok) return;
+          const blob = new Blob([JSON.stringify(body, null, 2)], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const anchor = document.createElement('a');
+          anchor.href = url;
+          anchor.download = `omni-backup-${new Date().toISOString().slice(0, 10)}.json`;
+          document.body.appendChild(anchor);
+          anchor.click();
+          anchor.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        } catch { /* export is best effort */ }
       };
 
       const forget = async (kind, id) => {
@@ -347,6 +398,12 @@ const EMPTY_HIGHLIGHT = [];
           }, t('focusMode')),
           h('button', { type: 'button', style: ghostButton, onClick: () => setDrawer(value => !value) },
             drawer ? t('panelListClose') : t('panelList')),
+          h('button', {
+            type: 'button',
+            style: { ...ghostButton, ...(audit ? { borderColor: 'rgba(120,200,255,.85)', color: '#9fd8ff' } : {}) },
+            onClick: () => setAudit(value => !value),
+          }, t('auditMode')),
+          h('button', { type: 'button', style: ghostButton, onClick: exportBackup }, t('exportNow')),
           h('button', { type: 'button', style: ghostButton, onClick: () => load(offset) }, t('refresh'))),
         h('div', {
           style: {
@@ -443,7 +500,7 @@ const EMPTY_HIGHLIGHT = [];
                         : {}),
                     },
                   }, t(label)))),
-              h('div', { style: { ...MUTED, fontSize: 10 } }, `${from + 1}–${to} / ${page.totalNotes ?? 0}`),
+              h('div', { style: { ...MUTED, fontSize: 10 } }, audit ? t('auditHint') : `${from + 1}–${to} / ${page.totalNotes ?? 0}`),
               projects.length
                 ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
                     h('div', { style: { ...MUTED, fontSize: 10 } }, format(t('projectsTitleCount'), { n: projects.length })),
@@ -477,7 +534,7 @@ const EMPTY_HIGHLIGHT = [];
               items.length === 0
                 ? h('div', { style: { ...MUTED, paddingTop: 10 } }, t('empty'))
                 : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
-                    ...items.map(item => h(Card, { key: `${item.kind}-${item.id}`, item, t, onForget: forget }))),
+                    ...items.map(item => h(Card, { key: `${item.kind}-${item.id}`, item, t, onForget: forget, onRestore: restore }))),
               h('div', { style: { display: 'flex', gap: 6, justifyContent: 'space-between' } },
                 h('button', {
                   type: 'button', style: { ...ghostButton, flex: 1 }, disabled: from <= 0,

@@ -20,7 +20,7 @@
 
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readdirSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { DIM, embedText, dot, toBlob, fromBlob, tokenize } from './lib/embed.mjs';
@@ -797,6 +797,232 @@ function forgetMemory(s, kind, id) {
     }
     return Number(info.changes) > 0;
   });
+}
+
+const EXPORT_FORMAT = 'omni-memory-backup';
+const EXPORT_VERSION = 1;
+
+/** Build one portable snapshot of the store. Vectors are derived and excluded. */
+function snapshotStore(s, options = {}) {
+  const audit = options.audit !== false;
+  const where = audit ? '' : 'WHERE deleted_at IS NULL';
+  const edgesWhere = audit ? '' : 'WHERE valid_to IS NULL';
+  const notes = s.db.prepare(`SELECT * FROM notes ${where} ORDER BY id`).all();
+  const facts = s.db.prepare(`SELECT * FROM facts ${where} ORDER BY id`).all();
+  const chunks = s.db.prepare(`SELECT * FROM chunks ${where} ORDER BY id`).all();
+  const edges = s.db.prepare(`SELECT * FROM edges ${edgesWhere} ORDER BY id`).all();
+  const entities = s.db.prepare('SELECT name FROM entities ORDER BY name').all().map(row => row.name);
+  return {
+    format: EXPORT_FORMAT,
+    version: EXPORT_VERSION,
+    exportedAt: now(),
+    schema: SCHEMA_VERSION,
+    source: path.basename(DB_FILE),
+    counts: {
+      notes: notes.length, facts: facts.length, chunks: chunks.length,
+      edges: edges.length, entities: entities.length,
+    },
+    notes, facts, chunks, edges, entities,
+  };
+}
+
+function exportBackup(s, options = {}) {
+  const snapshot = snapshotStore(s, options);
+  const target = String(options.path ?? '').trim()
+    || path.join(DB_DIR, `omni-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
+  mkdirSync(path.dirname(target), { recursive: true });
+  writeFileSync(target, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf8');
+  return { path: target, counts: snapshot.counts, audit: options.audit !== false };
+}
+
+function importBackup(s, options = {}) {
+  const file = String(options.path ?? '').trim();
+  if (!file) throw new Error('path is required');
+  let snapshot;
+  try {
+    snapshot = JSON.parse(readFileSync(file, 'utf8'));
+  } catch (error) {
+    throw new Error(`cannot read backup: ${String(error?.message ?? error)}`);
+  }
+  return mergeSnapshot(s, snapshot, options);
+}
+
+/**
+ * Merge a snapshot into the live store.
+ *
+ * Safe default is a dry run: import touches every table, so the caller has to
+ * pass dryRun=false explicitly. Rows are matched by natural identity (text, fact
+ * triple, chunk hash, edge triple) rather than by id; a note's `superseded_by`
+ * pointer is remapped when ids are reassigned. Vectors are rebuilt, never imported.
+ */
+function mergeSnapshot(s, snapshot, options = {}) {
+  if (!snapshot || snapshot.format !== EXPORT_FORMAT) throw new Error('not an omni-memory backup');
+  if (Number(snapshot.version) > EXPORT_VERSION) throw new Error('backup was written by a newer version');
+  const dryRun = options.dryRun !== false;
+  const stats = { notes: 0, facts: 0, chunks: 0, edges: 0, entities: 0, skipped: 0, dryRun };
+  const plan = { notes: [], facts: [], chunks: [], edges: [], entities: [] };
+
+  const noteExists = s.db.prepare('SELECT id FROM notes WHERE scope = ? AND text = ? AND superseded_by IS NULL');
+  const factExists = s.db.prepare('SELECT id FROM facts WHERE subject = ? AND relation = ? AND object = ? AND scope = ?');
+  const chunkExists = s.db.prepare("SELECT id FROM chunks WHERE hash = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global')");
+  const edgeExists = s.db.prepare("SELECT id FROM edges WHERE src = ? AND rel = ? AND dst = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global')");
+
+  for (const note of Array.isArray(snapshot.notes) ? snapshot.notes : []) {
+    if (!note?.text) { stats.skipped += 1; continue; }
+    if (noteExists.get(note.scope ?? SCOPE_GLOBAL, note.text)) { stats.skipped += 1; continue; }
+    plan.notes.push(note);
+  }
+  for (const fact of Array.isArray(snapshot.facts) ? snapshot.facts : []) {
+    if (!fact?.subject || !fact?.relation) { stats.skipped += 1; continue; }
+    if (factExists.get(fact.subject, fact.relation, String(fact.object ?? ''), fact.scope ?? SCOPE_GLOBAL)) {
+      stats.skipped += 1;
+      continue;
+    }
+    plan.facts.push(fact);
+  }
+  for (const chunk of Array.isArray(snapshot.chunks) ? snapshot.chunks : []) {
+    if (!chunk?.text) { stats.skipped += 1; continue; }
+    const digest = hash(String(chunk.text));
+    if (chunkExists.get(digest, chunk.scope ?? 'global')) { stats.skipped += 1; continue; }
+    plan.chunks.push(chunk);
+  }
+  for (const edge of Array.isArray(snapshot.edges) ? snapshot.edges : []) {
+    if (!edge?.src || !edge?.rel || !edge?.dst) { stats.skipped += 1; continue; }
+    if (edgeExists.get(edge.src, edge.rel, edge.dst, edge.scope ?? SCOPE_GLOBAL)) { stats.skipped += 1; continue; }
+    plan.edges.push(edge);
+  }
+  for (const name of Array.isArray(snapshot.entities) ? snapshot.entities : []) {
+    if (!name) { stats.skipped += 1; continue; }
+    plan.entities.push(String(name));
+  }
+
+  stats.notes = plan.notes.length;
+  stats.facts = plan.facts.length;
+  stats.chunks = plan.chunks.length;
+  stats.edges = plan.edges.length;
+  stats.entities = plan.entities.length;
+  if (dryRun) return stats;
+
+  const idMap = new Map();
+  transaction(s.db, () => {
+    for (const note of plan.notes) {
+      const info = s.db.prepare(`
+        INSERT INTO notes(ts, scope, text, importance, source, revision, superseded_by, contested, deleted_at, verification, verified_at, evidence)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        Number(note.ts ?? now()), note.scope ?? SCOPE_GLOBAL, String(note.text),
+        Number(note.importance ?? 0.5), note.source ?? null, Number(note.revision ?? 1),
+        note.superseded_by ?? null, Number(note.contested ?? 0), note.deleted_at ?? null,
+        note.verification ?? null, note.verified_at ?? null, note.evidence ?? null,
+      );
+      const newId = Number(info.lastInsertRowid);
+      idMap.set(Number(note.id), newId);
+      if (s.fts.notes) {
+        try { s.db.prepare('INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(newId, String(note.text)); } catch { /* duplicate */ }
+      }
+      indexBigrams(s.db, 'note', newId, String(note.text));
+      upsertVector(s, 'note', newId, String(note.text));
+    }
+    // Remap note lineage pointers to the ids assigned in this database.
+    for (const note of plan.notes) {
+      const replacement = Number(note.superseded_by ?? 0);
+      if (!replacement) continue;
+      const newId = idMap.get(Number(note.id));
+      const target = idMap.get(replacement) ?? replacement;
+      if (newId) s.db.prepare('UPDATE notes SET superseded_by = ? WHERE id = ?').run(target, newId);
+    }
+    for (const fact of plan.facts) {
+      const info = s.db.prepare(`
+        INSERT INTO facts(subject, relation, object, text, valid_from, valid_to, recorded_at, confidence, source, contested, scope, deleted_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        String(fact.subject), String(fact.relation), String(fact.object ?? ''),
+        String(fact.text ?? `${fact.subject} ${fact.relation} ${fact.object ?? ''}`),
+        Number(fact.valid_from ?? now()), fact.valid_to ?? null, fact.recorded_at ?? null,
+        Number(fact.confidence ?? 0.7), fact.source ?? null, Number(fact.contested ?? 0),
+        fact.scope ?? SCOPE_GLOBAL, fact.deleted_at ?? null,
+      );
+      const newId = Number(info.lastInsertRowid);
+      if (s.fts.facts) {
+        try { s.db.prepare('INSERT INTO facts_fts(rowid, text) VALUES (?, ?)').run(newId, String(fact.text ?? '')); } catch { /* duplicate */ }
+      }
+      indexBigrams(s.db, 'fact', newId, String(fact.text ?? `${fact.subject} ${fact.relation} ${fact.object ?? ''}`));
+      upsertVector(s, 'fact', newId, String(fact.text ?? `${fact.subject} ${fact.relation} ${fact.object ?? ''}`));
+    }
+    for (const chunk of plan.chunks) {
+      const text = String(chunk.text);
+      const info = s.db.prepare(`
+        INSERT INTO chunks(ts, session_id, role, text, hash, source, importance, scope, deleted_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        Number(chunk.ts ?? now()), chunk.session_id ?? null, chunk.role ?? 'note', text,
+        hash(text), chunk.source ?? null, Number(chunk.importance ?? 0.5), chunk.scope ?? null,
+        chunk.deleted_at ?? null,
+      );
+      const newId = Number(info.lastInsertRowid);
+      if (s.fts.chunks) {
+        try { s.db.prepare('INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)').run(newId, text); } catch { /* duplicate */ }
+      }
+      indexBigrams(s.db, 'chunk', newId, text);
+      upsertVector(s, 'chunk', newId, text);
+    }
+    for (const edge of plan.edges) {
+      s.db.prepare(`
+        INSERT INTO edges(src, rel, dst, valid_from, valid_to, scope, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        String(edge.src), String(edge.rel), String(edge.dst),
+        Number(edge.valid_from ?? now()), edge.valid_to ?? null,
+        edge.scope ?? null, edge.source ?? null,
+      );
+    }
+    for (const name of plan.entities) s.db.prepare('INSERT OR IGNORE INTO entities(name) VALUES (?)').run(name);
+  });
+  entityCache = { names: [], at: 0 };
+  invalidateProfile();
+  return stats;
+}
+
+/** Revive one tombstoned row and restore its derived indexes. */
+function restoreMemory(s, kind, id) {
+  const table = { note: 'notes', fact: 'facts', chunk: 'chunks' }[String(kind)];
+  if (!table) throw new Error('kind must be note, fact or chunk');
+  const restored = transaction(s.db, () => {
+    const row = s.db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(Number(id));
+    if (!row || !row.deleted_at) return false;
+    s.db.prepare(`UPDATE ${table} SET deleted_at = NULL WHERE id = ?`).run(Number(id));
+    if (table === 'notes') {
+      if (s.fts.notes) {
+        try { s.db.prepare('INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(Number(id), row.text); } catch { /* already indexed */ }
+      }
+      indexBigrams(s.db, 'note', Number(id), row.text);
+      upsertVector(s, 'note', Number(id), row.text);
+    } else if (table === 'facts') {
+      const text = String(row.text ?? `${row.subject} ${row.relation} ${row.object}`);
+      if (s.fts.facts) {
+        try { s.db.prepare('INSERT INTO facts_fts(rowid, text) VALUES (?, ?)').run(Number(id), text); } catch { /* already indexed */ }
+      }
+      indexBigrams(s.db, 'fact', Number(id), text);
+      upsertVector(s, 'fact', Number(id), text);
+      const edge = s.db.prepare(`
+        SELECT id FROM edges WHERE src = ? AND rel = ? AND dst = ? AND valid_to IS NULL
+          AND (scope = ? OR scope IS NULL)
+      `).get(row.subject, row.relation, String(row.object ?? ''), row.scope ?? SCOPE_GLOBAL);
+      if (!edge) {
+        s.db.prepare('INSERT INTO edges(src, rel, dst, valid_from, scope, source) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(row.subject, row.relation, String(row.object ?? ''), Number(row.valid_from ?? now()), row.scope ?? SCOPE_GLOBAL, row.source ?? null);
+      }
+    } else {
+      if (s.fts.chunks) {
+        try { s.db.prepare('INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)').run(Number(id), row.text); } catch { /* already indexed */ }
+      }
+      indexBigrams(s.db, 'chunk', Number(id), row.text);
+      upsertVector(s, 'chunk', Number(id), row.text);
+    }
+    return true;
+  });
+  if (restored) invalidateProfile();
+  return restored;
 }
 
 function insertChunk(s, input) {
@@ -1586,7 +1812,16 @@ function projectForAgentId(agentId) {
   const known = projectByAgent.get(id);
   if (known) return known;
   const cwd = cwdBySession.get(id);
-  return cwd ? projectKeyFromCwd(cwd) : null;
+  if (cwd) return projectKeyFromCwd(cwd);
+  // Survive a plugin reload: the mapping is persisted when it is learned.
+  try {
+    const stored = metaGet(openStore().db, `agent_project:${id}`);
+    if (stored) {
+      projectByAgent.set(id, stored);
+      return stored;
+    }
+  } catch { /* store unavailable */ }
+  return null;
 }
 
 /**
@@ -1631,6 +1866,7 @@ function rememberUserMessage(agent, message) {
     if (cwd) {
       const project = projectKeyFromCwd(cwd);
       projectByAgent.set(agentId, project);
+      try { metaSet(openStore().db, `agent_project:${agentId}`, project); } catch { /* best effort */ }
     }
     if (!autoRecallEnabled()) return;
     void precomputeRecall(agentId, text);
@@ -1667,6 +1903,9 @@ function captureEvent(session, event) {
     const scope = scopeForSession(session);
     const role = type === 'user/message' ? 'user' : 'assistant';
     const source = `session:${sessionId}#${String(event.seq ?? '')}`;
+    if (scope && scope !== SCOPE_GLOBAL && sessionId) {
+      try { metaSet(openStore().db, `agent_project:${sessionId}`, scope); } catch { /* best effort */ }
+    }
     insertChunk(openStore(), {
       text: text.length > MAX_CAPTURE_CHARS ? text.slice(0, MAX_CAPTURE_CHARS) : text,
       role,
@@ -1945,6 +2184,72 @@ function defineTools(ctx) {
         processed += before - after;
       }
       return { processed, queued: pendingVectors.size, backend: `remote:${dim}` };
+    },
+  }));
+
+  disposers.push(ctx.tools.register({
+    name: 'memory_export',
+    description: 'Write a portable JSON backup (notes, facts, transcripts, edges, entities). Vectors are derived and excluded. Tombstones are included by default so a later restore can revive them.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        path: { type: 'string', description: 'Destination file. Defaults to a timestamped file under $DSH_HOME/memory/.' },
+        activeOnly: { type: 'boolean', description: 'true exports only live rows (no tombstones, superseded notes or expired facts).' },
+      },
+    },
+    output: {
+      schema: { type: 'object', properties: { path: { type: 'string' }, counts: { type: 'object' } } },
+      render: (_args, value) => textBlock(`exported ${value.counts.notes} notes, ${value.counts.facts} facts, ${value.counts.chunks} transcripts -> ${value.path}`),
+    },
+    async execute(args = {}) {
+      const s = openStore();
+      return exportBackup(s, { path: args.path, audit: !args.activeOnly });
+    },
+  }));
+
+  disposers.push(ctx.tools.register({
+    name: 'memory_import',
+    description: 'Merge a JSON backup written by memory_export. Dry run by default: pass dryRun=false to write. Rows are deduplicated by content, not by id; vectors are rebuilt.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        path: { type: 'string', description: 'Backup file to read.' },
+        dryRun: { type: 'boolean', description: 'true (default) reports what would be imported without writing.' },
+      },
+      required: ['path'],
+    },
+    output: {
+      schema: { type: 'object', properties: { notes: { type: 'number' }, facts: { type: 'number' }, chunks: { type: 'number' }, skipped: { type: 'number' }, dryRun: { type: 'boolean' } } },
+      render: (_args, value) => textBlock(`${value.dryRun ? 'would import' : 'imported'} ${value.notes} notes, ${value.facts} facts, ${value.chunks} transcripts, ${value.edges} edges (skipped ${value.skipped})`),
+    },
+    async execute(args = {}) {
+      const s = openStore();
+      if (!args.path) throw new Error('path is required');
+      return importBackup(s, { path: String(args.path), dryRun: args.dryRun !== false });
+    },
+  }));
+
+  disposers.push(ctx.tools.register({
+    name: 'memory_restore',
+    description: 'Revive one tombstoned memory (kind + id). Derived indexes are rebuilt; use the audit view to find deleted rows.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        kind: { type: 'string', enum: ['note', 'fact', 'chunk'], description: 'Which layer the row belongs to.' },
+        id: { type: 'number', description: 'Row id from the audit view.' },
+      },
+      required: ['kind', 'id'],
+    },
+    output: {
+      schema: { type: 'object', properties: { restored: { type: 'boolean' } } },
+      render: (_args, value) => textBlock(value.restored ? 'restored' : 'nothing to restore'),
+    },
+    async execute(args = {}) {
+      const s = openStore();
+      return { restored: restoreMemory(s, String(args.kind), Number(args.id)) };
     },
   }));
 
@@ -2269,6 +2574,7 @@ function registerRoutes(ctx) {
       const audit = String(url.searchParams.get('audit') ?? '') === '1';
       const noteActive = audit ? '' : 'AND superseded_by IS NULL';
       const factActive = audit ? '' : 'AND valid_to IS NULL';
+      const deletedActive = audit ? '' : 'AND deleted_at IS NULL';
       // Layer filter: 'all' | 'global' | 'project' (any proj:*), or one exact key.
       let scopeSql = '';
       let scopeParams = [];
@@ -2282,14 +2588,14 @@ function registerRoutes(ctx) {
       }
       const notes = s.db.prepare(`
         SELECT id, ts, scope, text, importance, source, revision, contested,
-               superseded_by, verification, verified_at, evidence
-        FROM notes WHERE deleted_at IS NULL ${noteActive} ${scopeSql}
+               superseded_by, verification, verified_at, evidence, deleted_at
+        FROM notes WHERE 1 = 1 ${deletedActive} ${noteActive} ${scopeSql}
         ORDER BY importance DESC, ts DESC LIMIT ? OFFSET ?
       `).all(...scopeParams, limit, offset);
       const facts = s.db.prepare(`
         SELECT id, subject, relation, object, text, confidence, source,
-               valid_from, valid_to, contested, scope
-        FROM facts WHERE deleted_at IS NULL ${factActive} ${scopeSql}
+               valid_from, valid_to, contested, scope, deleted_at
+        FROM facts WHERE 1 = 1 ${deletedActive} ${factActive} ${scopeSql}
         ORDER BY valid_from DESC LIMIT ? OFFSET ?
       `).all(...scopeParams, limit, offset);
       const count = (table, extra = '', params = []) => Number(s.db.prepare(
@@ -2325,7 +2631,7 @@ function registerRoutes(ctx) {
       let chunks = [];
       if (scopeFilter !== 'all' && scopeFilter !== 'global' && scopeFilter !== 'project') {
         chunks = s.db.prepare(`
-          SELECT id, ts, role, source, text FROM chunks
+          SELECT id, ts, role, source, text, deleted_at FROM chunks
           WHERE deleted_at IS NULL AND scope = ?
           ORDER BY ts DESC LIMIT 20
         `).all(scopeFilter).map(row => ({
@@ -2335,6 +2641,7 @@ function registerRoutes(ctx) {
           role: row.role,
           source: row.source ?? '',
           text: String(row.text).slice(0, 300),
+          deleted_at: row.deleted_at ?? null,
         }));
       }
 
@@ -2540,6 +2847,40 @@ function registerRoutes(ctx) {
       }
 
       return json(res, 400, { ok: false });
+    },
+  });
+
+  add({
+    kind: 'exact',
+    path: '/omni-memory/export',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) return json(res, 403, { ok: false });
+      const s = openStore();
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      const activeOnly = String(url.searchParams.get('activeOnly') ?? '') === '1';
+      const snapshot = snapshotStore(s, { audit: !activeOnly });
+      if (String(url.searchParams.get('download') ?? '') === '1') {
+        const name = `omni-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+        res.setHeader('content-disposition', `attachment; filename="${name}"`);
+      }
+      return json(res, 200, { ok: true, ...snapshot });
+    },
+  });
+
+  add({
+    kind: 'exact',
+    path: '/omni-memory/restore',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) return json(res, 403, { ok: false });
+      const method = String(req.method ?? 'GET').toUpperCase();
+      if (method !== 'POST') return json(res, 405, { ok: false, error: 'restore requires POST' });
+      if (!mutationAllowed(req)) return json(res, 403, { ok: false, error: 'forbidden' });
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      const kind = String(url.searchParams.get('kind') ?? '');
+      const id = Number(url.searchParams.get('id') ?? 0);
+      if (!kind || !id) return json(res, 400, { ok: false, error: 'kind and id required' });
+      const s = openStore();
+      return json(res, 200, { ok: true, restored: restoreMemory(s, kind, id) });
     },
   });
 

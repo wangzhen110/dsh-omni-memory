@@ -2,6 +2,20 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [2.4.0] — 2026-11-17
+
+### 备份 / 导出 / 恢复（路线第 1 项）
+- **`memory_export`**：生成可移植 JSON 快照（notes / facts / chunks / edges / entities），默认包含墓碑与历史；`activeOnly` 只导出活跃行。向量是派生数据，不导出。
+- **`memory_import`**：合并导入，**默认 dry-run**；按内容而非 id 去重；note 的 `superseded_by` 指针在 id 重排后自动重映射；导入后重建 FTS / bigram / 向量。
+- **`memory_restore`**：复活单条墓碑化记忆并重建派生索引（事实恢复时同步恢复 edge）。
+- **审计视图**：列表默认只显示活跃记忆；`?audit=1` 显示历史（被替代 / 已删除 / 失效），面板新增「审计」「导出」按钮，删除项可一键恢复。
+- **HTTP**：`GET /omni-memory/export`（`download=1` 返回附件头）、`POST /omni-memory/restore`（POST + CSRF + 同源校验）。
+- 导出/导入的格式与安全边界见 ADR-019，威胁模型同步更新（导出包含全量记忆、导入读取本地路径）。
+- **agent→项目映射持久化**：重载插件后、下一条用户消息到达前，工具写入仍能落到正确项目层（此前会 fail-closed 到 global）。真实使用中发现的缺口，已补回归用例。
+
+### 测试
+- **179 / 179 通过**（新增 9 条：导出含墓碑、导出路由附件头、导入 dry-run/去重、lineage 重映射、restore、restore 路由 CSRF、审计列表可见墓碑、重载后项目映射持久化、未知 agent 仍 fail-closed）。
+
 ## [2.3.3] — 2026-11-17
 
 ### 防复发护栏（ADR-018）
