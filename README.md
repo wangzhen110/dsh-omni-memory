@@ -5,7 +5,7 @@
 > ⚠️ **许可提醒**：本项目采用 **CC BY-NC 4.0** —— 可自由使用、修改、二次开发、借鉴，
 > 但**禁止任何商业用途**，且**必须署名作者**。商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-181%2F181-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-187%2F187-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)](LICENSE)
 
 ---
@@ -28,7 +28,7 @@
 - **自动召回**：每轮用你的消息预取 top-3 注入上下文（可关）
 - **模型复核归类（可选）**：写入先按规则落层；显式开启后，后台让模型复核，判错自动迁移并留痕。默认关闭，不把正文发给外部模型
 - **冲突标记**：显式声明或近重复自动标记 `contested`，只标记不删除；画像与自动召回默认排除 contested
-- **做梦校验**：离线拿转录核对笔记，发现"与原文矛盾"时用证据生成替代笔记并保留旧行
+- **做梦校验**：离线拿转录核对笔记，发现"与原文矛盾"时**只标记为待复核**；替代需单条确认（`memory_dream_replace`），且可一键反替代
 - **记忆星图**：整屏旋臂星系，拖拽旋转/滚轮缩放/分层切换；**单击任意星点弹出记忆卡**，搜索命中会亮起脉冲光环
 - **活跃视图**：列表/搜索默认只显示活跃记忆；历史（被替代、已删除、已失效）通过面板「审计」查看并可单条**恢复**
 - **备份/导出/导入**：`memory_export` 导出可移植 JSON（含墓碑），`memory_import` 合并导入（默认 dry-run），`memory_restore` 复活单条
@@ -44,7 +44,7 @@
 
 ```bash
 cd memory-core
-npm test          # 181 个用例
+npm test          # 187 个用例
 npm run check     # 语法与 JSON 校验
 ```
 
@@ -76,7 +76,10 @@ npm run check     # 语法与 JSON 校验
 | `memory_profile` | 读取常驻画像 |
 | `memory_timeline` | 某实体的时间线（事实 + 相关笔记） |
 | `memory_forget` | 墓碑化一条记忆 |
-| `memory_dream` | 拿转录核对笔记（默认 dry-run） |
+| `memory_dream` | 拿转录核对笔记（默认 dry-run；`apply` 只标记，`commit` 才批量替代） |
+| `memory_dream_proposals` | 列出待确认的替代候选（只读） |
+| `memory_dream_replace` | 单条替代（需 `confirm: true`） |
+| `memory_dream_rollback` | 反替代：复活原笔记、墓碑化生成笔记 |
 | `memory_compact` | 转录增长治理（默认 dry-run） |
 | `memory_reindex` | 回填缺失向量（hashed / remote 两种后端均可） |
 | `memory_export` | 导出 JSON 备份（默认含墓碑；`activeOnly` 只导活跃） |
@@ -91,7 +94,7 @@ npm run check     # 语法与 JSON 校验
 
 ## 测试与指标
 
-- 自动化用例：**181 / 181 通过**
+- 自动化用例：**187 / 187 通过**
 - 检索延迟：10,000 行语料 p95 ≈ **2.2ms**；100,000 行 ≈ 5.8ms；1,000,000 行 ≈ 13.3ms；1M + 5 万向量 + 100 万 bigram ≈ 56ms（两段式有界检索，见 ADR-020）
 - 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 混合检索 **0.927**
 
@@ -110,10 +113,11 @@ npm run bench:golden   # 黄金集
 ## 文档
 
 - [设计规格](docs/DESIGN.md)（需求、架构、数据模型、契约、失败模式、追溯矩阵）
-- [架构决策记录](docs/ADR)（20 份）
+- [架构决策记录](docs/ADR)（21 份）
 - [威胁模型](docs/THREAT-MODEL.md)（信任边界、残余风险、新增路由检查清单）
 - 备份/恢复设计见 [ADR-019](docs/ADR/019-backup-restore.md)
 - 1M 行检索改造见 [ADR-020](docs/ADR/020-bounded-retrieval.md)
+- 做梦校验的安全边界见 [ADR-021](docs/ADR/021-dream-manual-confirmation.md)
 - [更新日志](docs/CHANGELOG.md)
 - [架构图](docs/architecture.png)
 

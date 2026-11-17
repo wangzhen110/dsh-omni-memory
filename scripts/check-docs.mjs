@@ -18,8 +18,8 @@ const readme = read('README.md');
 const design = read('docs/DESIGN.md');
 const changelog = read('docs/CHANGELOG.md');
 
-const tools = [...new Set([...index.matchAll(/name:\s*'(memory_[a-z]+)'/g)].map(match => match[1]))].sort();
-const routes = [...new Set([...index.matchAll(/path:\s*'\/omni-memory\/([a-z]+)'/g)].map(match => match[1]))].sort();
+const tools = [...new Set([...index.matchAll(/name:\s*'(memory_[a-z_]+)'/g)].map(match => match[1]))].sort();
+const routes = [...new Set([...index.matchAll(/path:\s*'\/omni-memory\/([a-z/]+)'/g)].map(match => match[1]))].sort();
 const adrCount = readdirSync(path.join(root, 'docs', 'ADR')).filter(file => file.endsWith('.md')).length;
 
 let tests = 0;

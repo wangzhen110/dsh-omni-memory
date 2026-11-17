@@ -2,6 +2,19 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [2.6.0] — 2026-11-17
+
+### dream 安全化（路线第 3 项）
+- **破坏性变更**：`memory_dream({ apply: true })` 默认**只标记**（写 verification/evidence、置 contested、返回 `proposedText`），不再自动替代。
+- 批量替代需显式 `commit: true`（apply + commit），文档标注为危险操作。
+- 新增 `memory_dream_proposals`（只读候选列表）、`memory_dream_replace({ noteId, confirm: true })`（单条替代）、`memory_dream_rollback({ noteId })`（反替代：复活原笔记、墓碑化生成笔记）。
+- HTTP：`GET /omni-memory/dream/proposals`、`POST /omni-memory/dream/replace`、`POST /omni-memory/dream/rollback`（POST + CSRF + 同源）。
+- 面板审计视图：被替代的行显示「反替代」按钮。
+- 设计边界见 ADR-021：dream 仍是词面启发式，proposals 的 `proposedText` 只是证据摘录，确认者需自己判断。
+
+### 测试
+- **187 / 187 通过**（新增 6 条 dream 安全用例；原替代用例改为显式 `commit: true`）。
+
 ## [2.5.0] — 2026-11-17
 
 ### 1M 行检索（路线第 2 项）

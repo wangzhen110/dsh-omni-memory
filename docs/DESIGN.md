@@ -3,7 +3,7 @@
 | 项 | 值 |
 |---|---|
 | 文档版本 | 2.3.2 |
-| 插件版本 | 2.5.0 |
+| 插件版本 | 2.6.0 |
 | 状态 | 已评审（本文为开发与验收的**唯一依据**） |
 | 目标平台 | DeepSeek Harness 0.2.2-rc.3（Desktop，Windows 11，Node 24.17） |
 | 最后更新 | 2026-11-17 |
@@ -57,7 +57,7 @@
 | FR-17 | 向量融合排序 | 黄金集 MRR 不低于仅词面基线 | ✅ 默认哈希后端：MRR 0.776 → 0.927；配置远程语义后端可进一步提升 |
 | FR-18 | 图游走召回 | 通过实体边扩散，召回直接匹配不到的相关条目 | ✅ 已实现（2 跳、衰减 0.5、按边召回） |
 | FR-19 | 冲突标记 | 笔记之间冲突时置 `contested=1` 并在界面标注 | ✅ 已实现（显式 `contradicts` + 余弦 ≥0.9 启发） |
-| FR-20 | 做梦校验 | 离线任务用原文核对笔记，发现错误时修订并留痕 | ✅ 已实现（覆盖度 + 特征词缺失判定，dry-run/apply 两态） |
+| FR-20 | 做梦校验 | 离线任务用原文核对笔记，发现错误时标记并留痕；替代需人工确认且可回滚 | ✅ 已实现（覆盖度 + 特征词缺失判定；`apply` 只标记，`commit`/单条 replace 才替代） |
 | FR-21 | 真语义嵌入后端 | 换说法（无共享字）仍能召回；由外部 OpenAI 兼容 `/embeddings` 提供 | ✅ 已实现（默认仍为哈希后端；远程路径经本地 mock 端点验证） |
 | FR-22 | 面板分页与状态展示 | 列表支持 `limit/offset` 并显示总数；卡片展示 `contested`、`verification`、`evidence`、`superseded` | ✅ 已实现 |
 | FR-23 | 转录增长治理 | `memory_compact` 按保留上限墓碑化最旧转录；行保留可审计；dry-run 默认 | ✅ 已实现 |
@@ -81,7 +81,7 @@
 | NFR-07 | 失败隔离 | 任一子系统（FTS/路由/注入）失效不得导致会话不可用 | 满足（全部 try/catch + 可选降级） |
 | NFR-08 | 隐私 | 所有数据仅存本机 `$DSH_HOME/memory/omni.db`；HTTP 仅 loopback，且浏览器跨站写请求被 Origin 校验拦截 | 部分满足：数据库未加密，loopback HTTP 仍依赖本机进程边界，未做进程级鉴权（ADR-017） |
 | NFR-09 | 可卸载 | 卸载插件后不残留运行中的监听；数据文件保留由用户决定 | 满足 |
-| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 181/181（100%） |
+| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 187/187（100%） |
 | NFR-11 | 界面本地化 | 中英词典注册，切换语言无需重载插件 | 已实现（词典 + 订阅重渲染） |
 
 ### 1.3 约束
@@ -146,9 +146,9 @@ DSH Host 进程
 │   ├── capture       session/event → chunks
 │   ├── recall        agent/inbox/claimed → 异步预取 top-3（TTL 120s）
 │   ├── retrieval     分词 / FTS / bigram / 向量 / 图游走 / RRF
-│   ├── tools         8 个模型工具（write/search/profile/timeline/forget/dream/compact/reindex）
+│   ├── tools         14 个模型工具（write/search/profile/timeline/forget/dream/dream_proposals/dream_replace/dream_rollback/compact/reindex/export/import/restore）
 │   ├── prompt        systemPrompt.section：画像 + 召回段（同步读缓存）
-│   └── routes        8 条 loopback HTTP（list/search/graph/node/forget/restore/export/status）
+│   └── routes        11 条 loopback HTTP（list/search/graph/node/forget/restore/export/status/dream/proposals/dream/replace/dream/rollback）
 ├── 本插件 Client 半边（client.js，~1108 行）
 │   ├── sidebar.panellist[id=omni-memory]   左栏入口图标
 │   ├── main[key=omni-memory]               记忆面板（分页/搜索/状态/遗忘）
@@ -227,7 +227,10 @@ chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 | `memory_profile` | 无 | `{text, stats, picked, budget}` | 无 |
 | `memory_timeline` | `entity` | `{entries[]}` | 无 |
 | `memory_forget` | `kind`(note/fact/chunk), `id` | `{forgotten}` | `kind must be note, fact or chunk` |
-| `memory_dream` | `apply`(默认 false) | `{scanned, applied, actions[]}` | 无；证据缺失走 `no_source` |
+| `memory_dream` | `apply`(默认 false), `commit`(默认 false，需 apply) | `{scanned, applied, actions[]}` | 无；`apply` 只标记，`commit` 才批量替代 |
+| `memory_dream_proposals` | `limit`(默认 50) | `{proposals[]}` | 无 |
+| `memory_dream_replace` | `noteId`, `confirm`(必须 true) | `{oldId, replacementId}` | 无；单条语义决策 |
+| `memory_dream_rollback` | `noteId` | `{restored, replacementId?}` | 仅回滚 `dream:` 来源的替代 |
 | `memory_compact` | `keepChunks`(默认 5000，下限 50), `apply`(默认 false) | `{total, excess, tombstoned, applied}` | 无；只做墓碑，不物理删除 |
 
 命中项结构：`{kind, id, ts, text, source, score}`，fact 额外含 `subject/relation/object/validFrom/validTo/contested`。

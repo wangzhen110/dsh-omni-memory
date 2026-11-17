@@ -1418,7 +1418,11 @@ function coverageScore(noteText, evidenceText) {
   return hits / tokens.length;
 }
 
-function dreamRun(s, apply) {
+function dreamRun(s, apply, options = {}) {
+  // Flagging is safe; replacing a memory is a semantic decision. Replacement is
+  // therefore opt-in and every replacement records its source as dream:<noteId>
+  // so it can be rolled back.
+  const commit = options.commit === true;
   const notes = s.db.prepare(`
     SELECT * FROM notes
     WHERE deleted_at IS NULL AND superseded_by IS NULL AND COALESCE(revision, 1) < 3
@@ -1459,7 +1463,9 @@ function dreamRun(s, apply) {
           .run(now(), verdict, evidenceRef, Number(note.id));
         if ((verdict === 'unsupported' || verdict === 'contradicted') && evidence) {
           s.db.prepare('UPDATE notes SET contested = 1 WHERE id = ?').run(Number(note.id));
-          const replacementText = String(evidence.text).slice(0, 600);
+          action.proposedText = String(evidence.text).slice(0, 600);
+          if (!commit) return;
+          const replacementText = action.proposedText;
           const info = s.db.prepare(
             'INSERT INTO notes(ts, scope, text, importance, source, revision) VALUES (?, ?, ?, ?, ?, ?)'
           ).run(now(), note.scope, replacementText, 0.5, `dream:${note.id}`, Number(note.revision ?? 1) + 1);
@@ -1481,6 +1487,76 @@ function dreamRun(s, apply) {
   }
   if (apply) invalidateProfile();
   return { scanned: notes.length, applied: Boolean(apply), actions };
+}
+
+/** Evidence-backed replacement candidates for notes already flagged by a dream run. */
+function dreamProposals(s, limit = 50) {
+  const rows = s.db.prepare(`
+    SELECT * FROM notes
+    WHERE deleted_at IS NULL AND superseded_by IS NULL
+      AND verification IN ('unsupported', 'contradicted')
+    ORDER BY ts DESC LIMIT ?
+  `).all(Math.min(Math.max(1, Number(limit) || 50), 200));
+  const out = [];
+  for (const note of rows) {
+    const evidence = dreamEvidence(s, note, note.scope ?? SCOPE_GLOBAL);
+    if (!evidence) continue;
+    out.push({
+      noteId: Number(note.id),
+      verdict: note.verification,
+      evidence: evidence.source || `chunk:${evidence.id}`,
+      proposedText: String(evidence.text).slice(0, 600),
+    });
+  }
+  return out;
+}
+
+/** Replace one flagged note with its evidence text. Explicit per-note action. */
+function dreamReplace(s, noteId) {
+  const result = transaction(s.db, () => {
+    const note = s.db.prepare(
+      'SELECT * FROM notes WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL'
+    ).get(Number(noteId));
+    if (!note) throw new Error('note not found or already superseded');
+    const evidence = dreamEvidence(s, note, note.scope ?? SCOPE_GLOBAL);
+    if (!evidence) throw new Error('no evidence to build a replacement');
+    const replacementText = String(evidence.text).slice(0, 600);
+    const info = s.db.prepare(
+      'INSERT INTO notes(ts, scope, text, importance, source, revision) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(now(), note.scope, replacementText, 0.5, `dream:${note.id}`, Number(note.revision ?? 1) + 1);
+    const replacementId = Number(info.lastInsertRowid);
+    s.db.prepare('UPDATE notes SET superseded_by = ?, contested = 1 WHERE id = ?').run(replacementId, Number(note.id));
+    if (s.fts.notes) {
+      try { s.db.prepare('INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(replacementId, replacementText); } catch { /* best effort */ }
+    }
+    indexBigrams(s.db, 'note', replacementId, replacementText);
+    upsertVector(s, 'note', replacementId, replacementText);
+    return {
+      oldId: Number(note.id),
+      replacementId,
+      evidence: evidence.source || `chunk:${evidence.id}`,
+    };
+  });
+  invalidateProfile();
+  return result;
+}
+
+/** Undo a dream replacement: revive the original, tombstone the generated note. */
+function dreamRollback(s, noteId) {
+  const result = transaction(s.db, () => {
+    const note = s.db.prepare('SELECT id, superseded_by FROM notes WHERE id = ?').get(Number(noteId));
+    if (!note || !note.superseded_by) return { restored: false, reason: 'not superseded' };
+    const replacement = s.db.prepare('SELECT id, source, deleted_at FROM notes WHERE id = ?').get(Number(note.superseded_by));
+    if (!replacement || !String(replacement.source ?? '').startsWith('dream:')) {
+      return { restored: false, reason: 'not a dream replacement' };
+    }
+    s.db.prepare('UPDATE notes SET superseded_by = NULL, contested = 0 WHERE id = ?').run(Number(note.id));
+    s.db.prepare('UPDATE notes SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL')
+      .run(now(), Number(replacement.id));
+    return { restored: true, replacementId: Number(replacement.id) };
+  });
+  if (result.restored) invalidateProfile();
+  return result;
 }
 
 /** Vector route: cosine over the stored hashed n-gram vectors. */
@@ -2264,6 +2340,67 @@ function defineTools(ctx) {
   }));
 
   disposers.push(ctx.tools.register({
+    name: 'memory_dream_proposals',
+    description: 'List replacement candidates produced by dream: flagged notes plus the evidence text that would replace them. Read-only.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: { limit: { type: 'number', description: 'Maximum proposals, default 50, max 200.' } },
+    },
+    output: {
+      schema: { type: 'object', properties: { proposals: { type: 'array', items: { type: 'object' } } } },
+      render: (_args, value) => {
+        if (!value.proposals.length) return textBlock('no replacement proposals');
+        const lines = value.proposals.map(item => `#${item.noteId} [${item.verdict}] <- ${item.evidence}: ${item.proposedText.slice(0, 120)}`);
+        return textBlock(`${value.proposals.length} proposal(s)\n${lines.join('\n')}`);
+      },
+    },
+    async execute(args = {}) {
+      return { proposals: dreamProposals(openStore(), args.limit) };
+    },
+  }));
+
+  disposers.push(ctx.tools.register({
+    name: 'memory_dream_replace',
+    description: 'Replace one flagged note with its evidence text. Requires confirm=true; the old note is superseded (kept for audit) and the replacement can be rolled back.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        noteId: { type: 'number', description: 'Note id from memory_dream_proposals.' },
+        confirm: { type: 'boolean', description: 'Must be true; replacement is a semantic decision, not automatic.' },
+      },
+      required: ['noteId', 'confirm'],
+    },
+    output: {
+      schema: { type: 'object', properties: { oldId: { type: 'number' }, replacementId: { type: 'number' } } },
+      render: (_args, value) => textBlock(`replaced #${value.oldId} with #${value.replacementId} (rollback with memory_dream_rollback)`),
+    },
+    async execute(args = {}) {
+      if (args.confirm !== true) throw new Error('confirm=true is required');
+      return dreamReplace(openStore(), args.noteId);
+    },
+  }));
+
+  disposers.push(ctx.tools.register({
+    name: 'memory_dream_rollback',
+    description: 'Undo a dream replacement: revive the original note and tombstone the generated replacement. Only works on replacements created by memory_dream (source dream:<id>).',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: { noteId: { type: 'number', description: 'The original (superseded) note id.' } },
+      required: ['noteId'],
+    },
+    output: {
+      schema: { type: 'object', properties: { restored: { type: 'boolean' }, replacementId: { type: 'number' } } },
+      render: (_args, value) => textBlock(value.restored ? `restored #${_args.noteId}` : `not rolled back: ${value.reason}`),
+    },
+    async execute(args = {}) {
+      return dreamRollback(openStore(), args.noteId);
+    },
+  }));
+
+  disposers.push(ctx.tools.register({
     name: 'memory_export',
     description: 'Write a portable JSON backup (notes, facts, transcripts, edges, entities). Vectors are derived and excluded. Tombstones are included by default so a later restore can revive them.',
     parameters: {
@@ -2479,7 +2616,8 @@ function defineTools(ctx) {
       type: 'object',
       additionalProperties: false,
       properties: {
-        apply: { type: 'boolean', description: 'false (default) reports only; true writes verdicts and corrections.' },
+        apply: { type: 'boolean', description: 'false (default) reports only; true writes verdicts and flags contested notes. It never replaces anything.' },
+        commit: { type: 'boolean', description: 'Only with apply: also replace flagged notes with their evidence text. Off by default; replacement is reversible with memory_dream_rollback.' },
       },
     },
     output: {
@@ -2507,7 +2645,7 @@ function defineTools(ctx) {
     },
     async execute(args) {
       const s = openStore();
-      return dreamRun(s, args.apply === true);
+      return dreamRun(s, args.apply === true, { commit: args.commit === true });
     },
   }));
 
@@ -2923,6 +3061,48 @@ function registerRoutes(ctx) {
       }
 
       return json(res, 400, { ok: false });
+    },
+  });
+
+  add({
+    kind: 'exact',
+    path: '/omni-memory/dream/proposals',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) return json(res, 403, { ok: false });
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      return json(res, 200, { ok: true, proposals: dreamProposals(openStore(), url.searchParams.get('limit')) });
+    },
+  });
+
+  add({
+    kind: 'exact',
+    path: '/omni-memory/dream/replace',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) return json(res, 403, { ok: false });
+      if (String(req.method ?? 'GET').toUpperCase() !== 'POST') return json(res, 405, { ok: false, error: 'replace requires POST' });
+      if (!mutationAllowed(req)) return json(res, 403, { ok: false, error: 'forbidden' });
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      const noteId = Number(url.searchParams.get('noteId') ?? 0);
+      if (!noteId) return json(res, 400, { ok: false, error: 'noteId required' });
+      try {
+        return json(res, 200, { ok: true, ...dreamReplace(openStore(), noteId) });
+      } catch (error) {
+        return json(res, 400, { ok: false, error: String(error?.message ?? error) });
+      }
+    },
+  });
+
+  add({
+    kind: 'exact',
+    path: '/omni-memory/dream/rollback',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) return json(res, 403, { ok: false });
+      if (String(req.method ?? 'GET').toUpperCase() !== 'POST') return json(res, 405, { ok: false, error: 'rollback requires POST' });
+      if (!mutationAllowed(req)) return json(res, 403, { ok: false, error: 'forbidden' });
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      const noteId = Number(url.searchParams.get('noteId') ?? 0);
+      if (!noteId) return json(res, 400, { ok: false, error: 'noteId required' });
+      return json(res, 200, { ok: true, ...dreamRollback(openStore(), noteId) });
     },
   });
 

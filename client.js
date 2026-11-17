@@ -65,6 +65,7 @@ const EMPTY_HIGHLIGHT = [];
         auditHint: '审计模式：显示历史（被替代/已删除/失效）',
         exportNow: '导出',
         restore: '恢复',
+        rollback: '反替代',
         deleted: '已删除',
         kindEntity: '实体',
         nodeMeta: '层级 {scope} · 重要度 {importance}',
@@ -131,6 +132,7 @@ const EMPTY_HIGHLIGHT = [];
         auditHint: 'Audit view: history (superseded / deleted / expired)',
         exportNow: 'Export',
         restore: 'Restore',
+        rollback: 'Roll back',
         deleted: 'Deleted',
         kindEntity: 'Entity',
         nodeMeta: 'layer {scope} · importance {importance}',
@@ -174,7 +176,7 @@ const EMPTY_HIGHLIGHT = [];
       return String(template).replace(/\{(\w+)\}/g, (_, key) => String(vars[key] ?? ''));
     }
 
-    function Card({ item, t, onForget, onRestore }) {
+    function Card({ item, t, onForget, onRestore, onRollback }) {
       const [busy, setBusy] = React.useState(false);
       const kindLabel = item.kind === 'note' ? t('note') : item.kind === 'fact' ? t('fact') : item.kind === 'chunk' ? t('transcript') : item.kind;
       const verdictKey = {
@@ -192,6 +194,12 @@ const EMPTY_HIGHLIGHT = [];
         if (busy || !onRestore) return;
         setBusy(true);
         try { await onRestore(item.kind, item.id); } finally { setBusy(false); }
+      };
+
+      const rollback = async () => {
+        if (busy || !onRollback) return;
+        setBusy(true);
+        try { await onRollback(item.id); } finally { setBusy(false); }
       };
 
       return h('div', {
@@ -213,6 +221,11 @@ const EMPTY_HIGHLIGHT = [];
                 type: 'button', onClick: restore, disabled: busy,
                 style: { ...BTN, fontSize: 10, padding: '1px 8px' },
               }, busy ? '…' : t('restore'))
+            : item.superseded_by && onRollback
+            ? h('button', {
+                type: 'button', onClick: rollback, disabled: busy,
+                style: { ...BTN, fontSize: 10, padding: '1px 8px' },
+              }, busy ? '…' : t('rollback'))
             : h('button', {
                 type: 'button', onClick: forget, disabled: busy,
                 style: {
@@ -289,6 +302,17 @@ const EMPTY_HIGHLIGHT = [];
       const restore = async (kind, id) => {
         try {
           await fetch(`/omni-memory/restore?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`, {
+            method: 'POST',
+            headers: { accept: 'application/json', 'x-omni-csrf': '1' },
+          });
+        } finally {
+          await load(offset);
+        }
+      };
+
+      const rollbackDream = async (noteId) => {
+        try {
+          await fetch(`/omni-memory/dream/rollback?noteId=${encodeURIComponent(noteId)}`, {
             method: 'POST',
             headers: { accept: 'application/json', 'x-omni-csrf': '1' },
           });
@@ -534,7 +558,7 @@ const EMPTY_HIGHLIGHT = [];
               items.length === 0
                 ? h('div', { style: { ...MUTED, paddingTop: 10 } }, t('empty'))
                 : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
-                    ...items.map(item => h(Card, { key: `${item.kind}-${item.id}`, item, t, onForget: forget, onRestore: restore }))),
+                    ...items.map(item => h(Card, { key: `${item.kind}-${item.id}`, item, t, onForget: forget, onRestore: restore, onRollback: rollbackDream }))),
               h('div', { style: { display: 'flex', gap: 6, justifyContent: 'space-between' } },
                 h('button', {
                   type: 'button', style: { ...ghostButton, flex: 1 }, disabled: from <= 0,

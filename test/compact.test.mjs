@@ -73,7 +73,7 @@ test('D-10 the list route exposes verification and contested state', async () =>
   const written = await app.call('memory_write', {
     kind: 'note', text: '部署方式最终选择 Docker 容器方案', source: 'session:listcase#1',
   });
-  await app.call('memory_dream', { apply: true });
+  await app.call('memory_dream', { apply: true, commit: true });
 
   // The working list shows live memory only: a dream-replaced note is history.
   const live = fakeRes();

@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-memory",
-  "version": "2.5.0",
+  "version": "2.6.0",
   "private": true,
   "type": "module",
   "description": "Omni memory for DeepSeek Harness: append-only transcripts, bi-temporal facts, self-verifying notes, hybrid retrieval, project scoping and an interactive star map.",

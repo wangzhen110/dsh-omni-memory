@@ -43,7 +43,7 @@ test('FR-20 a note contradicted by its transcript is flagged and superseded', as
   assert.deepEqual(dryAction.missingTokens, ['docker']);
   assert.equal(readNote(app.home, written.value.id).verification, null, 'dry run must not write');
 
-  const applied = await app.call('memory_dream', { apply: true });
+  const applied = await app.call('memory_dream', { apply: true, commit: true });
   const action = applied.value.actions.find(item => item.noteId === written.value.id);
   assert.equal(action.verdict, 'contradicted');
   assert.equal(typeof action.replacementId, 'number');
