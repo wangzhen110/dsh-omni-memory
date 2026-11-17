@@ -401,6 +401,7 @@ function openStore() {
 }
 
 export const SCHEMA_VERSION = 10;
+let hostCtx = null;
 
 function columnExists(db, table, column) {
   try {
@@ -2146,7 +2147,192 @@ function personaSet(db, input) {
   return personaGet(db);
 }
 
+/** Evidence for persona synthesis: recent high-signal notes and active facts. */
+function personaEvidence(db) {
+  const notes = [];
+  const facts = [];
+  const technical = /(插件|面板|schema|ADR|memory_|测试|路由|接口|迁移|数据库|函数|字段|版本|用例|构建|HTTP)/i;
+  try {
+    const rows = db.prepare(`
+      SELECT text FROM notes
+      WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0
+      ORDER BY importance DESC, ts DESC LIMIT 40
+    `).all();
+    for (const row of rows) {
+      const text = String(row.text);
+      if (!technical.test(text)) notes.push(text);
+    }
+  } catch { /* ignore */ }
+  try {
+    const rows = db.prepare(`
+      SELECT subject, relation, object FROM facts
+      WHERE deleted_at IS NULL AND valid_to IS NULL
+      ORDER BY confidence DESC, valid_from DESC LIMIT 80
+    `).all();
+    for (const row of rows) facts.push(`${row.subject} ${row.relation} ${row.object}`);
+  } catch { /* ignore */ }
+  const utterances = [];
+  try {
+    const rows = db.prepare(`
+      SELECT text FROM chunks
+      WHERE role = 'user' AND deleted_at IS NULL
+      ORDER BY ts DESC LIMIT 100
+    `).all();
+    for (const row of rows) {
+      const text = String(row.text);
+      if (!technical.test(text) && text.length <= 600) utterances.push(text);
+    }
+  } catch { /* ignore */ }
+  return { notes, facts, utterances };
+}
+
+const PERSONA_RELATIONS = {
+  称呼: /^(称呼|名字|昵称|name)$/i,
+  偏好: /(喜欢|偏好|讨厌|常用|习惯用|prefer)/i,
+  习惯: /(习惯|每天|通常|定期|固定)/i,
+  性格: /(性格|风格|说话)/i,
+};
+
+/** Rule extraction: works offline; the model only refines these results. */
+function personaFromRules(evidence) {
+  const out = {};
+  const add = (key, value) => {
+    const text = String(value ?? '').trim().replace(/\s+/g, ' ');
+    if (!personaValueOk(text)) return;
+    out[key] = out[key] ? `${out[key]}；${text}` : text;
+  };
+  const userSubject = /^(用户|我|user|me)$/i;
+  for (const line of evidence.facts) {
+    const parts = String(line).split(' ');
+    if (parts.length < 3) continue;
+    const subject = parts[0];
+    if (!userSubject.test(subject)) continue;
+    const object = parts.slice(2).join(' ');
+    const relation = parts[1];
+    if (PERSONA_RELATIONS.称呼.test(relation)) add('称呼', object);
+    else if (PERSONA_RELATIONS.偏好.test(relation)) add('偏好', `${relation} ${object}`);
+    else if (PERSONA_RELATIONS.习惯.test(relation)) add('习惯', `${relation} ${object}`);
+    else if (PERSONA_RELATIONS.性格.test(relation)) add('性格', `${relation} ${object}`);
+  }
+  for (const note of [...evidence.utterances, ...evidence.notes]) {
+    const patterns = [
+      ['称呼', /(?:叫我|称呼我|可以叫我|我的名字是)[：:\s]*(?:是)?\s*([^\n。；，,]{1,20})/],
+      ['性格', /(?:我的性格|回答风格|说话方式)[：:\s是为]+([^\n。；]{1,50})/],
+      ['偏好', /我(?:更|最)?(?:喜欢|偏好|讨厌|不要)[^\n。；]{0,40}/],
+      ['偏好', /(?:以后|今后)[^。；\n]{2,30}(?:都|统一|用|说)[^。；\n]{0,20}/],
+      ['偏好', /(?:不要|别)[^。；\n]{4,30}/],
+      ['习惯', /我(?:习惯|每天|通常|定期)[^\n。；]{0,40}/],
+    ];
+    for (const pair of patterns) {
+      const key = pair[0];
+      const match = String(note).match(pair[1]);
+      if (match) add(key, match[1] ?? match[0]);
+    }
+  }
+  return out;
+}
+
+const PERSONA_BAD_VALUE = /(插件|面板|schema|ADR|memory_|测试|路由|接口|迁移|数据库|函数|字段|版本|用例|构建|HTTP|JSON|body|sessionQuery|conversation|chat|flow|API|token|\/)/i;
+
+function personaValueOk(value) {
+  const text = String(value ?? '').trim();
+  if (!text || text.length < 2 || text.length > 200) return false;
+  if (PERSONA_BAD_VALUE.test(text)) return false;
+  return true;
+}
+
+function parsePersonaJson(text) {
+  try {
+    const match = String(text ?? '').match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    const parsed = JSON.parse(match[0]);
+    const out = {};
+    for (const key of ['称呼', '性格', '习惯', '偏好', '其他']) {
+      const value = String(parsed[key] ?? '').trim();
+      if (personaValueOk(value)) out[key] = value;
+    }
+    return Object.keys(out).length ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+async function personaFromModel(ctx, evidence) {
+  try {
+    const llm = typeof ctx?.get === 'function' ? ctx.get('llm') : undefined;
+    if (!llm || typeof llm.stream !== 'function') return null;
+    const route = await pickJudgeRoute(llm);
+    if (!route) return null;
+    const evidenceText = [...evidence.utterances, ...evidence.facts, ...evidence.notes]
+      .map(item => `- ${String(item).replace(/\s+/g, ' ').slice(0, 160)}`)
+      .join('\n')
+      .slice(0, 6000);
+    if (!evidenceText) return null;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    let out = '';
+    try {
+      const stream = llm.stream({
+        provider: route.provider,
+        model: route.model,
+        system: 'Extract the long-lived settings of the user from their memory records. Fields: 称呼 (how to address them), 性格 (communication style), 习惯 (recurring routines), 偏好 (likes/dislikes), 其他. Only use facts present in the records; empty fields are allowed. Reply with a single JSON object using those keys.',
+        messages: [{ role: 'user', content: [{ type: 'text', text: `records:\n${evidenceText}\nJSON:` }] }],
+        maxTokens: 400,
+        temperature: 0,
+        signal: controller.signal,
+      });
+      for await (const chunk of stream) {
+        if (chunk?.type === 'text-delta') out += chunk.text ?? '';
+        else if (chunk?.type === 'finish') break;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+    return parsePersonaJson(out);
+  } catch {
+    return null;
+  }
+}
+
+/** Synthesize settings from everyday memory; rules first, model refinement second. */
+async function personaRefresh(ctx, options = {}) {
+  const s = openStore();
+  const evidence = personaEvidence(s.db);
+  const rules = personaFromRules(evidence);
+  const model = await personaFromModel(ctx ?? hostCtx, evidence);
+  const merged = { ...rules, ...(model ?? {}) };
+  const source = model ? 'model' : 'rules';
+  if (options.apply === true && Object.keys(merged).length) {
+    personaSet(s.db, merged);
+    metaSet(s.db, 'persona_updated_at', now());
+    metaSet(s.db, 'persona_source', source);
+  }
+  return {
+    persona: options.apply === true ? personaGet(s.db) : merged,
+    source,
+    applied: options.apply === true,
+    evidence: evidence.utterances.length + evidence.notes.length + evidence.facts.length,
+  };
+}
+
+/** Occasionally re-derive persona from everyday memory (never blocks a write). */
+function maybeRefreshPersona(ctx) {
+  try {
+    if (typeof ctx?.get !== 'function' || !ctx.get('llm')) return;
+    const s = openStore();
+    const pending = Number(metaGet(s.db, 'persona_pending') ?? 0) + 1;
+    const last = Number(metaGet(s.db, 'persona_updated_at') ?? 0);
+    if (pending < 20 || now() - last < 3_600_000) {
+      metaSet(s.db, 'persona_pending', pending);
+      return;
+    }
+    metaSet(s.db, 'persona_pending', 0);
+    setTimeout(() => { void personaRefresh(ctx, { apply: true }).catch(() => {}); }, 0);
+  } catch { /* best effort */ }
+}
+
 /** Prompt lines for the always-injected persona block, kept short and explicit. */
+
 function personaLines(db) {
   const values = personaGet(db);
   const keys = Object.keys(values);
@@ -2466,6 +2652,7 @@ function defineTools(ctx) {
         });
         entityCache = { names: [], at: 0 };
         invalidateProfile();
+        maybeRefreshPersona(ctx);
         enqueueJudge(ctx, {
           kind: 'fact', table: 'facts', id: Number(result.factId),
           text: text || `${subject} ${relation} ${object}`,
@@ -2642,7 +2829,7 @@ function defineTools(ctx) {
       type: 'object',
       additionalProperties: false,
       properties: {
-        action: { type: 'string', enum: ['get', 'set'], description: 'get returns the current settings; set replaces them.' },
+        action: { type: 'string', enum: ['get', 'set', 'refresh'], description: 'get reads, set replaces, refresh synthesizes settings from recent memory.' },
         values: {
           type: 'object',
           additionalProperties: true,
@@ -2661,6 +2848,9 @@ function defineTools(ctx) {
     },
     async execute(args = {}) {
       const s = openStore();
+      if (String(args.action) === 'refresh') {
+        return personaRefresh(hostCtx, { apply: args.apply !== false });
+      }
       if (String(args.action) === 'set') {
         if (!args.values || typeof args.values !== 'object') throw new Error('values is required for set');
         return { persona: personaSet(s.db, args.values) };
@@ -3450,6 +3640,23 @@ function registerRoutes(ctx) {
 
   add({
     kind: 'exact',
+    path: '/omni-memory/persona/refresh',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) return json(res, 403, { ok: false });
+      if (String(req.method ?? 'GET').toUpperCase() !== 'POST') return json(res, 405, { ok: false, error: 'refresh requires POST' });
+      if (!mutationAllowed(req)) return json(res, 403, { ok: false, error: 'forbidden' });
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      const apply = String(url.searchParams.get('dryRun') ?? '') !== '1';
+      try {
+        return json(res, 200, { ok: true, ...await personaRefresh(hostCtx, { apply }) });
+      } catch (error) {
+        return json(res, 400, { ok: false, error: String(error?.message ?? error) });
+      }
+    },
+  });
+
+  add({
+    kind: 'exact',
     path: '/omni-memory/dream/proposals',
     handler: async (req, res) => {
       if (!isLoopback(req)) return json(res, 403, { ok: false });
@@ -3609,6 +3816,7 @@ function registerRoutes(ctx) {
 }
 
 export function apply(ctx) {
+  hostCtx = ctx;
   ctx.effect(() => {
     const disposers = defineTools(ctx);
     return () => {

@@ -74,7 +74,8 @@ const EMPTY_HIGHLIGHT = [];
         personaHabits: '习惯',
         personaPreferences: '偏好',
         personaOther: '其他',
-        personaHint: '这些设定会注入系统提示并长期生效；留空即清除该项。',
+        personaHint: 'AI 会从日常记忆里提炼这些设定；也可以在这里修正。留空即清除该项。',
+        personaDerive: '重新提炼',
         personaSave: '保存',
         personaClose: '关闭',
         deleted: '已删除',
@@ -152,7 +153,8 @@ const EMPTY_HIGHLIGHT = [];
         personaHabits: 'Habits',
         personaPreferences: 'Preferences',
         personaOther: 'Other',
-        personaHint: 'Injected into the system prompt and kept across sessions; empty clears a field.',
+        personaHint: 'The assistant derives these from everyday memory; edit to correct. Empty clears a field.',
+        personaDerive: 'Derive',
         personaSave: 'Save',
         personaClose: 'Close',
         deleted: 'Deleted',
@@ -363,6 +365,22 @@ const EMPTY_HIGHLIGHT = [];
         } catch { /* keep an empty form */ }
       };
 
+      const refreshPersona = async () => {
+        if (personaBusy) return;
+        setPersonaBusy(true);
+        try {
+          await fetch('/omni-memory/persona/refresh', {
+            method: 'POST',
+            headers: { accept: 'application/json', 'x-omni-csrf': '1' },
+          });
+          const response = await fetch('/omni-memory/persona', { headers: { accept: 'application/json' } });
+          const body = await response.json();
+          setPersonaDraft(body?.persona ?? {});
+        } finally {
+          setPersonaBusy(false);
+        }
+      };
+
       const savePersona = async () => {
         if (personaBusy) return;
         setPersonaBusy(true);
@@ -542,6 +560,8 @@ const EMPTY_HIGHLIGHT = [];
                   },
                 }))),
               h('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
+                h('button', { type: 'button', style: ghostButton, onClick: refreshPersona, disabled: personaBusy },
+                  personaBusy ? '…' : t('personaDerive')),
                 h('button', { type: 'button', style: ghostButton, onClick: () => setPersonaOpen(false) }, t('personaClose')),
                 h('button', { type: 'button', style: ghostButton, onClick: savePersona, disabled: personaBusy },
                   personaBusy ? '…' : t('personaSave')))))

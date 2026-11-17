@@ -5,7 +5,7 @@
 > ⚠️ **许可提醒**：本项目采用 **CC BY-NC 4.0** —— 可自由使用、修改、二次开发、借鉴，
 > 但**禁止任何商业用途**，且**必须署名作者**。商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-211%2F211-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-217%2F217-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)](LICENSE)
 
 ---
@@ -44,7 +44,7 @@
 
 ```bash
 cd memory-core
-npm test          # 211 个用例
+npm test          # 217 个用例
 npm run check     # 语法与 JSON 校验
 ```
 
@@ -86,7 +86,7 @@ npm run check     # 语法与 JSON 校验
 | `memory_compact` | 转录增长治理（默认 dry-run） |
 | `memory_reindex` | 回填缺失向量（hashed / remote）；`bigrams: true` 一次重建全库 CJK 两字索引 |
 | `memory_link_entity` | 登记实体别名并合并事实/边（默认 dry-run） |
-| `memory_persona` | 读写用户设定：称呼 / 性格 / 习惯 / 偏好 / 其他 |
+| `memory_persona` | 读取/修正/自动提炼用户设定：称呼 / 性格 / 习惯 / 偏好 / 其他 |
 | `memory_export` | 导出 JSON 备份（默认含墓碑；`activeOnly` 只导活跃） |
 | `memory_import` | 合并导入备份（默认 dry-run，按内容去重，重建向量） |
 | `memory_restore` | 恢复一条被墓碑化的记忆（重建索引） |
@@ -99,7 +99,7 @@ npm run check     # 语法与 JSON 校验
 
 ## 测试与指标
 
-- 自动化用例：**211 / 211 通过**
+- 自动化用例：**217 / 217 通过**
 - 检索延迟：10,000 行语料 p95 ≈ **2.2ms**；100,000 行 ≈ 5.8ms；1,000,000 行 ≈ 13.3ms；1M + 5 万向量 + 100 万 bigram ≈ 56ms（两段式有界检索，见 ADR-020）
 - 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 混合检索 **0.927**
 

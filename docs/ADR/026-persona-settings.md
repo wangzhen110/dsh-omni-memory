@@ -45,7 +45,17 @@ CREATE TABLE persona (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTE
 - 工具 `memory_persona({ action: 'get' | 'set', values })`；
 - HTTP `GET/POST /omni-memory/persona`：写操作 POST + CSRF + 同源，参数放查询串（宿主可能读空 body）。
 
-### 4. 不做的事
+### 4. 自动提炼（v3.1.0 修订）
+
+设定不应由用户逐条填写，而应从日常记忆中生长出来：
+
+- **证据**：活跃事实（按 confidence/时间取前 80）+ 高重要度未争议笔记（前 40）；
+- **规则层**：事实关系（称呼/喜欢/习惯/性格）与笔记句式（"叫我…"、"回答风格：…"、"喜欢…"），离线可解释；
+- **模型层**：宿主有 `llm` 时用小模型输出 JSON，失败回退规则；提示词明确"只能用记录里的事实"；
+- **频率**：每 20 次相关写入且距上次 ≥1 小时，后台刷新，不阻塞写入；
+- **人工修正**：面板可改字段，保存即覆盖；「重新提炼」按钮可手动触发。
+
+### 5. 不做的事
 
 - 不做按项目覆盖（设定是跨项目恒定的；项目差异用记忆/提示表达）；
 - 不做版本历史（这是配置，不是知识；需要时用导出备份）；
@@ -60,4 +70,5 @@ CREATE TABLE persona (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTE
 ## 验证
 
 - `test/persona.test.mjs` 5 例：工具读写、超长拒绝、HTTP CSRF、注入、清空移除；
+- `test/persona-auto.test.mjs` 3 例：规则提炼、宿主模型提炼、refresh 路由鉴权；
 - 真机：设置后 GET 回读、面板按钮渲染（截图受前台窗口限制，见 ADR-017 的同类说明）。
