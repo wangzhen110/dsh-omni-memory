@@ -2,6 +2,19 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [2.3.3] — 2026-11-17
+
+### 防复发护栏（ADR-018）
+- **状态×读取路径矩阵测试**：新增 `test/lifecycle.test.mjs`（7 例），覆盖 active / superseded / tombstoned / contested / expired × global / 项目 A / 项目 B × search / profile / graph / node / list / 重新捕获转录。首次运行即抓到真实泄漏：面板列表仍返回被替代笔记。
+- **活跃视图与审计视图分离**：`/omni-memory/list` 默认只返回活跃记忆；新增 `?audit=1` 保留历史（被替代笔记、失效事实）可见，含 verification/evidence/superseded_by。
+- **文档一致性门禁**：新增 `scripts/check-docs.mjs`，实测版本、用例数、工具数、路由数、ADR 数并与 README/DESIGN/CHANGELOG 核对，不一致即 `npm run check` 失败。
+- **威胁模型**：新增 `docs/THREAT-MODEL.md`，写清资产、参与者、信任边界、现有控制、残余风险与新增路由检查清单。
+- **CI**：`.github/workflows/ci.yml` 在 Node 24 上执行 `npm run check` + `npm test`。
+- 外部补丁接收流程写入 ADR-018（核对声称文件、隔离分支、dry-run、通读 hunk、独立补测试、真机冒烟）。
+
+### 测试
+- **170 / 170 通过**（新增 7 条生命周期矩阵）。
+
 ## [2.3.2] — 2026-11-17
 
 ### 可靠性（代码级评审修复）

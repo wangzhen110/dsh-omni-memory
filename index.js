@@ -2264,6 +2264,11 @@ function registerRoutes(ctx) {
       const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit') ?? 40)));
       const offset = Math.max(0, Number(url.searchParams.get('offset') ?? 0));
       const scopeFilter = String(url.searchParams.get('scope') ?? 'all');
+      // The working list shows live memory; `audit=1` keeps superseded notes and
+      // expired facts browsable for review without mixing them into recall.
+      const audit = String(url.searchParams.get('audit') ?? '') === '1';
+      const noteActive = audit ? '' : 'AND superseded_by IS NULL';
+      const factActive = audit ? '' : 'AND valid_to IS NULL';
       // Layer filter: 'all' | 'global' | 'project' (any proj:*), or one exact key.
       let scopeSql = '';
       let scopeParams = [];
@@ -2278,22 +2283,22 @@ function registerRoutes(ctx) {
       const notes = s.db.prepare(`
         SELECT id, ts, scope, text, importance, source, revision, contested,
                superseded_by, verification, verified_at, evidence
-        FROM notes WHERE deleted_at IS NULL ${scopeSql}
+        FROM notes WHERE deleted_at IS NULL ${noteActive} ${scopeSql}
         ORDER BY importance DESC, ts DESC LIMIT ? OFFSET ?
       `).all(...scopeParams, limit, offset);
       const facts = s.db.prepare(`
         SELECT id, subject, relation, object, text, confidence, source,
                valid_from, valid_to, contested, scope
-        FROM facts WHERE deleted_at IS NULL ${scopeSql}
+        FROM facts WHERE deleted_at IS NULL ${factActive} ${scopeSql}
         ORDER BY valid_from DESC LIMIT ? OFFSET ?
       `).all(...scopeParams, limit, offset);
       const count = (table, extra = '', params = []) => Number(s.db.prepare(
         `SELECT COUNT(*) AS n FROM ${table} WHERE deleted_at IS NULL ${extra}`
       ).get(...params).n);
-      const totalNotes = count('notes', scopeSql, scopeParams);
-      const totalFacts = count('facts', scopeSql, scopeParams);
-      const globalNotes = count('notes', "AND (scope = 'global' OR scope IS NULL)");
-      const projectNotes = count('notes', "AND scope LIKE 'proj:%'");
+      const totalNotes = count('notes', `${noteActive} ${scopeSql}`, scopeParams);
+      const totalFacts = count('facts', `${factActive} ${scopeSql}`, scopeParams);
+      const globalNotes = count('notes', "AND superseded_by IS NULL AND (scope = 'global' OR scope IS NULL)");
+      const projectNotes = count('notes', "AND superseded_by IS NULL AND scope LIKE 'proj:%'");
 
       // Project overview: every project layer with what it actually holds. Notes
       // are model-written conclusions; transcripts are captured automatically, so
@@ -2306,10 +2311,10 @@ function registerRoutes(ctx) {
         projects.set(scope, entry);
       };
       for (const row of s.db.prepare(
-        "SELECT scope, COUNT(*) AS n, MAX(ts) AS last FROM notes WHERE deleted_at IS NULL AND scope LIKE 'proj:%' GROUP BY scope"
+        "SELECT scope, COUNT(*) AS n, MAX(ts) AS last FROM notes WHERE deleted_at IS NULL AND superseded_by IS NULL AND scope LIKE 'proj:%' GROUP BY scope"
       ).all()) bump(row.scope, 'notes', row.n, row.last);
       for (const row of s.db.prepare(
-        "SELECT scope, COUNT(*) AS n, MAX(valid_from) AS last FROM facts WHERE deleted_at IS NULL AND scope LIKE 'proj:%' GROUP BY scope"
+        "SELECT scope, COUNT(*) AS n, MAX(valid_from) AS last FROM facts WHERE deleted_at IS NULL AND valid_to IS NULL AND scope LIKE 'proj:%' GROUP BY scope"
       ).all()) bump(row.scope, 'facts', row.n, row.last);
       for (const row of s.db.prepare(
         "SELECT scope, COUNT(*) AS n, MAX(ts) AS last FROM chunks WHERE deleted_at IS NULL AND scope LIKE 'proj:%' GROUP BY scope"

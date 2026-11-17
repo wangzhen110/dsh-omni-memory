@@ -5,7 +5,7 @@
 > ⚠️ **许可提醒**：本项目采用 **CC BY-NC 4.0** —— 可自由使用、修改、二次开发、借鉴，
 > 但**禁止任何商业用途**，且**必须署名作者**。商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-163%2F163-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-170%2F170-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)](LICENSE)
 
 ---
@@ -30,6 +30,7 @@
 - **冲突标记**：显式声明或近重复自动标记 `contested`，只标记不删除；画像与自动召回默认排除 contested
 - **做梦校验**：离线拿转录核对笔记，发现"与原文矛盾"时用证据生成替代笔记并保留旧行
 - **记忆星图**：整屏旋臂星系，拖拽旋转/滚轮缩放/分层切换；**单击任意星点弹出记忆卡**，搜索命中会亮起脉冲光环
+- **活跃视图**：列表/搜索默认只显示活跃记忆；历史（被替代、已失效）通过 `?audit=1` 审计视图查看
 - **隐私**：全部数据在本地 SQLite（`$DSH_HOME/memory/omni.db`），HTTP 只监听 loopback；写操作只接受 POST 并校验 Origin/CSRF 头
 
 ## 安装
@@ -42,7 +43,7 @@
 
 ```bash
 cd memory-core
-npm test          # 163 个用例
+npm test          # 170 个用例
 npm run check     # 语法与 JSON 校验
 ```
 
@@ -86,7 +87,7 @@ npm run check     # 语法与 JSON 校验
 
 ## 测试与指标
 
-- 自动化用例：**163 / 163 通过**
+- 自动化用例：**170 / 170 通过**
 - 检索延迟：10,000 行语料 p95 ≈ **4ms**；100,000 行 ≈ 93ms；1,000,000 行 ≈ 911ms（超出 300ms 预算，见 DESIGN NFR-01）
 - 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 混合检索 **0.927**
 
@@ -105,7 +106,8 @@ npm run bench:golden   # 黄金集
 ## 文档
 
 - [设计规格](docs/DESIGN.md)（需求、架构、数据模型、契约、失败模式、追溯矩阵）
-- [架构决策记录](docs/ADR)（17 份）
+- [架构决策记录](docs/ADR)（18 份）
+- [威胁模型](docs/THREAT-MODEL.md)（信任边界、残余风险、新增路由检查清单）
 - [更新日志](docs/CHANGELOG.md)
 - [架构图](docs/architecture.png)
 

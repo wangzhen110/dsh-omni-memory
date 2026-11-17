@@ -74,11 +74,19 @@ test('D-10 the list route exposes verification and contested state', async () =>
     kind: 'note', text: '部署方式最终选择 Docker 容器方案', source: 'session:listcase#1',
   });
   await app.call('memory_dream', { apply: true });
-  const { res, json } = fakeRes();
-  await app.route('/omni-memory/list').handler(fakeReq('/omni-memory/list?limit=10'), res);
-  const body = json();
+
+  // The working list shows live memory only: a dream-replaced note is history.
+  const live = fakeRes();
+  await app.route('/omni-memory/list').handler(fakeReq('/omni-memory/list?limit=10'), live.res);
+  const liveBody = live.json();
+  assert.equal(liveBody.notes.some(note => note.id === written.value.id), false);
+
+  // `audit=1` keeps the replacement visible with its verification evidence.
+  const audit = fakeRes();
+  await app.route('/omni-memory/list').handler(fakeReq('/omni-memory/list?limit=10&audit=1'), audit.res);
+  const body = audit.json();
   const row = body.notes.find(note => note.id === written.value.id);
-  assert.ok(row, 'the note must be listed');
+  assert.ok(row, 'the note must be listed in audit mode');
   assert.equal(row.contested, 1);
   assert.equal(row.verification, 'contradicted');
   assert.equal(row.evidence, 'session:listcase#1');
