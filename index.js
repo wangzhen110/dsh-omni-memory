@@ -400,7 +400,7 @@ function openStore() {
   return store;
 }
 
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 function columnExists(db, table, column) {
   try {
@@ -530,6 +530,16 @@ const MIGRATIONS = [
       CREATE INDEX IF NOT EXISTS entity_aliases_canonical ON entity_aliases(canonical);
     `);
   },
+  // v10: user-defined persona settings (personality, habits, preferences...).
+  db => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS persona (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER
+      );
+    `);
+  },
 ];
 
 function migrate(db) {
@@ -544,7 +554,8 @@ function migrate(db) {
     if (typeof step === 'function') step(db);
   }
   // Repair path: never trust the version marker alone. A database whose marker
-  // says v8 but lacks the v8 artifacts is repaired in place (add column, table).
+  // is current but lacks a table/column is repaired in place; this is what a
+  // migration inserted at the wrong array index used to produce.
   if (SCHEMA_VERSION >= 8 && !columnExists(db, 'facts', 'cardinality')) {
     addColumn(db, 'facts', 'cardinality', "TEXT NOT NULL DEFAULT 'single'");
     db.exec(`
@@ -552,6 +563,25 @@ function migrate(db) {
         name TEXT PRIMARY KEY,
         cardinality TEXT NOT NULL DEFAULT 'single',
         aliases TEXT,
+        updated_at INTEGER
+      );
+    `);
+  }
+  if (SCHEMA_VERSION >= 9) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS entity_aliases (
+        alias TEXT PRIMARY KEY,
+        canonical TEXT NOT NULL,
+        updated_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS entity_aliases_canonical ON entity_aliases(canonical);
+    `);
+  }
+  if (SCHEMA_VERSION >= 10) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS persona (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
         updated_at INTEGER
       );
     `);
@@ -2072,6 +2102,63 @@ function profileFactLines(db, scopeKey, budget) {
   return lines.length > 1 ? lines : [];
 }
 
+const PERSONA_DEFAULT_KEYS = ['称呼', '性格', '习惯', '偏好', '其他'];
+const PERSONA_MAX_VALUE = 1200;
+const PERSONA_MAX_TOTAL = 4000;
+
+function personaGet(db) {
+  try {
+    const rows = db.prepare('SELECT key, value FROM persona ORDER BY key').all();
+    const out = {};
+    for (const row of rows) out[String(row.key)] = String(row.value);
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/** Validate one persona map; arbitrary keys are allowed, values are plain text. */
+function personaNormalize(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('values must be an object');
+  const values = {};
+  let total = 0;
+  for (const [rawKey, rawValue] of Object.entries(input)) {
+    const key = String(rawKey).trim();
+    const value = String(rawValue ?? '').trim();
+    if (!key) continue;
+    if (key.length > 40) throw new Error('persona key is too long');
+    if (value.length > PERSONA_MAX_VALUE) throw new Error(`persona value for "${key}" is too long`);
+    if (!value) continue;
+    total += value.length;
+    values[key] = value;
+  }
+  if (total > PERSONA_MAX_TOTAL) throw new Error('persona settings are too long');
+  return values;
+}
+
+function personaSet(db, input) {
+  const values = personaNormalize(input);
+  transaction(db, () => {
+    db.exec('DELETE FROM persona');
+    const insert = db.prepare('INSERT INTO persona(key, value, updated_at) VALUES (?, ?, ?)');
+    for (const [key, value] of Object.entries(values)) insert.run(key, value, now());
+  });
+  return personaGet(db);
+}
+
+/** Prompt lines for the always-injected persona block, kept short and explicit. */
+function personaLines(db) {
+  const values = personaGet(db);
+  const keys = Object.keys(values);
+  if (!keys.length) return [];
+  const lines = ['用户长期设定（来自面板，高于临时指令）：'];
+  for (const key of keys) {
+    const line = `- ${key}：${String(values[key]).replace(/\s+/g, ' ').slice(0, 300)}`;
+    lines.push(line);
+  }
+  return lines;
+}
+
 /** Read the highest-importance notes that fit the always-injected budget. */
 function buildProfileText(projectKey) {
   const s = openStore();
@@ -2545,6 +2632,40 @@ function defineTools(ctx) {
         processed += before - after;
       }
       return { processed, queued: pendingVectors.size, backend: `remote:${dim}`, ...(bigrams ? { bigrams } : {}) };
+    },
+  }));
+
+  disposers.push(ctx.tools.register({
+    name: 'memory_persona',
+    description: 'Read or write the long-lived user settings (name, personality, habits, preferences, custom fields). These are injected into the system prompt; values are plain text.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['get', 'set'], description: 'get returns the current settings; set replaces them.' },
+        values: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'set only: map of field -> text. Empty values are removed; total length is capped at 4000 characters.',
+        },
+      },
+      required: ['action'],
+    },
+    output: {
+      schema: { type: 'object', properties: { persona: { type: 'object' } } },
+      render: (_args, value) => textBlock(
+        Object.keys(value.persona).length
+          ? Object.entries(value.persona).map(([key, text]) => `${key}：${text}`).join('\n')
+          : 'no persona settings',
+      ),
+    },
+    async execute(args = {}) {
+      const s = openStore();
+      if (String(args.action) === 'set') {
+        if (!args.values || typeof args.values !== 'object') throw new Error('values is required for set');
+        return { persona: personaSet(s.db, args.values) };
+      }
+      return { persona: personaGet(s.db) };
     },
   }));
 
@@ -3304,6 +3425,31 @@ function registerRoutes(ctx) {
 
   add({
     kind: 'exact',
+    path: '/omni-memory/persona',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) return json(res, 403, { ok: false });
+      const s = openStore();
+      const method = String(req.method ?? 'GET').toUpperCase();
+      if (method === 'GET') return json(res, 200, { ok: true, persona: personaGet(s.db) });
+      if (method !== 'POST') return json(res, 405, { ok: false, error: 'persona requires GET or POST' });
+      if (!mutationAllowed(req)) return json(res, 403, { ok: false, error: 'forbidden' });
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      let values;
+      try {
+        values = JSON.parse(url.searchParams.get('values') ?? '{}');
+      } catch {
+        return json(res, 400, { ok: false, error: 'values must be JSON' });
+      }
+      try {
+        return json(res, 200, { ok: true, persona: personaSet(s.db, values) });
+      } catch (error) {
+        return json(res, 400, { ok: false, error: String(error?.message ?? error) });
+      }
+    },
+  });
+
+  add({
+    kind: 'exact',
     path: '/omni-memory/dream/proposals',
     handler: async (req, res) => {
       if (!isLoopback(req)) return json(res, 403, { ok: false });
@@ -3511,6 +3657,9 @@ export function apply(ctx) {
       text: assemblyContext => {
         const project = projectForScope(assemblyContext?.scope);
         const lines = [];
+        try {
+          lines.push(...personaLines(openStore().db));
+        } catch { /* persona is optional */ }
         const body = cachedProfile(project);
         if (body) {
           lines.push('Long-term memory from earlier sessions. It may be stale; confirm with memory_search before relying on it for a destructive or irreversible action.');

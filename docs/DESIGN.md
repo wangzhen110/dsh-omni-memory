@@ -3,7 +3,7 @@
 | 项 | 值 |
 |---|---|
 | 文档版本 | 2.3.2 |
-| 插件版本 | 2.9.0 |
+| 插件版本 | 3.0.0 |
 | 状态 | 已评审（本文为开发与验收的**唯一依据**） |
 | 目标平台 | DeepSeek Harness 0.2.2-rc.3（Desktop，Windows 11，Node 24.17） |
 | 最后更新 | 2026-11-17 |
@@ -81,7 +81,7 @@
 | NFR-07 | 失败隔离 | 任一子系统（FTS/路由/注入）失效不得导致会话不可用 | 满足（全部 try/catch + 可选降级） |
 | NFR-08 | 隐私 | 所有数据仅存本机 `$DSH_HOME/memory/omni.db`；HTTP 仅 loopback，且浏览器跨站写请求被 Origin 校验拦截 | 部分满足：数据库未加密，loopback HTTP 仍依赖本机进程边界，未做进程级鉴权（ADR-017） |
 | NFR-09 | 可卸载 | 卸载插件后不残留运行中的监听；数据文件保留由用户决定 | 满足 |
-| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 204/204（100%） |
+| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 211/211（100%） |
 | NFR-11 | 界面本地化 | 中英词典注册，切换语言无需重载插件 | 已实现（词典 + 订阅重渲染） |
 
 ### 1.3 约束
@@ -146,9 +146,9 @@ DSH Host 进程
 │   ├── capture       session/event → chunks
 │   ├── recall        agent/inbox/claimed → 异步预取 top-3（TTL 120s）
 │   ├── retrieval     分词 / FTS / bigram / 向量 / 图游走 / RRF
-│   ├── tools         15 个模型工具（write/search/profile/timeline/forget/dream/dream_proposals/dream_replace/dream_rollback/compact/reindex/export/import/restore/link_entity）
+│   ├── tools         16 个模型工具（write/search/profile/timeline/forget/dream/dream_proposals/dream_replace/dream_rollback/compact/reindex/export/import/restore/link_entity/persona）
 │   ├── prompt        systemPrompt.section：画像 + 召回段（同步读缓存）
-│   └── routes        11 条 loopback HTTP（list/search/graph/node/forget/restore/export/status/dream/proposals/dream/replace/dream/rollback）
+│   └── routes        12 条 loopback HTTP（list/search/graph/node/forget/restore/export/status/persona/dream/proposals/dream/replace/dream/rollback）
 ├── 本插件 Client 半边（client.js，~1108 行）
 │   ├── sidebar.panellist[id=omni-memory]   左栏入口图标
 │   ├── main[key=omni-memory]               记忆面板（分页/搜索/状态/遗忘）
@@ -212,6 +212,7 @@ chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 | 5 | 做梦校验 | `notes.verified_at / verification / evidence` |
 | 5b | 多值关系（v2.8.0） | `facts.cardinality`、`relations(name, cardinality, aliases, updated_at)` |
 | 5c | 实体别名（v2.9.0） | `entity_aliases(alias, canonical, updated_at)`；写入时 subject 规范化 |
+| 5d | 用户设定（v3.0.0） | `persona(key, value, updated_at)`；始终注入，不参与 dream/检索 |
 | 6 | 旧作用域归一 | 无哈希的 `proj:*` 旧值改为 `global`（升级前它们本就全局可见） |
 
 未带版本的旧库按 v1 处理，自动补齐到当前版本；旧行不受影响（迁移只加列、不删数据）。

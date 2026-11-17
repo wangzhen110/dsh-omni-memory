@@ -2,6 +2,21 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.0.0] — 2026-11-17
+
+### 用户设定（ADR-026）
+- **Schema v10**：`persona(key, value, updated_at)`，与 notes/facts 分离，不参与检索与 dream 校验。
+- 工具 `memory_persona({ action: 'get' | 'set', values })`；面板新增「设定」按钮（称呼 / 性格 / 习惯 / 偏好 / 其他）。
+- HTTP `GET/POST /omni-memory/persona`（写操作 POST + CSRF + 同源；参数在查询串）。
+- 设定注入在系统提示最前，明确"高于临时指令"；单值 ≤1200 字、总量 ≤4000 字，空值删除。
+
+### 修复
+- **星图悬停后不再旋转**：`pointerInside` 在鼠标进入时被置 true 且从未清除，帧循环因此永久跳过自动旋转；现在仅在拖拽时暂停，并补了 `pointerleave` 清理 tooltip。
+- **迁移顺序再次修正**：v10 曾插到 v9 之前，导致 v9 库升级后 marker=10 但没有 persona 表；已修正顺序，并把 repair 扩展为"当前版本缺表就补建"（v8/v9/v10 全量检查）。
+
+### 测试
+- **211 / 211 通过**（新增 5 条 persona + 2 条迁移：v9→v10、标记已是 v10 但缺表的修复）。
+
 ## [2.9.0] — 2026-11-17
 
 ### 实体别名与多值画像（ADR-024）

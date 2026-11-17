@@ -66,6 +66,15 @@ const EMPTY_HIGHLIGHT = [];
         exportNow: '导出',
         restore: '恢复',
         rollback: '反替代',
+        personaTitle: '设定',
+        personaName: '称呼',
+        personaPersonality: '性格',
+        personaHabits: '习惯',
+        personaPreferences: '偏好',
+        personaOther: '其他',
+        personaHint: '这些设定会注入系统提示并长期生效；留空即清除该项。',
+        personaSave: '保存',
+        personaClose: '关闭',
         deleted: '已删除',
         kindEntity: '实体',
         nodeMeta: '层级 {scope} · 重要度 {importance}',
@@ -133,6 +142,15 @@ const EMPTY_HIGHLIGHT = [];
         exportNow: 'Export',
         restore: 'Restore',
         rollback: 'Roll back',
+        personaTitle: 'Persona',
+        personaName: 'Name',
+        personaPersonality: 'Personality',
+        personaHabits: 'Habits',
+        personaPreferences: 'Preferences',
+        personaOther: 'Other',
+        personaHint: 'Injected into the system prompt and kept across sessions; empty clears a field.',
+        personaSave: 'Save',
+        personaClose: 'Close',
         deleted: 'Deleted',
         kindEntity: 'Entity',
         nodeMeta: 'layer {scope} · importance {importance}',
@@ -256,6 +274,9 @@ const EMPTY_HIGHLIGHT = [];
       const [hitIds, setHitIds] = React.useState([]);
       const [focusMode, setFocusMode] = React.useState(false);
       const [audit, setAudit] = React.useState(false);
+      const [personaOpen, setPersonaOpen] = React.useState(false);
+      const [personaDraft, setPersonaDraft] = React.useState({});
+      const [personaBusy, setPersonaBusy] = React.useState(false);
 
       const load = React.useCallback(async (nextOffset = offset) => {
         try {
@@ -318,6 +339,42 @@ const EMPTY_HIGHLIGHT = [];
           });
         } finally {
           await load(offset);
+        }
+      };
+
+      const personaFields = [
+        ['称呼', 'personaName'],
+        ['性格', 'personaPersonality'],
+        ['习惯', 'personaHabits'],
+        ['偏好', 'personaPreferences'],
+        ['其他', 'personaOther'],
+      ];
+
+      const openPersona = async () => {
+        setPersonaOpen(true);
+        try {
+          const response = await fetch('/omni-memory/persona', { headers: { accept: 'application/json' } });
+          const body = await response.json();
+          setPersonaDraft(body?.persona ?? {});
+        } catch { /* keep an empty form */ }
+      };
+
+      const savePersona = async () => {
+        if (personaBusy) return;
+        setPersonaBusy(true);
+        try {
+          const values = {};
+          for (const [key] of personaFields) {
+            const text = String(personaDraft[key] ?? '').trim();
+            if (text) values[key] = text;
+          }
+          await fetch(`/omni-memory/persona?values=${encodeURIComponent(JSON.stringify(values))}`, {
+            method: 'POST',
+            headers: { accept: 'application/json', 'x-omni-csrf': '1' },
+          });
+          setPersonaOpen(false);
+        } finally {
+          setPersonaBusy(false);
         }
       };
 
@@ -427,6 +484,7 @@ const EMPTY_HIGHLIGHT = [];
             style: { ...ghostButton, ...(audit ? { borderColor: 'rgba(120,200,255,.85)', color: '#9fd8ff' } : {}) },
             onClick: () => setAudit(value => !value),
           }, t('auditMode')),
+          h('button', { type: 'button', style: ghostButton, onClick: openPersona }, t('personaTitle')),
           h('button', { type: 'button', style: ghostButton, onClick: exportBackup }, t('exportNow')),
           h('button', { type: 'button', style: ghostButton, onClick: () => load(offset) }, t('refresh'))),
         h('div', {
@@ -438,6 +496,52 @@ const EMPTY_HIGHLIGHT = [];
           notes: stats.notes ?? 0, facts: stats.facts ?? 0,
           chunks: stats.chunks ?? 0, contested: stats.contested ?? 0,
         })),
+        personaOpen
+          ? h('div', {
+              style: {
+                position: 'absolute', inset: 0, zIndex: 3, background: 'rgba(2,5,12,.72)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16,
+              },
+            },
+            h('div', {
+              style: {
+                width: 520, maxWidth: '100%', maxHeight: '90%', overflow: 'auto',
+                borderRadius: 16, border: '1px solid rgba(110,170,255,.5)',
+                background: 'rgba(8,13,26,.98)', padding: 16,
+                display: 'flex', flexDirection: 'column', gap: 10,
+              },
+            },
+              h('div', { style: { display: 'flex', alignItems: 'center' } },
+                h('div', { style: { fontSize: 14, fontWeight: 600 } }, t('personaTitle')),
+                h('button', {
+                  type: 'button',
+                  style: { ...ghostButton, marginLeft: 'auto', padding: '2px 9px' },
+                  onClick: () => setPersonaOpen(false),
+                }, '×')),
+              h('div', { style: { ...MUTED, fontSize: 11 } }, t('personaHint')),
+              ...personaFields.map(([key, labelKey]) => h('div', {
+                key,
+                style: { display: 'flex', flexDirection: 'column', gap: 4 },
+              },
+                h('div', { style: { fontSize: 11, color: 'rgba(190,210,235,.9)' } }, t(labelKey)),
+                h('textarea', {
+                  value: personaDraft[key] ?? '',
+                  rows: key === '其他' ? 3 : 2,
+                  onChange: event => {
+                    const value = event.target.value;
+                    setPersonaDraft(previous => ({ ...previous, [key]: value }));
+                  },
+                  style: {
+                    resize: 'vertical', fontSize: 12, lineHeight: 1.5, padding: '6px 8px',
+                    borderRadius: 8, border: '1px solid rgba(90,120,190,.4)',
+                    background: 'rgba(4,8,18,.6)', color: 'rgba(215,230,250,.95)', outline: 'none',
+                  },
+                }))),
+              h('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
+                h('button', { type: 'button', style: ghostButton, onClick: () => setPersonaOpen(false) }, t('personaClose')),
+                h('button', { type: 'button', style: ghostButton, onClick: savePersona, disabled: personaBusy },
+                  personaBusy ? '…' : t('personaSave')))))
+          : null,
         selected
           ? h('div', {
               style: {
@@ -897,7 +1001,7 @@ const EMPTY_HIGHLIGHT = [];
               ctx.textAlign = 'start';
             }
 
-            if (!view.dragging && !reduceMotion && !view.pointerInside) {
+            if (!view.dragging && !reduceMotion) {
               view.yaw += view.vx;
               view.pitch = Math.max(-1.3, Math.min(1.3, view.pitch + view.vy));
               view.vx *= 0.985;
@@ -1021,6 +1125,12 @@ const EMPTY_HIGHLIGHT = [];
             view.lastY = event.clientY;
             view.lastMove = Date.now();
             try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* ignore */ }
+          },
+          onPointerLeave: () => {
+            const view = viewRef.current;
+            view.pointerInside = false;
+            view.tooltipId = null;
+            setTooltip(null);
           },
           onPointerMove: event => {
             const view = viewRef.current;

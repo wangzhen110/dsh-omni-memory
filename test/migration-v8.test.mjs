@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import { boot } from './helpers.mjs';
 
-test('a v7 database upgrades to v9 with the cardinality column and relations table', async () => {
+test('a v7 database upgrades to v10 with the cardinality column and relations table', async () => {
   const app = await boot();
   await app.call('memory_profile');
   const dbFile = path.join(app.home, 'memory', 'omni.db');
@@ -24,11 +24,11 @@ test('a v7 database upgrades to v9 with the cardinality column and relations tab
   migrated.close();
   assert.ok(columns.includes('cardinality'), 'cardinality column added');
   assert.ok(relations, 'relations registry created');
-  assert.equal(version, '9');
+  assert.equal(version, '10');
   assert.ok(again);
 });
 
-test('a database whose marker claims v9 but lacks the column is repaired', async () => {
+test('a database whose marker claims v10 but lacks the column is repaired', async () => {
   const app = await boot();
   await app.call('memory_profile');
   const dbFile = path.join(app.home, 'memory', 'omni.db');
