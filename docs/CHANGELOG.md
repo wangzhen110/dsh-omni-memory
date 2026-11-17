@@ -2,6 +2,21 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [2.9.0] — 2026-11-17
+
+### 实体别名与多值画像（ADR-024）
+- **Schema v9**：`entity_aliases(alias PK, canonical, updated_at)`；事实 subject 写入前规范化（空白/全角/大小写/首尾标点），再沿别名链解析到规范名。
+- 新工具 `memory_link_entity({ alias, canonical, apply })`：默认 dry-run 报告影响面；`apply: true` 合并 facts.subject 与 edges.src，之后经该别名的写入自动落到规范名。
+- `memory_timeline` 按规范名查询；object 同时匹配原始写法。
+- **画像事实块**：注入与 `memory_profile` 共用，只取 active facts，按 subject·relation 分组，多值关系显示最多 3 个值，与笔记共用 1200 字预算。
+
+### 远程 embedding 加固（ADR-025）
+- `OMNI_EMBED_PROVIDER` 预设（openai/dashscope/zhipu/siliconflow）；`OMNI_EMBED_BATCH`（默认 64）分批；`OMNI_EMBED_RETRIES`（默认 2）对 429/5xx 退避重试，其它 4xx 不重试。
+- ANN 评估结论：保持有界采样 + 词面补集；引入原生扩展或自研 LSH 需要标注集/重建/回滚，列为独立项目。
+
+### 测试
+- **204 / 204 通过**（新增 4 条实体别名/画像 + 3 条 provider 加固；补齐既有 provider 单测）。
+
 ## [2.8.0] — 2026-11-17
 
 ### 多值关系（ADR-023 从提案到实现）

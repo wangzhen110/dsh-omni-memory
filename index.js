@@ -400,7 +400,7 @@ function openStore() {
   return store;
 }
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 function columnExists(db, table, column) {
   try {
@@ -518,6 +518,18 @@ const MIGRATIONS = [
       );
     `);
   },
+  // v9: entity aliases. Facts are canonicalised at write time; aliases merge
+  // existing rows only when explicitly requested by memory_link_entity.
+  db => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS entity_aliases (
+        alias TEXT PRIMARY KEY,
+        canonical TEXT NOT NULL,
+        updated_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS entity_aliases_canonical ON entity_aliases(canonical);
+    `);
+  },
 ];
 
 function migrate(db) {
@@ -534,7 +546,15 @@ function migrate(db) {
   // Repair path: never trust the version marker alone. A database whose marker
   // says v8 but lacks the v8 artifacts is repaired in place (add column, table).
   if (SCHEMA_VERSION >= 8 && !columnExists(db, 'facts', 'cardinality')) {
-    MIGRATIONS[8](db);
+    addColumn(db, 'facts', 'cardinality', "TEXT NOT NULL DEFAULT 'single'");
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS relations (
+        name TEXT PRIMARY KEY,
+        cardinality TEXT NOT NULL DEFAULT 'single',
+        aliases TEXT,
+        updated_at INTEGER
+      );
+    `);
   }
   db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)")
     .run(String(SCHEMA_VERSION));
@@ -1244,6 +1264,53 @@ function rowsByIds(db, table, ids, extraSql = '') {
 }
 
 /** The JS twin of scopeClause for rows fetched by id. */
+/** Normalise an entity name so "Deploy" and "deploy" are the same node. */
+function normalizeEntity(name) {
+  const text = String(name ?? '').trim().replace(/\s+/g, ' ');
+  if (!text) return '';
+  return text
+    .replace(/[\uFF01-\uFF5E]/g, char => String.fromCharCode(char.charCodeAt(0) - 0xFEE0))
+    .toLowerCase()
+    .replace(/^[\s"'\u201c\u201d]+|[\s"'\u201c\u201d]+$/g, '')
+    .replace(/[。；;，,]+$/g, '');
+}
+
+/** Follow the alias chain (bounded) to the canonical entity. */
+function canonicalEntity(db, name) {
+  let current = normalizeEntity(name);
+  if (!current) return current;
+  try {
+    for (let depth = 0; depth < 5; depth += 1) {
+      const row = db.prepare('SELECT canonical FROM entity_aliases WHERE alias = ?').get(current);
+      if (!row || row.canonical === current) break;
+      current = String(row.canonical);
+    }
+  } catch { /* registry absent on very old stores */ }
+  return current;
+}
+
+function linkEntity(s, aliasInput, canonicalInput, options = {}) {
+  const alias = normalizeEntity(aliasInput);
+  const canonical = canonicalEntity(s.db, canonicalInput);
+  if (!alias || !canonical) throw new Error('alias and canonical are required');
+  if (alias === canonical) throw new Error('alias and canonical are the same entity');
+  const dryRun = options.apply !== true;
+  const affectedFacts = Number(s.db.prepare('SELECT COUNT(*) AS n FROM facts WHERE subject = ?').get(alias)?.n ?? 0);
+  const affectedEdges = Number(s.db.prepare("SELECT COUNT(*) AS n FROM edges WHERE src = ?").get(alias)?.n ?? 0);
+  if (dryRun) return { alias, canonical, affectedFacts, affectedEdges, applied: false };
+  transaction(s.db, () => {
+    s.db.prepare('INSERT OR REPLACE INTO entity_aliases(alias, canonical, updated_at) VALUES (?, ?, ?)')
+      .run(alias, canonical, now());
+    s.db.prepare('INSERT OR IGNORE INTO entities(name) VALUES (?)').run(canonical);
+    s.db.prepare('UPDATE facts SET subject = ? WHERE subject = ?').run(canonical, alias);
+    s.db.prepare('UPDATE edges SET src = ? WHERE src = ?').run(canonical, alias);
+    s.db.prepare('DELETE FROM entities WHERE name = ?').run(alias);
+  });
+  entityCache = { names: [], at: 0 };
+  invalidateProfile();
+  return { alias, canonical, affectedFacts, affectedEdges, applied: true };
+}
+
 function relationCardinality(db, name) {
   try {
     return db.prepare('SELECT cardinality FROM relations WHERE name = ?').get(name)?.cardinality ?? 'single';
@@ -1964,6 +2031,47 @@ async function runSearch(s, query, limit, scope) {  const terms = queryTerms(que
   return finalizeHits(ranked, limit);
 }
 
+/**
+ * Compact facts block for the profile: active rows only, grouped by
+ * subject+relation so multi-valued relations show all values. Returns plain
+ * lines (callers add their own bullet prefix).
+ */
+function profileFactLines(db, scopeKey, budget) {
+  const filter = scopeKey === null || scopeKey === undefined
+    ? ''
+    : scopeKey === SCOPE_GLOBAL
+      ? "AND (scope = 'global' OR scope IS NULL)"
+      : "AND (scope = ? OR scope = 'global' OR scope IS NULL)";
+  let rows;
+  try {
+    rows = db.prepare(`
+      SELECT subject, relation, object FROM facts
+      WHERE deleted_at IS NULL AND valid_to IS NULL ${filter}
+      ORDER BY confidence DESC, valid_from DESC LIMIT 40
+    `).all(...(scopeKey && scopeKey !== SCOPE_GLOBAL ? [scopeKey] : []));
+  } catch {
+    return [];
+  }
+  if (!rows.length) return [];
+  const groups = new Map();
+  for (const row of rows) {
+    const key = `${row.subject}·${row.relation}`;
+    const values = groups.get(key) ?? [];
+    if (values.length < 3) values.push(String(row.object ?? ''));
+    groups.set(key, values);
+  }
+  const lines = ['相关事实：'];
+  let used = lines[0].length;
+  for (const [key, values] of groups) {
+    const [subject, relation] = key.split('·');
+    const line = `${subject} · ${relation}：${values.join(' / ')}`;
+    if (used + line.length > budget) break;
+    used += line.length;
+    lines.push(line);
+  }
+  return lines.length > 1 ? lines : [];
+}
+
 /** Read the highest-importance notes that fit the always-injected budget. */
 function buildProfileText(projectKey) {
   const s = openStore();
@@ -1985,6 +2093,12 @@ function buildProfileText(projectKey) {
     if (used + line.length > PROFILE_BUDGET) continue;
     used += line.length;
     lines.push(line);
+  }
+
+  for (const line of profileFactLines(s.db, projectKey ?? null, PROFILE_BUDGET - used)) {
+    const withBullet = line === '相关事实：' ? line : `- ${line}`;
+    used += withBullet.length;
+    lines.push(withBullet);
   }
   return lines.join('\n');
 }
@@ -2195,7 +2309,7 @@ function defineTools(ctx) {
       const importance = Number.isFinite(args.importance) ? Number(args.importance) : 0.5;
       const project = currentProject(toolContext);
       if (kind === 'fact') {
-        const subject = String(args.subject ?? '').trim();
+        const subject = canonicalEntity(s.db, args.subject ?? '');
         const relation = String(args.relation ?? 'is').trim();
         const object = String(args.object ?? args.text ?? '').trim();
         if (!subject) throw new Error('subject is required for kind=fact');
@@ -2435,6 +2549,28 @@ function defineTools(ctx) {
   }));
 
   disposers.push(ctx.tools.register({
+    name: 'memory_link_entity',
+    description: 'Register an entity alias and merge existing facts/edges written under that alias into the canonical name. Dry run by default; apply=true rewrites the rows.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        alias: { type: 'string', description: 'The alternate spelling, e.g. "deploy" or "上线".' },
+        canonical: { type: 'string', description: 'The canonical entity name to merge into.' },
+        apply: { type: 'boolean', description: 'false (default) reports how many facts/edges would move; true rewrites them.' },
+      },
+      required: ['alias', 'canonical'],
+    },
+    output: {
+      schema: { type: 'object', properties: { alias: { type: 'string' }, canonical: { type: 'string' }, affectedFacts: { type: 'number' }, affectedEdges: { type: 'number' }, applied: { type: 'boolean' } } },
+      render: (_args, value) => textBlock(`${value.applied ? 'linked' : 'would link'} "${value.alias}" -> "${value.canonical}" (${value.affectedFacts} facts, ${value.affectedEdges} edges)`),
+    },
+    async execute(args = {}) {
+      return linkEntity(openStore(), args.alias, args.canonical, { apply: args.apply === true });
+    },
+  }));
+
+  disposers.push(ctx.tools.register({
     name: 'memory_dream_proposals',
     description: 'List replacement candidates produced by dream: flagged notes plus the evidence text that would replace them. Read-only.',
     parameters: {
@@ -2596,6 +2732,10 @@ function defineTools(ctx) {
         used += line.length;
         picked.push({ id: Number(row.id), text: row.text, scope: row.scope });
       }
+      for (const line of profileFactLines(s.db, scope, PROFILE_BUDGET - used)) {
+        used += line.length;
+        picked.push({ id: null, text: line === '相关事实：' ? line : line, scope: 'facts' });
+      }
       const count = table => Number(s.db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE deleted_at IS NULL`).get().n);
       const stats = {
         notes: count('notes'),
@@ -2645,17 +2785,20 @@ function defineTools(ctx) {
     },
     async execute(args = {}, toolContext = {}) {
       const s = openStore();
-      const name = String(args.entity ?? '').trim();
-      if (!name) throw new Error('entity is required');
+      const rawName = String(args.entity ?? '').trim();
+      if (!rawName) throw new Error('entity is required');
+      // Facts are stored under their canonical subject; object values are not
+      // canonicalised, so both spellings are matched.
+      const name = canonicalEntity(s.db, rawName);
       const requested = String(args.scope ?? '').trim();
       const scope = requested === 'all' ? null : (requested || currentProject(toolContext) || SCOPE_GLOBAL);
       const factFilter = scope ? scopeClause('scope', scope) : { sql: '', params: [] };
       const noteFilter = scope ? scopeClause('scope', scope, false) : { sql: '', params: [] };
       const facts = s.db.prepare(`
         SELECT * FROM facts
-        WHERE (subject = ? OR object LIKE ?) AND deleted_at IS NULL ${factFilter.sql}
+        WHERE (subject = ? OR object LIKE ? OR object LIKE ?) AND deleted_at IS NULL ${factFilter.sql}
         ORDER BY valid_from ASC LIMIT 50
-      `).all(name, `%${name}%`, ...factFilter.params).map(row => ({
+      `).all(name, `%${rawName}%`, `%${name}%`, ...factFilter.params).map(row => ({
         kind: 'fact',
         subject: row.subject,
         relation: row.relation,
