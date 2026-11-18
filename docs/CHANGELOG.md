@@ -2,6 +2,13 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.2.1] — 2026-11-18
+
+### 许可
+- 许可从 CC BY-NC 4.0 切换为 **全息记忆个人使用许可 1.0**：允许个人非商业使用、学习、复制、修改和非商业分发；禁止任何商业使用，**修改版尤其不得商用**；商用需取得作者书面许可。
+- `package.json` 的 `license` 改为 `SEE LICENSE IN LICENSE`；`index.js`、`client.js` 的 SPDX 标识改为 `LicenseRef-Omni-Memory-Personal-Use-1.0`；README 与 `ATTRIBUTION.md` 同步更新。
+- `LICENSE` 改为中文权威条款 + 英文非约束性摘要，保留署名、修改标记、免责声明与商业授权渠道。
+
 ## [3.2.0] — 2026-11-18
 
 ### 故障经验库（ADR-027）

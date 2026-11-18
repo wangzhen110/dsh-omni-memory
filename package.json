@@ -1,10 +1,10 @@
 {
   "name": "@local/dsh-memory",
-  "version": "3.2.0",
+  "version": "3.2.1",
   "private": true,
   "type": "module",
   "description": "Omni memory for DeepSeek Harness: append-only transcripts, bi-temporal facts, self-verifying notes, hybrid retrieval, project scoping and an interactive star map.",
-  "license": "CC-BY-NC-4.0",
+  "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "node": ">=24"
   },
