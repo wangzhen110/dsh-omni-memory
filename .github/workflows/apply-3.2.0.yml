@@ -1,0 +1,33 @@
+name: apply v3.2.0 release
+
+on:
+  push:
+    paths:
+      - '.github/workflows/apply-3.2.0.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply checked patch
+        env:
+          PATCH_URL: https://aka.doubaocdn.com/s/TVhRuXZyqB
+          PATCH_SHA256: 14b084b78f5529fb0d7a5b01b3b41bb037d93605582cf21ef5b990ce06ef9468
+        run: |
+          set -euo pipefail
+          curl -fsSL "$PATCH_URL" -o "$RUNNER_TEMP/3.2.0.patch"
+          echo "$PATCH_SHA256  $RUNNER_TEMP/3.2.0.patch" | sha256sum -c -
+          git apply --check "$RUNNER_TEMP/3.2.0.patch"
+          git apply --whitespace=nowarn "$RUNNER_TEMP/3.2.0.patch"
+          rm .github/workflows/apply-3.2.0.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'release: v3.2.0 problem experience library'
+          git push origin HEAD:main
