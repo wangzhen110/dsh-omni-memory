@@ -6,7 +6,7 @@ import { boot } from './helpers.mjs';
 
 const hasTable = (db, name) => !!db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
 
-test('a v9 database upgrades to v10 with the persona table', async () => {
+test('a v9 database upgrades to v11 with the persona table and solution columns', async () => {
   const app = await boot();
   await app.call('memory_profile');
   const file = path.join(app.home, 'memory', 'omni.db');
@@ -22,7 +22,7 @@ test('a v9 database upgrades to v10 with the persona table', async () => {
   const version = migrated.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()?.value;
   migrated.close();
   assert.ok(persona, 'persona table created');
-  assert.equal(version, '10');
+  assert.equal(version, '11');
 });
 
 test('a database whose marker is v10 but lacks persona is repaired', async () => {

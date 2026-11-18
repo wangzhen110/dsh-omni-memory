@@ -327,7 +327,12 @@ function openStore() {
       revision INTEGER NOT NULL DEFAULT 1,
       superseded_by INTEGER,
       contested INTEGER NOT NULL DEFAULT 0,
-      deleted_at INTEGER
+      deleted_at INTEGER,
+      problem_key TEXT,
+      solution_status TEXT,
+      solution_verified_at INTEGER,
+      reuse_count INTEGER NOT NULL DEFAULT 0,
+      last_used_at INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS facts (
@@ -411,7 +416,7 @@ function openStore() {
   return store;
 }
 
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 let hostCtx = null;
 
 function columnExists(db, table, column) {
@@ -552,6 +557,20 @@ const MIGRATIONS = [
       );
     `);
   },
+  // v11: turn notes into problem-solving memory. `verification` remains the
+  // transcript-coverage verdict from dreaming; `solution_status` is the real-world
+  // outcome (verified / unverified / failed / expired).
+  db => {
+    addColumn(db, 'notes', 'problem_key', 'TEXT');
+    addColumn(db, 'notes', 'solution_status', 'TEXT');
+    addColumn(db, 'notes', 'solution_verified_at', 'INTEGER');
+    addColumn(db, 'notes', 'reuse_count', 'INTEGER NOT NULL DEFAULT 0');
+    addColumn(db, 'notes', 'last_used_at', 'INTEGER');
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS notes_problem_key ON notes(problem_key);
+      CREATE INDEX IF NOT EXISTS notes_solution_status ON notes(solution_status);
+    `);
+  },
 ];
 
 function migrate(db) {
@@ -596,6 +615,17 @@ function migrate(db) {
         value TEXT NOT NULL,
         updated_at INTEGER
       );
+    `);
+  }
+  if (SCHEMA_VERSION >= 11) {
+    addColumn(db, 'notes', 'problem_key', 'TEXT');
+    addColumn(db, 'notes', 'solution_status', 'TEXT');
+    addColumn(db, 'notes', 'solution_verified_at', 'INTEGER');
+    addColumn(db, 'notes', 'reuse_count', 'INTEGER NOT NULL DEFAULT 0');
+    addColumn(db, 'notes', 'last_used_at', 'INTEGER');
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS notes_problem_key ON notes(problem_key);
+      CREATE INDEX IF NOT EXISTS notes_solution_status ON notes(solution_status);
     `);
   }
   db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)")
@@ -1058,13 +1088,21 @@ function mergeSnapshot(s, snapshot, options = {}) {
   transaction(s.db, () => {
     for (const note of plan.notes) {
       const info = s.db.prepare(`
-        INSERT INTO notes(ts, scope, text, importance, source, revision, superseded_by, contested, deleted_at, verification, verified_at, evidence)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO notes(
+          ts, scope, text, importance, source, revision, superseded_by, contested, deleted_at,
+          verification, verified_at, evidence, problem_key, solution_status,
+          solution_verified_at, reuse_count, last_used_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         Number(note.ts ?? now()), note.scope ?? SCOPE_GLOBAL, String(note.text),
         Number(note.importance ?? 0.5), note.source ?? null, Number(note.revision ?? 1),
         note.superseded_by ?? null, Number(note.contested ?? 0), note.deleted_at ?? null,
         note.verification ?? null, note.verified_at ?? null, note.evidence ?? null,
+        note.problem_key ?? note.problemKey ?? null,
+        note.solution_status ?? note.solutionStatus ?? null,
+        note.solution_verified_at ?? note.solutionVerifiedAt ?? null,
+        Number(note.reuse_count ?? note.reuseCount ?? 0),
+        note.last_used_at ?? note.lastUsedAt ?? null,
       );
       const newId = Number(info.lastInsertRowid);
       idMap.set(Number(note.id), newId);
@@ -1461,6 +1499,45 @@ function scopeAllows(value, scope, nulls = true) {
   return nulls && (value === null || value === undefined);
 }
 
+const SOLUTION_STATUSES = new Set(['verified', 'unverified', 'failed', 'expired']);
+
+/** Normalize an error signature so the same failure matches across sessions. */
+function normalizeProblemKey(value) {
+  return String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .slice(0, 200);
+}
+
+function solutionStatusOf(value) {
+  const status = String(value ?? 'unverified').trim().toLowerCase();
+  return SOLUTION_STATUSES.has(status) ? status : 'unverified';
+}
+
+/** Prefer proven solutions; keep failed/expired attempts visible but below them. */
+function solutionBoost(statusValue, reuseValue = 0) {
+  const status = solutionStatusOf(statusValue);
+  const reuse = Math.min(0.15, Math.log1p(Math.max(0, Number(reuseValue) || 0)) * 0.05);
+  if (status === 'verified') return 0.2 + reuse;
+  if (status === 'failed') return -0.2 + reuse;
+  if (status === 'expired') return -0.35 + reuse;
+  return reuse;
+}
+
+/** Fields shared by every note-shaped search hit and API detail response. */
+function solutionFields(row) {
+  return {
+    problemKey: row.problem_key ?? row.problemKey ?? null,
+    solutionStatus: solutionStatusOf(row.solution_status ?? row.solutionStatus),
+    reuseCount: Number(row.reuse_count ?? row.reuseCount ?? 0),
+    lastUsedAt: row.last_used_at ?? row.lastUsedAt ?? null,
+    verifiedAt: row.solution_verified_at ?? row.solutionVerifiedAt ?? null,
+    verification: row.verification ?? null,
+    evidence: row.evidence ?? null,
+  };
+}
+
 /**
  * Two-character CJK lookup through the bigram index. The inner query walks the
  * (gram, layer, owner_id) index backwards and stops after the sample size, so a
@@ -1523,10 +1600,12 @@ function searchChunks(s, terms, limit, scope) {
   return out;
 }
 
-function searchNotes(s, terms, limit, scope) {
+function searchNotes(s, terms, limit, scope, options = {}) {
   if (!terms.length) return [];
+  const status = options.status && options.status !== 'all' ? solutionStatusOf(options.status) : null;
   const found = new Map();
   const push = (row, textScore) => {
+    if (status && solutionStatusOf(row.solution_status) !== status) return;
     const id = Number(row.id);
     const candidate = {
       kind: 'note',
@@ -1536,10 +1615,12 @@ function searchNotes(s, terms, limit, scope) {
       source: row.source ?? '',
       revision: Number(row.revision ?? 1),
       contested: Number(row.contested ?? 0) === 1,
+      ...solutionFields(row),
       text: String(row.text).slice(0, 400),
       score: 0.6 * Math.max(0.6, textScore, matchRatio(row, ['text'], terms))
         + 0.2 * Number(row.importance ?? 0.5)
-        + 0.2 * recencyScore(row.ts),
+        + 0.2 * recencyScore(row.ts)
+        + solutionBoost(row.solution_status, row.reuse_count),
     };
     const previous = found.get(id);
     if (!previous || candidate.score > previous.score) found.set(id, candidate);
@@ -1564,6 +1645,43 @@ function searchNotes(s, terms, limit, scope) {
     }
   }
   return [...found.values()];
+}
+
+/** Deterministic lookup for an exact error signature before semantic recall. */
+function searchProblemKey(s, problemKey, limit, scope, options = {}) {
+  const key = normalizeProblemKey(problemKey);
+  if (!key) return [];
+  const status = options.status && options.status !== 'all' ? solutionStatusOf(options.status) : null;
+  const filter = scopeClause('scope', scope, false);
+  const statusSql = status ? "AND COALESCE(solution_status, 'unverified') = ?" : '';
+  try {
+    return s.db.prepare(`
+      SELECT * FROM notes
+      WHERE deleted_at IS NULL AND superseded_by IS NULL AND problem_key = ?
+        ${filter.sql} ${statusSql}
+      ORDER BY
+        CASE COALESCE(solution_status, 'unverified')
+          WHEN 'verified' THEN 0 WHEN 'unverified' THEN 1 WHEN 'failed' THEN 2 ELSE 3
+        END,
+        reuse_count DESC, importance DESC, ts DESC
+      LIMIT ?
+    `).all(key, ...filter.params, ...(status ? [status] : []), Math.min(30, Math.max(1, Number(limit) || 8)))
+      .map(row => ({
+        kind: 'note',
+        id: Number(row.id),
+        ts: Number(row.ts),
+        scope: row.scope,
+        source: row.source ?? '',
+        revision: Number(row.revision ?? 1),
+        contested: Number(row.contested ?? 0) === 1,
+        ...solutionFields(row),
+        text: String(row.text).slice(0, 400),
+        score: 2 + solutionBoost(row.solution_status, row.reuse_count),
+        exactProblem: true,
+      }));
+  } catch {
+    return [];
+  }
 }
 
 function searchFacts(s, terms, limit, scope) {
@@ -1904,8 +2022,10 @@ async function vectorSearch(s, queryText, limit, scope, candidates = []) {
         kind: spec.kind,
         id: Number(row.owner_id),
         ts: Number(row.ts ?? row.valid_from ?? 0),
+        scope: row.scope ?? null,
         text: String(row.text ?? '').slice(0, 400),
         source: row.source ?? '',
+        ...(spec.kind === 'note' ? solutionFields(row) : {}),
         score,
         cosine: score,
         via: 'vector',
@@ -2093,7 +2213,19 @@ function graphExpand(s, hits, limit, scope) {
 
 let lastSearchProfile = null;
 
-async function runSearch(s, query, limit, scope) {  const terms = queryTerms(query);
+async function runSearch(s, query, limit, scope, options = {}) {
+  const terms = queryTerms(query);
+  const status = options.status && options.status !== 'all' ? solutionStatusOf(options.status) : null;
+  const kind = options.kind && options.kind !== 'all' ? String(options.kind) : null;
+  const hitAllowed = hit => {
+    if (!hit) return false;
+    if (kind && hit.kind !== kind) return false;
+    if (status) {
+      if (hit.kind !== 'note') return false;
+      return solutionStatusOf(hit.solutionStatus ?? hit.solution_status) === status;
+    }
+    return true;
+  };
   const profile = process.env.OMNI_PROFILE === '1'
     ? { terms: terms.length, notes: 0, facts: 0, chunks: 0, lexical: 0, vector: 0, graph: 0 }
     : null;
@@ -2106,17 +2238,23 @@ async function runSearch(s, query, limit, scope) {  const terms = queryTerms(que
       profile[key] = Number(process.hrtime.bigint() - started) / 1e6;
     }
   };
-  const notesHits = terms.length ? await timed('notes', () => searchNotes(s, terms, limit, scope)) : [];
-  const factsHits = terms.length ? await timed('facts', () => searchFacts(s, terms, limit, scope)) : [];
-  const chunksHits = terms.length ? await timed('chunks', () => searchChunks(s, terms, limit, scope)) : [];
+  const notesHits = terms.length && (!kind || kind === 'note')
+    ? await timed('notes', () => searchNotes(s, terms, limit, scope, { status }))
+    : [];
+  const factsHits = terms.length && (!kind || kind === 'fact') && !status
+    ? await timed('facts', () => searchFacts(s, terms, limit, scope))
+    : [];
+  const chunksHits = terms.length && (!kind || kind === 'chunk') && !status
+    ? await timed('chunks', () => searchChunks(s, terms, limit, scope))
+    : [];
   const lexicalStarted = process.hrtime.bigint();
-  const lexical = terms.length ? rank([...notesHits, ...factsHits, ...chunksHits]) : [];
+  const lexical = terms.length ? rank([...notesHits, ...factsHits, ...chunksHits].filter(hitAllowed)) : [];
   if (profile) profile.lexical = Number(process.hrtime.bigint() - lexicalStarted) / 1e6;
   // Diagnostic switch: OMNI_DISABLE_VECTOR=1 measures the lexical route alone.
   const useVector = process.env.OMNI_DISABLE_VECTOR !== '1';
   if (useVector) await flushPendingVectors(s);
-  const vector = useVector ? await timed('vector', () => vectorSearch(s, query, limit, scope, lexical)) : [];
-  const graph = await timed('graph', () => graphExpand(s, [...lexical, ...vector], Math.min(limit, 10), scope));
+  const vector = useVector ? (await timed('vector', () => vectorSearch(s, query, limit, scope, lexical))).filter(hitAllowed) : [];
+  const graph = (await timed('graph', () => graphExpand(s, [...lexical, ...vector], Math.min(limit, 10), scope))).filter(hitAllowed);
   if (profile) {
     profile.hits = lexical.length + vector.length + graph.length;
     profile.at = now();
@@ -2146,15 +2284,21 @@ async function runSearch(s, query, limit, scope) {  const terms = queryTerms(que
   graph.forEach((hit, index) => add(hit, index));
 
   const ranked = [...fused.values()]
-    .sort((a, b) => b.rrf - a.rrf)
-    .map(entry => ({
-      ...entry.hit,
-      score: Number(entry.rrf.toFixed(6)),
-      rrf: Number(entry.rrf.toFixed(6)),
-      lexicalScore: entry.lexical,
-      vectorScore: entry.vector,
-      graphScore: entry.graph,
-    }));
+    .map(entry => {
+      const boost = entry.hit.kind === 'note'
+        ? solutionBoost(entry.hit.solutionStatus, entry.hit.reuseCount)
+        : 0;
+      const exact = entry.hit.exactProblem ? 0.5 : 0;
+      return {
+        ...entry.hit,
+        score: Number((entry.rrf + boost + exact).toFixed(6)),
+        rrf: Number(entry.rrf.toFixed(6)),
+        lexicalScore: entry.lexical,
+        vectorScore: entry.vector,
+        graphScore: entry.graph,
+      };
+    })
+    .sort((a, b) => b.score - a.score);
   return finalizeHits(ranked, limit);
 }
 
@@ -2471,7 +2615,8 @@ function buildProfileText(projectKey) {
     : "AND (scope = 'global' OR scope IS NULL)";
   const rows = s.db.prepare(
     `SELECT id, text, importance, scope FROM notes
-     WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0 ${noteScope}
+     WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0
+       AND COALESCE(solution_status, 'unverified') NOT IN ('failed', 'expired') ${noteScope}
      ORDER BY importance DESC, ts DESC LIMIT 60`
   ).all(...(projectKey ? [projectKey] : []));
   // Global notes follow the model everywhere; project notes only in their own
@@ -2530,7 +2675,11 @@ async function precomputeRecall(agentId, text) {
   try {
     const project = projectByAgent.get(agentId) ?? SCOPE_GLOBAL;
     const result = await runSearch(openStore(), text, 3, project);
-    recallByAgent.set(agentId, { hits: result.hits, query: text, at: now(), project });
+    // Dead ends and expired advice are useful when explicitly searched for, but
+    // must not be injected as recommendations into the next turn.
+    const hits = result.hits.filter(hit => hit.kind !== 'note'
+      || !['failed', 'expired'].includes(String(hit.solutionStatus ?? 'unverified')));
+    recallByAgent.set(agentId, { hits, query: text, at: now(), project });
   } catch { /* recall is best effort */ }
 }
 
@@ -2665,13 +2814,13 @@ function defineTools(ctx) {
 
   disposers.push(ctx.tools.register({
     name: 'memory_write',
-    description: 'Store one durable memory. kind=note for conclusions and rules, kind=fact for subject/relation/object triples, kind=episode for raw observations. Returns the stored id.',
+    description: 'Store one durable memory. kind=note for conclusions, rules and problem-solving experience; kind=fact for subject/relation/object triples; kind=episode for raw observations. Returns the stored id. For experience notes, set problemKey to the stable error signature and solutionStatus to what actually happened.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         kind: { type: 'string', enum: ['note', 'fact', 'episode'], description: 'Which layer to write.' },
-        text: { type: 'string', description: 'The memory, stated so it is useful without the original conversation.' },
+        text: { type: 'string', description: 'The memory, stated so it is useful without the original conversation. For a solution, include the symptom, what failed, what worked, and the preconditions.' },
         scope: {
           type: 'string',
           description: 'Optional. Omit to let the plugin judge: project-specific wording goes to the current project layer, cross-project rules to global. Pass a project key or global to override; all is read-only and rejected.',
@@ -2691,6 +2840,19 @@ function defineTools(ctx) {
           items: { type: 'number' },
           description: 'note only: ids of earlier notes this one contradicts. Both sides are flagged contested for review; nothing is merged or deleted.',
         },
+        problemKey: {
+          type: 'string',
+          description: 'note only: stable fingerprint for the problem, such as an error code plus the failing command or a short normalized symptom. Matching is case-insensitive and whitespace-normalized.',
+        },
+        solutionStatus: {
+          type: 'string',
+          enum: ['verified', 'unverified', 'failed', 'expired'],
+          description: 'note only: real-world outcome. verified means the solution worked in practice; failed means a dead end worth remembering; expired means it no longer applies in the current environment.',
+        },
+        evidence: {
+          type: 'string',
+          description: 'note only: what proves the status, e.g. a command output, a test result, a URL, or a short verification note.',
+        },
       },
       required: ['kind', 'text'],
     },
@@ -2708,6 +2870,15 @@ function defineTools(ctx) {
       const kind = String(args.kind ?? 'note');
       const text = String(args.text ?? '');
       const importance = Number.isFinite(args.importance) ? Number(args.importance) : 0.5;
+      const requestedStatus = args.solutionStatus == null ? null : String(args.solutionStatus).trim().toLowerCase();
+      if (requestedStatus && !SOLUTION_STATUSES.has(requestedStatus)) {
+        throw new Error('solutionStatus must be verified, unverified, failed, or expired');
+      }
+      if (kind !== 'note' && (args.problemKey || requestedStatus || args.evidence)) {
+        throw new Error('problemKey, solutionStatus and evidence are note-only');
+      }
+      const problemKey = kind === 'note' ? normalizeProblemKey(args.problemKey) : '';
+      const evidence = kind === 'note' ? String(args.evidence ?? '').trim() : '';
       const project = currentProject(toolContext);
       if (kind === 'fact') {
         const subject = canonicalEntity(s.db, args.subject ?? '');
@@ -2817,21 +2988,54 @@ function defineTools(ctx) {
       // Scope is part of a note's identity: the same wording in two layers is two
       // deliberate records (a global rule and its project-specific restatement).
       const prev = s.db.prepare(
-        'SELECT id FROM notes WHERE scope = ? AND text = ? AND deleted_at IS NULL AND superseded_by IS NULL'
+        'SELECT id, problem_key, solution_status, evidence FROM notes WHERE scope = ? AND text = ? AND deleted_at IS NULL AND superseded_by IS NULL'
       ).get(scope, text);
       if (prev) {
+        const updates = [];
+        const values = [];
+        if (problemKey) {
+          updates.push('problem_key = ?');
+          values.push(problemKey);
+        }
+        if (requestedStatus) {
+          updates.push('solution_status = ?');
+          values.push(requestedStatus);
+          updates.push('solution_verified_at = ?');
+          values.push(requestedStatus === 'verified' ? ts : null);
+        }
+        if (evidence) {
+          updates.push('evidence = ?');
+          values.push(evidence);
+        }
+        if (updates.length) {
+          transaction(s.db, () => {
+            s.db.prepare(`UPDATE notes SET ${updates.join(', ')} WHERE id = ?`).run(...values, Number(prev.id));
+          });
+          invalidateProfile();
+        }
         return {
           id: Number(prev.id),
           kind: 'note',
           deduped: true,
           scope,
           scopeReason: decision.reason,
+          problemKey: problemKey || prev.problem_key || null,
+          solutionStatus: solutionStatusOf(requestedStatus ?? prev.solution_status),
+          reuseCount: Number(s.db.prepare('SELECT reuse_count FROM notes WHERE id = ?').get(Number(prev.id))?.reuse_count ?? 0),
         };
       }
       const result = transaction(s.db, () => {
-        const info = s.db.prepare(
-          'INSERT INTO notes(ts, scope, text, importance, source) VALUES (?, ?, ?, ?, ?)'
-        ).run(ts, scope, text, importance, args.source ?? null);
+        const info = s.db.prepare(`
+          INSERT INTO notes(
+            ts, scope, text, importance, source, problem_key, solution_status,
+            solution_verified_at, reuse_count, last_used_at, evidence
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)
+        `).run(
+          ts, scope, text, importance, args.source ?? null,
+          problemKey || null, requestedStatus,
+          requestedStatus === 'verified' ? ts : null,
+          evidence || null,
+        );
         const noteId = Number(info.lastInsertRowid);
         if (s.fts.notes) {
           try {
@@ -2857,35 +3061,56 @@ function defineTools(ctx) {
         contestedWith: result.contestedWith,
         scope,
         scopeReason: decision.reason,
+        problemKey: problemKey || null,
+        solutionStatus: solutionStatusOf(requestedStatus),
+        reuseCount: 0,
       };
     },
   }));
 
   disposers.push(ctx.tools.register({
     name: 'memory_search',
-    description: 'Hybrid recall over stored notes, facts and transcripts. Returns ranked hits with source pointers. Use scope to narrow to a project.',
+    description: "Recall stored notes, facts, transcripts and problem-solving experience. When blocked by an error or tool failure, search the exact problemKey first: verified solutions rank above unverified notes, while failed attempts stay visible but lower. Then widen to keywords or the web only if the stored experience is absent or weak.",
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        query: { type: 'string', description: 'Keywords, an entity, a file path, or a phrase from the original wording.' },
+        query: { type: 'string', description: 'Keywords, an entity, a file path, or a phrase from the original wording. Optional when problemKey is supplied.' },
+        problemKey: {
+          type: 'string',
+          description: 'Exact normalized error signature, e.g. "EADDRINUSE: port 8000" or "npm test fails on node 22". Exact matches are returned first.',
+        },
+        status: {
+          type: 'string',
+          enum: ['all', 'verified', 'unverified', 'failed', 'expired'],
+          description: 'Optional note status filter. all (default) keeps every layer; a concrete status restricts results to notes with that real-world outcome.',
+        },
+        kind: {
+          type: 'string',
+          enum: ['all', 'note', 'fact', 'chunk'],
+          description: 'Optional layer filter: note, fact, chunk, or all (default).',
+        },
         limit: { type: 'number', description: 'Maximum hits, default 8, max 30.' },
         scope: {
           type: 'string',
           description: "Optional layer filter: a project scope (returns that project plus global), 'global', or 'all'. Omit to use the current project when one is known.",
         },
       },
-      required: ['query'],
+      required: [],
     },
     output: {
-      schema: { type: 'object', properties: { total: { type: 'number' }, scope: { type: 'string' }, hits: { type: 'array', items: { type: 'object' } } } },
+      schema: { type: 'object', properties: { total: { type: 'number' }, scope: { type: 'string' }, problemKey: { type: 'string' }, hits: { type: 'array', items: { type: 'object' } } } },
       render: (_args, value) => {
         if (!value.hits.length) return textBlock(`no memory matched (scope ${value.scope ?? 'all'})`);
         const lines = value.hits.map((hit, index) => {
           const pointer = hit.source ? ` · ${hit.source}` : '';
           const flag = hit.contested ? ' · contested' : '';
           const layer = hit.scope && hit.scope !== 'global' ? ` · ${hit.scope}` : '';
-          return `${index + 1}. [${hit.kind}#${hit.id}${layer}${flag}] ${hit.text.replace(/\s+/g, ' ')}${pointer}`;
+          const solution = hit.solutionStatus && hit.solutionStatus !== 'unverified'
+            ? ` · ${hit.solutionStatus}${hit.reuseCount ? ` ×${hit.reuseCount}` : ''}`
+            : '';
+          const problem = hit.problemKey ? ` · key: ${hit.problemKey}` : '';
+          return `${index + 1}. [${hit.kind}#${hit.id}${layer}${flag}${solution}${problem}] ${hit.text.replace(/\s+/g, ' ')}${pointer}`;
         });
         return textBlock(`matched ${value.total} (scope ${value.scope ?? 'all'})\n${lines.join('\n')}`);
       },
@@ -2894,13 +3119,113 @@ function defineTools(ctx) {
       const s = openStore();
       const limit = Math.min(30, Math.max(1, Number(args.limit ?? 8)));
       const query = String(args.query ?? '');
+      const problemKey = normalizeProblemKey(args.problemKey);
+      const requestedStatus = String(args.status ?? 'all').trim().toLowerCase();
+      if (!['all', ...SOLUTION_STATUSES].includes(requestedStatus)) {
+        throw new Error('status must be all, verified, unverified, failed, or expired');
+      }
+      const requestedKind = String(args.kind ?? 'all').trim().toLowerCase();
+      if (!['all', 'note', 'fact', 'chunk'].includes(requestedKind)) {
+        throw new Error('kind must be all, note, fact, or chunk');
+      }
       const requested = String(args.scope ?? '').trim();
       // Retrieval judgement: an explicit request wins; otherwise scope to the
       // current project (plus the global layer), never to every project.
       const scope = requested === 'all' ? null : (requested || currentProject(toolContext) || SCOPE_GLOBAL);
-      if (!queryTerms(query).length) return { total: 0, scope: scope ?? 'all', hits: [] };
-      const result = await runSearch(s, query, limit, scope);
-      return { ...result, scope: scope ?? 'all' };
+      if (!queryTerms(query).length && !problemKey) {
+        return { total: 0, scope: scope ?? 'all', hits: [] };
+      }
+      const exact = problemKey && (requestedKind === 'all' || requestedKind === 'note')
+        ? searchProblemKey(s, problemKey, limit, scope, { status: requestedStatus })
+        : [];
+      const result = queryTerms(query).length
+        ? await runSearch(s, query, limit, scope, { status: requestedStatus, kind: requestedKind })
+        : { hits: [] };
+      const merged = [];
+      const seen = new Set();
+      for (const hit of [...exact, ...result.hits]) {
+        const key = `${hit.kind}:${hit.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push(hit);
+        if (merged.length >= limit) break;
+      }
+      return {
+        total: merged.length,
+        scope: scope ?? 'all',
+        ...(problemKey ? { problemKey } : {}),
+        hits: merged,
+      };
+    },
+  }));
+
+  disposers.push(ctx.tools.register({
+    name: 'memory_solution_report',
+    description: 'Close the loop after trying a stored solution. success marks the note verified and increments its reuse count; failed records a dead end; expired marks it as no longer applicable. Call this after the result is known, not before.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        id: { type: 'number', description: 'Note id returned by memory_write or memory_search.' },
+        outcome: {
+          type: 'string',
+          enum: ['success', 'failed', 'expired'],
+          description: 'success: the solution worked in practice; failed: it did not solve the problem; expired: it no longer applies in the current environment.',
+        },
+        evidence: {
+          type: 'string',
+          description: 'Optional: command output, test result, URL, or a short note showing why the outcome is credible.',
+        },
+      },
+      required: ['id', 'outcome'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          id: { type: 'number' }, solutionStatus: { type: 'string' },
+          reuseCount: { type: 'number' }, lastUsedAt: { type: 'number' },
+        },
+      },
+      render: (_args, value) => textBlock(
+        `solution #${value.id} -> ${value.solutionStatus} (reused ${value.reuseCount}×)`,
+      ),
+    },
+    async execute(args = {}) {
+      const id = Number(args.id);
+      const outcome = String(args.outcome ?? '').trim().toLowerCase();
+      if (!Number.isFinite(id) || id <= 0) throw new Error('id is required');
+      if (!['success', 'failed', 'expired'].includes(outcome)) {
+        throw new Error('outcome must be success, failed, or expired');
+      }
+      const s = openStore();
+      const note = s.db.prepare(`
+        SELECT id, solution_status, reuse_count, problem_key
+        FROM notes WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL
+      `).get(id);
+      if (!note) throw new Error(`note ${id} not found or is no longer active`);
+      const ts = now();
+      const status = outcome === 'success' ? 'verified' : outcome === 'failed' ? 'failed' : 'expired';
+      transaction(s.db, () => {
+        s.db.prepare(`
+          UPDATE notes
+          SET solution_status = ?, reuse_count = reuse_count + 1,
+            last_used_at = ?, solution_verified_at = ?, evidence = COALESCE(?, evidence)
+          WHERE id = ?
+        `).run(status, ts, outcome === 'success' ? ts : null, String(args.evidence ?? '').trim() || null, id);
+      });
+      invalidateProfile();
+      const updated = s.db.prepare(`
+        SELECT solution_status, reuse_count, last_used_at, solution_verified_at
+        FROM notes WHERE id = ?
+      `).get(id);
+      return {
+        id,
+        solutionStatus: solutionStatusOf(updated?.solution_status),
+        reuseCount: Number(updated?.reuse_count ?? 0),
+        lastUsedAt: updated?.last_used_at ?? ts,
+        verifiedAt: updated?.solution_verified_at ?? null,
+      };
     },
   }));
 
@@ -3165,7 +3490,8 @@ function defineTools(ctx) {
       const filter = scope ? scopeClause('scope', scope) : { sql: '', params: [] };
       const rows = s.db.prepare(`
         SELECT id, text, importance, source, scope FROM notes
-        WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0 ${filter.sql}
+        WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0
+          AND COALESCE(solution_status, 'unverified') NOT IN ('failed', 'expired') ${filter.sql}
         ORDER BY importance DESC, ts DESC LIMIT 60
       `).all(...filter.params);
       let used = 0;
@@ -3484,7 +3810,8 @@ function registerRoutes(ctx) {
       }
       const notes = s.db.prepare(`
         SELECT id, ts, scope, text, importance, source, revision, contested,
-               superseded_by, verification, verified_at, evidence, deleted_at
+               superseded_by, verification, verified_at, evidence, deleted_at,
+               problem_key, solution_status, solution_verified_at, reuse_count, last_used_at
         FROM notes WHERE 1 = 1 ${deletedActive} ${noteActive} ${scopeSql}
         ORDER BY importance DESC, ts DESC LIMIT ? OFFSET ?
       `).all(...scopeParams, limit, offset);
@@ -3586,6 +3913,8 @@ function registerRoutes(ctx) {
           projectNotes,
           contested: count('notes', 'AND contested = 1'),
           verified: count('notes', 'AND verification IS NOT NULL'),
+          solutionsVerified: count('notes', "AND solution_status = 'verified'"),
+          solutionsFailed: count('notes', "AND solution_status = 'failed'"),
         },
         projects: projectRows,
         projectTotal: projectRows.length,
@@ -3729,6 +4058,12 @@ function registerRoutes(ctx) {
             ts: row.ts ?? null,
             contested: Boolean(row.contested),
             verification: row.verification ?? null,
+            verifiedAt: row.solution_verified_at ?? null,
+            problemKey: row.problem_key ?? null,
+            solutionStatus: solutionStatusOf(row.solution_status),
+            reuseCount: Number(row.reuse_count ?? 0),
+            lastUsedAt: row.last_used_at ?? null,
+            evidence: row.evidence ?? null,
           },
         });
       }

@@ -1,11 +1,11 @@
 # 全息记忆（Omni memory）
 
-> 给 DeepSeek Harness 的长期记忆内核：**只增不改的原文留底 + 会自我校验的结论 + 按项目分层 + 三路混合召回**。
+> 给 DeepSeek Harness 的长期记忆内核：**只增不改的原文留底 + 会自我校验的结论 + 按项目分层 + 三路混合召回 + 可复用的故障经验沉淀**。
 
 > ⚠️ **许可提醒**：本项目采用 **CC BY-NC 4.0** —— 可自由使用、修改、二次开发、借鉴，
 > 但**禁止任何商业用途**，且**必须署名作者**。商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-225%2F225-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-235%2F235-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)](LICENSE)
 
 ---
@@ -25,6 +25,8 @@
 ## 核心能力
 
 - **混合检索**：词面（FTS5 trigram + 中文二元索引）+ 向量（512 维字符 n-gram，可选接真语义嵌入）+ 图游走，RRF 融合排序
+- **故障经验库**：笔记可带 `problemKey` 问题指纹、`solutionStatus`（verified / unverified / failed / expired）和证据；精确指纹优先命中，已验证解法排在失败尝试之前
+- **复用闭环**：`memory_solution_report` 在真实复用后回写成功/失败/过期，成功累计 `reuseCount` 并标记 verified，失败尝试保留下来避免重复走死路
 - **自动召回**：每轮用你的消息预取 top-3 注入上下文（可关）
 - **模型复核归类（可选）**：写入先按规则落层；显式开启后，后台让模型复核，判错自动迁移并留痕。默认关闭，不把正文发给外部模型
 - **冲突标记**：显式声明或近重复自动标记 `contested`，只标记不删除；画像与自动召回默认排除 contested
@@ -44,7 +46,7 @@
 
 ```bash
 cd memory-core
-npm test          # 225 个用例
+npm test          # 235 个用例
 npm run check     # 语法与 JSON 校验
 ```
 
@@ -75,8 +77,9 @@ npm run check     # 语法与 JSON 校验
 
 | 工具 | 作用 |
 |---|---|
-| `memory_write` | 写入笔记 / 事实 / 原始观察（事实可声明 `cardinality: multi` 保留多值） |
-| `memory_search` | 混合检索（支持全局 / 项目 / 全部） |
+| `memory_write` | 写入笔记 / 事实 / 原始观察；笔记可带 `problemKey` / `solutionStatus` / `evidence`（事实可声明 `cardinality: multi` 保留多值） |
+| `memory_search` | 混合检索（支持全局 / 项目 / 全部）；可按 `problemKey` 精确查，按 `status` / `kind` 过滤 |
+| `memory_solution_report` | 记录解法真实复用结果：`success` 标记 verified 并累计次数，`failed` / `expired` 更新状态 |
 | `memory_profile` | 读取常驻画像 |
 | `memory_timeline` | 某实体的时间线（事实 + 相关笔记） |
 | `memory_forget` | 墓碑化一条记忆 |
@@ -101,8 +104,8 @@ npm run check     # 语法与 JSON 校验
 
 ## 测试与指标
 
-- 自动化用例：**225 / 225 通过**
-- 检索延迟（本机复核，Node 22.23.2；标准 bench 已改为 global scope 并断言真实命中）：10,000 行 p95 ≈ **1.7ms**；100,000 行 ≈ 1.8ms；1,000,000 行 ≈ 5.3ms；1M + 5 万向量 + 100 万 bigram ≈ **109ms**（两段式有界检索，见 ADR-020）
+- 自动化用例：**235 / 235 通过**
+- 检索延迟（本机复核，Node 22.23.2；标准 bench 已改为 global scope 并断言真实命中）：10,000 行 p95 ≈ **2.4ms**；100,000 行 ≈ 2.4ms；1,000,000 行 ≈ 6.0ms；1M + 5 万向量 + 100 万 bigram ≈ **116.8ms**（两段式有界检索，见 ADR-020）
 - 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 混合检索 **0.927**
 
 ```bash
@@ -120,7 +123,7 @@ npm run bench:golden   # 黄金集
 ## 文档
 
 - [设计规格](docs/DESIGN.md)（需求、架构、数据模型、契约、失败模式、追溯矩阵）
-- [架构决策记录](docs/ADR)（26 份）
+- [架构决策记录](docs/ADR)（27 份）
 - [威胁模型](docs/THREAT-MODEL.md)（信任边界、残余风险、新增路由检查清单）
 - 备份/恢复设计见 [ADR-019](docs/ADR/019-backup-restore.md)
 - 1M 行检索改造见 [ADR-020](docs/ADR/020-bounded-retrieval.md)
@@ -129,6 +132,7 @@ npm run bench:golden   # 黄金集
 - 多值关系设计见 [ADR-023](docs/ADR/023-multi-valued-relations.md)
 - 实体别名与多值画像见 [ADR-024](docs/ADR/024-entity-aliases.md)
 - 用户设定见 [ADR-026](docs/ADR/026-persona-settings.md)
+- 故障经验库见 [ADR-027](docs/ADR/027-problem-experience.md)
 - 远程 embedding 加固与 ANN 边界见 [ADR-025](docs/ADR/025-remote-embedding-and-ann.md)
 - [更新日志](docs/CHANGELOG.md)
 - [架构图](docs/architecture.png)

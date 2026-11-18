@@ -225,7 +225,7 @@ test('memory_reindex rebuilds missing vectors for the hashed backend', async () 
   assert.ok(after > Number(before));
 });
 
-test('schema v6 databases migrate to v10 without losing rows', async () => {
+test('schema v6 databases migrate to v11 without losing rows', async () => {
   const home = mkdtempSync(path.join(tmpdir(), 'omni-v6-'));
   const dir = path.join(home, 'memory');
   const { mkdirSync } = await import('node:fs');
@@ -273,7 +273,7 @@ test('schema v6 databases migrate to v10 without losing rows', async () => {
   await app.route('/omni-memory/list').handler(fakeReq('/omni-memory/list?limit=10'), res.res);
   const body = res.json();
   assert.equal(body.ok, true);
-  assert.equal(body.schema, 10);
+  assert.equal(body.schema, 11);
   assert.equal(body.stats.notes, 1);
 
   const check = new DatabaseSync(file);

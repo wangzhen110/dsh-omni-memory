@@ -21,7 +21,7 @@
   "format": "omni-memory-backup",
   "version": 1,
   "exportedAt": 0,
-  "schema": 10,
+  "schema": 11,
   "source": "omni.db",
   "counts": { "notes": 0, "facts": 0, "chunks": 0, "edges": 0, "entities": 0, "relations": 0, "entityAliases": 0, "persona": 0 },
   "notes": [], "facts": [], "chunks": [], "edges": [], "entities": [], "relations": [], "entityAliases": [], "persona": []
@@ -31,7 +31,7 @@
 - **包含墓碑与历史**（默认）：恢复才有意义；`activeOnly` 供体积敏感场景，只导出活跃笔记和未失效事实。
 - **不包含向量**：向量是派生索引，与后端/维度耦合；导入后重建，避免把某一后端的向量带进另一后端。
 - 必须携带 `relations / entity_aliases / persona`，否则导入会丢失多值关系的 cardinality、实体别名和用户设定。
-- 每行保留原始 `ts / valid_from / valid_to / recorded_at / deleted_at / superseded_by / verification / evidence`，恢复后审计链不断。
+- 每行保留原始 `ts / valid_from / valid_to / recorded_at / deleted_at / superseded_by / verification / evidence`，恢复后审计链不断；v11 起 note 还保留 `problem_key / solution_status / solution_verified_at / reuse_count / last_used_at`。
 
 ### 2. 导入：按内容去重、默认 dry-run
 
@@ -40,7 +40,7 @@
 - `relations` 的 `cardinality`、`entity_aliases`、`persona` 一并 upsert；旧备份里的 `aliases` 字段仍然兼容。
 - id 不保证保留：新库可能已有同 id 行。note 的 `superseded_by` 在导入后按 id 映射重写；其它表没有跨行 id 引用。
 - 导入在一个 `BEGIN IMMEDIATE` 事务内完成；失败整体回滚。
-- 导入后重建 FTS / bigram / 向量（远程后端进入待嵌入队列）。
+- 导入后重建 FTS / bigram / 向量（远程后端进入待嵌入队列）；v11 的故障经验字段原样恢复，不重新推断状态。
 
 ### 3. 恢复：只复活，不猜语义
 
@@ -76,4 +76,4 @@
 
 - `test/backup.test.mjs` 7 例：导出含墓碑、activeOnly、导出路由附件头、导入 dry-run、二次导入去重、lineage id 重映射、restore 生效、restore 路由 CSRF、审计列表可见墓碑。
 - `test/review-fixes-3.1.3.test.mjs` 覆盖 activeOnly 排除 superseded/expired、relations/cardinality/aliases/persona 导入、chunk restore 冲突。
-- 全量 225 / 225。
+- 全量 235 / 235。

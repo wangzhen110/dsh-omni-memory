@@ -2,6 +2,22 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.2.0] — 2026-11-18
+
+### 故障经验库（ADR-027）
+- **Schema v11**：`notes` 新增 `problem_key / solution_status / solution_verified_at / reuse_count / last_used_at`，并建立 `problem_key`、`solution_status` 索引；旧库迁移补齐，旧行按 `unverified` 读取。
+- **写入**：`memory_write(kind='note')` 支持 `problemKey / solutionStatus / evidence`；问题指纹归一化为小写、压缩空白、限长 200；同文本重复写入可补写经验元数据。
+- **检索**：`memory_search` 的 `query` 改为可选，新增 `problemKey` 精确检索、`status` 过滤、`kind` 过滤；命中返回 `problemKey / solutionStatus / reuseCount / lastUsedAt / verifiedAt / verification / evidence`。
+- **排序**：verified `+0.2`、failed `-0.2`、expired `-0.35`，复用次数最多 `+0.15`；融合后再次叠加，避免 RRF 覆盖；精确指纹命中置顶。
+- **闭环工具**：新增 `memory_solution_report({ id, outcome, evidence? })`；success 标记 verified、写 `solution_verified_at` 并累计 `reuse_count`，failed/expired 更新状态并清空解法验证时间。
+- **备份**：schema 10 → 11；导出自动携带新字段，导入显式恢复并重建索引。
+- **界面**：笔记卡片显示「已验证解法 / 失败尝试 / 已失效」与复用次数。
+- **边界**：`problemKey / solutionStatus / evidence` 仅允许 note；不把经验写进常驻 prompt，协议放在工具描述与 README，由调用方在遇障时先检索。
+
+### 测试
+- **235 / 235 通过**（新增 10 条 `solution-memory` 回归；schema/backup/tools 断言同步 v11 与 17 工具）。
+- 基准复核（Node 22.23.2）：10k p95 2.4ms、100k 2.4ms、1M 6.0ms、1M + 5 万向量 + 100 万 bigram 116.8ms；均断言真实命中。
+
 ## [3.1.3] — 2026-11-18
 
 ### 修复

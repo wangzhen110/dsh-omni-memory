@@ -34,6 +34,11 @@ const EMPTY_HIGHLIGHT = [];
         contradicted: '与原文矛盾',
         unsupported: '缺少依据',
         noSource: '无来源',
+        solutionVerified: '已验证解法',
+        solutionUnverified: '待验证',
+        solutionFailed: '失败尝试',
+        solutionExpired: '已失效',
+        reuse: '复用 {n} 次',
         evidence: '证据',
         superseded: '已被替代',
         stats: '笔记 {notes} · 事实 {facts} · 片段 {chunks} · 争议 {contested}',
@@ -113,6 +118,11 @@ const EMPTY_HIGHLIGHT = [];
         contradicted: 'contradicted',
         unsupported: 'unsupported',
         noSource: 'no source',
+        solutionVerified: 'verified solution',
+        solutionUnverified: 'unverified',
+        solutionFailed: 'failed attempt',
+        solutionExpired: 'expired',
+        reuse: 'reused {n}×',
         evidence: 'evidence',
         superseded: 'superseded',
         stats: 'notes {notes} · facts {facts} · chunks {chunks} · contested {contested}',
@@ -196,6 +206,21 @@ const EMPTY_HIGHLIGHT = [];
       return 'var(--dsw-alias-text-tertiary, #8899aa)';
     }
 
+    function solutionColor(status) {
+      if (status === 'verified') return 'var(--dsw-alias-state-success-primary, #3fb950)';
+      if (status === 'failed' || status === 'expired') return 'var(--dsw-alias-label-dangerous, #d9483b)';
+      return 'var(--dsw-alias-text-tertiary, #8899aa)';
+    }
+
+    function solutionLabel(status, t) {
+      return {
+        verified: t('solutionVerified'),
+        unverified: t('solutionUnverified'),
+        failed: t('solutionFailed'),
+        expired: t('solutionExpired'),
+      }[status] ?? null;
+    }
+
     function format(template, vars) {
       return String(template).replace(/\{(\w+)\}/g, (_, key) => String(vars[key] ?? ''));
     }
@@ -207,6 +232,11 @@ const EMPTY_HIGHLIGHT = [];
         supported: 'supported', weak: 'weak', contradicted: 'contradicted',
         unsupported: 'unsupported', no_source: 'noSource',
       }[item.verification];
+      const solution = item.kind === 'note'
+        ? (item.solutionStatus ?? item.solution_status ?? null)
+        : null;
+      const reuseCount = Number(item.reuseCount ?? item.reuse_count ?? 0);
+      const solutionText = solution && solution !== 'unverified' ? solutionLabel(solution, t) : null;
 
       const forget = async () => {
         if (busy) return;
@@ -236,6 +266,7 @@ const EMPTY_HIGHLIGHT = [];
           h('span', { style: { ...CHIP, color: kindColor(item.kind), borderColor: kindColor(item.kind) } }, kindLabel),
           item.subject ? h('span', { style: { fontSize: 12, fontWeight: 600 } }, `${item.subject} · ${item.relation}`) : null,
           item.contested ? h('span', { style: { ...CHIP, color: 'var(--dsw-alias-label-dangerous, #d9483b)', borderColor: 'var(--dsw-alias-label-dangerous, #d9483b)' } }, t('contested')) : null,
+          solutionText ? h('span', { style: { ...CHIP, color: solutionColor(solution), borderColor: solutionColor(solution) } }, `${solutionText}${reuseCount > 0 ? ` · ${format(t('reuse'), { n: reuseCount })}` : ''}`) : null,
           verdictKey ? h('span', { style: { ...CHIP, color: verificationColor(item.verification), borderColor: verificationColor(item.verification) } }, t(verdictKey)) : null,
           item.superseded_by ? h('span', { style: MUTED }, t('superseded')) : null,
           item.deleted_at ? h('span', { style: { ...CHIP, color: 'var(--dsw-alias-label-dangerous, #d9483b)', borderColor: 'var(--dsw-alias-label-dangerous, #d9483b)' } }, t('deleted')) : null,
