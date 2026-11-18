@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Omni-Memory-Personal-Use-1.0
+// SPDX-License-Identifier: LicenseRef-Omni-Memory-Personal-Use-1.1
 // © 2026 wangzhen110 · https://github.com/wangzhen110/dsh-omni-memory
 // NonCommercial use only; attribution required. See LICENSE and ATTRIBUTION.md.
 /**

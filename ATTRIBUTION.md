@@ -1,7 +1,8 @@
 # 署名要求（Attribution）
 
-本项目使用 **全息记忆个人使用许可 1.0**：允许个人使用、修改、借鉴，但**不得商用**，
-尤其**不得将修改版商用**，且**必须署名**。以下是“怎样才算合规署名”的最低要求与可直接复制的模板。
+本项目使用 **全息记忆个人使用许可 1.1**：仅允许个人、非商业使用、修改、借鉴；
+**禁止任何形式的商业使用**，尤其**禁止拿源码或架构去做商业替代、竞品或商业服务**，且**必须署名**。
+以下是“怎样才算合规署名”的最低要求与可直接复制的模板。
 
 ---
 
@@ -11,7 +12,7 @@
 
 1. **写明作者与项目名**：全息记忆 (Omni Memory) · wangzhen110
 2. **给出项目链接**：https://github.com/wangzhen110/dsh-omni-memory
-3. **写明许可协议**：全息记忆个人使用许可 1.0，并附 `LICENSE` 链接
+3. **写明许可协议**：全息记忆个人使用许可 1.1，并附 `LICENSE` 链接
 4. **保留版权声明**：转载源码时不得删除本文件、`LICENSE` 及源码中的版权头
 5. **说明是否修改**：改过就写「已修改 / Modified」
 6. **不得暗示背书**：不能写「官方出品」「作者推荐」等
@@ -26,7 +27,7 @@
 本项目部分代码/设计参考或基于「全息记忆 (Omni Memory)」：
 - 作者：wangzhen110
 - 项目：https://github.com/wangzhen110/dsh-omni-memory
-- 许可：全息记忆个人使用许可 1.0（见项目 LICENSE）
+- 许可：全息记忆个人使用许可 1.1（见项目 LICENSE）
 - 说明：本项目对其进行了修改
 ```
 
@@ -35,7 +36,7 @@
 ```markdown
 This project is based on / borrows from "Omni Memory" by wangzhen110:
 - Source: https://github.com/wangzhen110/dsh-omni-memory
-- License: Omni Memory Personal Use License 1.0 (see LICENSE)
+- License: Omni Memory Personal Use License 1.1 (see LICENSE)
 - Changes: modified
 ```
 
@@ -44,8 +45,9 @@ This project is based on / borrows from "Omni Memory" by wangzhen110:
 ```js
 // Portions of this file are based on Omni Memory by wangzhen110
 // https://github.com/wangzhen110/dsh-omni-memory
-// Licensed under the Omni Memory Personal Use License 1.0 — personal,
-// non-commercial use only; commercial use of modified versions is prohibited.
+// Licensed under the Omni Memory Personal Use License 1.1 — personal,
+// non-commercial use only; commercial use of modified versions and commercial
+// reimplementation based on the source or architecture are prohibited.
 // Modified for this project.
 ```
 
@@ -53,7 +55,7 @@ This project is based on / borrows from "Omni Memory" by wangzhen110:
 
 ```text
 本软件的部分功能基于「全息记忆 (Omni Memory)」
-作者 wangzhen110 · 全息记忆个人使用许可 1.0
+作者 wangzhen110 · 全息记忆个人使用许可 1.1
 https://github.com/wangzhen110/dsh-omni-memory
 ```
 
@@ -75,7 +77,10 @@ https://github.com/wangzhen110/dsh-omni-memory
 可以，只要**非商业**、**保留署名**，并且修改版继续使用同一许可。不得改为更宽松的许可。
 
 **Q：修改版可以商用吗？**
-不可以。修改版商用被明确禁止；即使原版已取得商业授权，修改版仍需另行取得作者书面许可。
+不可以。任何形式的商用都被禁止；修改版商用尤其明确禁止。
+
+**Q：不复制代码，只拿架构、数据模型或接口设计重写一个商用产品，可以吗？**
+不可以。本许可把“为商业目的复制、改写、重写、提取架构后重新实现，制作竞品或商业替代”明确列为禁止行为；是否保留原代码、文件名或注释不影响判断。个人、非商业的学习和研究不受此限。
 
 **Q：商业授权怎么拿？**
 优先在 GitHub 仓库开 Issue（公开可追踪）：

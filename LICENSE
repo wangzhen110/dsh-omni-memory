@@ -1,14 +1,16 @@
-全息记忆（Omni Memory）个人使用许可 1.0
-Omni Memory Personal Use License 1.0
+全息记忆（Omni Memory）个人使用许可 1.1
+Omni Memory Personal Use License 1.1
 
 Copyright (c) 2026 wangzhen110
 https://github.com/wangzhen110/dsh-omni-memory
 
-本许可允许个人、非商业使用；禁止任何商业使用，尤其禁止将修改后的版本用于商业目的。
-This license permits personal, non-commercial use only. Commercial use is prohibited,
-including any commercial use of a modified version.
+本许可仅允许个人、非商业使用；禁止任何形式的商业使用，
+包括直接商用、修改后商用，以及复制、改写或提取本软件源码/架构后用于商业替代、竞品或商业服务。
+This license permits personal, non-commercial use only. All commercial use is prohibited,
+including commercial use of modified versions and commercial reimplementation based on
+the source code or architecture of this software.
 
-本许可不是 OSI 认可的开源许可证，属于「源码公开、个人非商业使用」许可。
+本许可不是 OSI 认可的开源许可证，属于「源码公开、仅限个人非商业使用」许可。
 This is a source-available license, not an OSI-approved open-source license.
 
 ────────────────────────────────────────────────────────
@@ -26,7 +28,11 @@ This is a source-available license, not an OSI-approved open-source license.
     b. 提供付费服务、SaaS、托管、订阅、咨询、培训或技术支持；
     c. 销售、出租、转售、收费分发，或捆绑进付费产品、硬件、课程、会员服务；
     d. 以本软件或其修改版为基础制作商业产品、商业插件、商业应用或商业内容；
-    e. 其他以获取商业利益或金钱补偿为主要目的的使用。
+    e. 其他以获取商业利益或金钱补偿为主要目的的使用，包括通过使用本软件直接或间接获客、降本、提高商业效率或形成商业竞争优势。
+
+1.5 “架构”指本软件整体或局部的结构、模块划分、数据模型、存储结构、检索与融合流程、接口/协议设计、状态机、调度与生命周期设计、算法组合及工程实现思路，以及文档、图表、注释中体现的相应设计。
+
+1.6 “商业替代/商业抄袭”指为商业目的，直接或间接复制、改写、重写、翻译、移植、拆分、重组、反向工程、提取或绕开本软件全部或实质性部分的源代码、架构、数据模型、接口或算法，制作与本软件功能实质相同、可替代本软件或形成商业竞争的产品、服务、插件或方案；无论是否保留原代码、文件名、注释或原作者信息，均不影响本条的适用。
 
 ────────────────────────────────────────────────────────
 二、授权
@@ -46,11 +52,13 @@ This is a source-available license, not an OSI-approved open-source license.
 
 3.1 不得将本软件用于任何商业使用。
 3.2 不得将修改版用于任何商业使用。即使你已就原版取得商业授权，修改版的商业使用仍需另行取得作者书面许可。
-3.3 不得销售、出租、转售、收费分发本软件或修改版，也不得将其捆绑进付费产品或付费服务。
-3.4 不得移除、隐藏或篡改本软件中的版权声明、许可声明、作者标识或来源链接。
-3.5 不得以任何方式暗示作者为你、你的修改版或你的商业产品背书。
-3.6 不得将本软件或修改版再许可为商业许可，或授予他人商业使用权。
-3.7 本许可不授予专利、商标、商号、服务标记或其他知识产权；作者保留未明确授予的一切权利。
+3.3 在法律允许的最大范围内，不得为商业目的复制、改写、重写、翻译、移植、拆分、重组、反向工程、提取架构后重新实现本软件的全部或实质性部分；不得基于本软件或其实质性架构、数据模型、接口或算法制作竞品、商业插件、商业替代品或商业服务。是否保留原代码、文件名、注释或原作者信息，不影响本条的适用。
+3.4 不得销售、出租、转售、收费分发本软件或修改版，也不得将其捆绑进付费产品或付费服务。
+3.5 不得移除、隐藏或篡改本软件中的版权声明、许可声明、作者标识或来源链接。
+3.6 不得以任何方式暗示作者为你、你的修改版或你的商业产品背书。
+3.7 不得将本软件或修改版再许可为商业许可，或授予他人商业使用权。
+3.8 本许可不授予专利、商标、商号、服务标记或其他知识产权；作者保留未明确授予的一切权利。
+3.9 判断是否构成商业使用，以使用目的、服务对象、收费、获客、降本或商业竞争优势等实质因素为准，不以是否修改代码、是否公开分发或是否标注来源为唯一标准。
 
 ────────────────────────────────────────────────────────
 四、署名
@@ -121,6 +129,9 @@ English summary (non-binding)
 - You may use, copy, modify and distribute this software for personal,
   non-commercial purposes only.
 - Commercial use of the software or any modified version is prohibited.
+- Commercial copying, rewriting, reverse engineering or extraction of the
+  source code or architecture to build a competing or substitute product is
+  also prohibited.
 - You must keep the copyright notice, this license and the project link;
   modified versions must be marked as modified.
 - Commercial use requires prior written permission from the author.
