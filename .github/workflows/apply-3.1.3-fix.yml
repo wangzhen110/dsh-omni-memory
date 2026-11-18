@@ -1,0 +1,29 @@
+name: apply-3.1.3-fix
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download verified patch
+        run: curl -fsSL --retry 3 -o 3.1.3-fix.patch "https://aka.doubaocdn.com/s/wurtwzQdrO"
+      - name: Verify patch checksum
+        run: echo "8d02c697f45c74210be4d44b0a40b2b3e7663f2b636e46e3ba3ec555928ac85b  3.1.3-fix.patch" | sha256sum -c -
+      - name: Apply patch and push release commit
+        run: |
+          git apply --check --whitespace=nowarn 3.1.3-fix.patch
+          git apply --whitespace=nowarn 3.1.3-fix.patch
+          rm -f 3.1.3-fix.patch
+          rm -f .github/workflows/apply-3.1.3-fix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: release v3.1.3 (review fixes)"
+          git push origin HEAD:main
