@@ -30,7 +30,7 @@ const started = Date.now();
 db.exec('BEGIN');
 for (let i = 0; i < ROWS; i += 1) {
   const text = `压力测试条目 ${i} 关键词 alpha beta gamma 说明文字用于模拟真实长度`;
-  const info = insertNote.run(Date.now() - i * 1000, 'bench', text, Math.random(), 'bench');
+  const info = insertNote.run(Date.now() - i * 1000, 'global', text, Math.random(), 'bench');
   try { insertFts.run(Number(info.lastInsertRowid), text); } catch { /* ignore */ }
 }
 db.exec('COMMIT');
@@ -58,11 +58,16 @@ db.close();
 
 const samples = [];
 const profiles = [];
+let hitTotal = 0;
+let minHits = Infinity;
 for (let i = 0; i < QUERIES; i += 1) {
   const query = i % 3 === 0 ? 'alpha beta' : i % 3 === 1 ? '压力测试条目' : `条目 ${i}`;
   const t0 = process.hrtime.bigint();
-  await app.call('memory_search', { query, limit: 8 });
+  const result = await app.call('memory_search', { query, limit: 8 });
   const t1 = process.hrtime.bigint();
+  const hits = result.value?.hits?.length ?? 0;
+  hitTotal += hits;
+  minHits = Math.min(minHits, hits);
   samples.push(Number(t1 - t0) / 1e6);
   if (PROFILE) {
     const probe = fakeRes();
@@ -85,12 +90,14 @@ console.log(JSON.stringify({
   queries: QUERIES,
   seedMs,
   derivedMs,
+  hitTotal,
+  minHitsPerQuery: minHits === Infinity ? 0 : minHits,
   p50: Number(at(0.5).toFixed(1)),
   p95: Number(at(0.95).toFixed(1)),
   max: Number(samples[samples.length - 1].toFixed(1)),
   mean: Number(mean.toFixed(1)),
   budgetP95: 300,
-  pass: at(0.95) < 300,
+  pass: at(0.95) < 300 && hitTotal > 0,
   ...(PROFILE ? {
     profileMeanMs: {
       notes: average('notes'), facts: average('facts'), chunks: average('chunks'),

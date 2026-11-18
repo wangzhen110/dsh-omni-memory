@@ -78,13 +78,26 @@ test('directive sentences from the user become preferences, technical ones do no
   assert.equal(/JSON|body/.test(pref), false, 'technical instruction filtered');
 });
 
-test('persona refresh uses the host model when available', async () => {
+test('persona refresh uses the host model only when explicitly requested', async () => {
   const app = await boot({ llm: fakeLlm('{"称呼":"老王","性格":"直接，先给结论","习惯":"每天总结"}') });
   await app.call('memory_write', { kind: 'note', scope: 'global', text: '一些日常记录', importance: 0.5 });
-  const refreshed = await app.call('memory_persona', { action: 'refresh' });
+  const refreshed = await app.call('memory_persona', { action: 'refresh', useModel: true });
   assert.equal(refreshed.value.source, 'model');
+  assert.equal(refreshed.value.modelUsed, true);
   assert.equal(refreshed.value.persona['性格'], '直接，先给结论');
   assert.equal(refreshed.value.persona['习惯'], '每天总结');
+});
+
+test('persona refresh defaults to offline rules and preserves unknown fields', async () => {
+  const app = await boot({ llm: fakeLlm('{"称呼":"模型猜测"}') });
+  await app.call('memory_persona', { action: 'set', values: { 称呼: '老板', 其他: '手工保留字段' } });
+  await app.call('memory_write', { kind: 'note', scope: 'global', text: '我喜欢简洁的回答', importance: 0.9 });
+  const refreshed = await app.call('memory_persona', { action: 'refresh' });
+  assert.equal(refreshed.value.source, 'rules');
+  assert.equal(refreshed.value.modelUsed, false);
+  assert.equal(refreshed.value.persona['其他'], '手工保留字段');
+  assert.equal(refreshed.value.persona['称呼'], '老板');
+  assert.ok(String(refreshed.value.persona['偏好']).includes('简洁'));
 });
 
 test('persona refresh route needs POST and CSRF', async () => {

@@ -2,6 +2,24 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.1.3] — 2026-11-18
+
+### 修复
+- **画像跨项目泄漏**：未知项目（`projectKey` 为空）的 facts 只读 `global`，不再回退到所有项目；笔记查询也在 SQL 层过滤当前层，避免其他项目的高权重笔记挤掉全局画像。
+- **项目层检索语义**：`scope=project` 只返回 `proj:` 层，不再退回 `all`；`/omni-memory/graph` 同步支持项目层。
+- **笔记检索假阳性**：`searchNotes` 不再把 `scope` 字符串参与正文 `matchRatio` 和最近窗口匹配。
+- **项目前缀解析**：优先 exact `cwd` 映射，再做唯一共同前缀（≥12）匹配；歧义返回 null；自动 recall 校验 TTL 内项目映射未变。
+- **备份完整性**：导出增加 `relations / entity_aliases / persona`；`activeOnly` 排除 `superseded` 笔记和 `valid_to` 失效事实；导入恢复 `facts.cardinality` 并 upsert 前述三表。
+- **恢复冲突**：chunk 恢复前检查同 `hash/scope` 已有活跃行，返回结构化 `{restored:false, reason, activeId}`，不再撞 `chunks_hash_active` 唯一索引；HTTP 400 + 客户端错误态。
+- **reindex limit**：`backfillVectors` 对 note/fact/chunk 三表共用全局 `limit`，hashed reindex 不再超量。
+- **persona 刷新覆盖**：刷新改为 `existing + rules + model` 合并，手工字段保留；证据只取全局层；默认离线规则，`useModel` / `OMNI_PERSONA_MODEL` 才调用模型；面板保存保留自定义字段。
+- **judge 改 scope**：事实改 scope 时同步更新同 `src/rel/dst` 的活跃边 scope。
+- **基准有效性**：`bench/bench.mjs` 插入 `scope='global'`，新增 `hitTotal / minHitsPerQuery`，`pass` 要求 p95 < 300ms 且真实命中。
+
+### 测试
+- **225 / 225 通过**（新增 7 条 3.1.3 回归；persona 默认离线规则测试替换旧宿主模型断言）。
+- 基准复核（Node 22.23.2）：10k p95 1.7ms、100k 1.8ms、1M 5.3ms、1M + 5 万向量 + 100 万 bigram 109ms。
+
 ## [3.1.2] — 2026-11-17
 
 ### 修复

@@ -309,7 +309,7 @@ const EMPTY_HIGHLIGHT = [];
         const q = query.trim();
         if (!q) { setOffset(0); return load(0); }
         try {
-          const searchScope = scopeFilter === 'project' ? 'all' : scopeFilter;
+          const searchScope = scopeFilter;
           const response = await fetch(
             `/omni-memory/search?q=${encodeURIComponent(q)}&limit=40&scope=${encodeURIComponent(searchScope)}`,
             { headers: { accept: 'application/json' } },
@@ -327,14 +327,20 @@ const EMPTY_HIGHLIGHT = [];
       };
 
       const restore = async (kind, id) => {
+        let error = '';
         try {
-          await fetch(`/omni-memory/restore?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`, {
+          const response = await fetch(`/omni-memory/restore?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`, {
             method: 'POST',
             headers: { accept: 'application/json', 'x-omni-csrf': '1' },
           });
-        } finally {
-          await load(offset);
+          const body = await response.json().catch(() => null);
+          if (!response.ok || body?.ok === false) error = body?.error || 'restore failed';
+          else if (body?.restored === false) error = body?.reason || 'restore failed';
+        } catch {
+          error = 'restore failed';
         }
+        await load(offset);
+        if (error) setState(prev => ({ ...prev, error }));
       };
 
       const rollbackDream = async (noteId) => {
@@ -386,6 +392,12 @@ const EMPTY_HIGHLIGHT = [];
         setPersonaBusy(true);
         try {
           const values = {};
+          const known = new Set(personaFields.map(([key]) => key));
+          for (const [key, value] of Object.entries(personaDraft ?? {})) {
+            if (known.has(key)) continue;
+            const text = String(value ?? '').trim();
+            if (text) values[key] = text;
+          }
           for (const [key] of personaFields) {
             const text = String(personaDraft[key] ?? '').trim();
             if (text) values[key] = text;
@@ -431,7 +443,7 @@ const EMPTY_HIGHLIGHT = [];
       const openNode = async node => {
         setSelected({ node, loading: true, detail: null });
         try {
-          const searchScope = scopeFilter === 'project' ? 'all' : scopeFilter;
+          const searchScope = scopeFilter;
           const response = await fetch(`/omni-memory/node?node=${encodeURIComponent(node.id)}&scope=${encodeURIComponent(searchScope)}`);
           const body = await response.json();
           setSelected(body?.ok

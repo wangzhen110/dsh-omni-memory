@@ -236,7 +236,18 @@ async function flushJudge(ctx) {
         const moved = verdict !== item.scope;
         if (moved) {
           const s = openStore();
+          const oldScope = item.scope ?? SCOPE_GLOBAL;
           s.db.prepare(`UPDATE ${item.table} SET scope = ? WHERE id = ?`).run(verdict, Number(item.id));
+          if (item.kind === 'fact') {
+            const fact = s.db.prepare('SELECT subject, relation, object FROM facts WHERE id = ?').get(Number(item.id));
+            if (fact) {
+              s.db.prepare(`
+                UPDATE edges SET scope = ?
+                WHERE src = ? AND rel = ? AND dst = ? AND valid_to IS NULL
+                  AND (scope = ? OR scope IS NULL)
+              `).run(verdict, fact.subject, fact.relation, String(fact.object ?? ''), oldScope);
+            }
+          }
           invalidateProfile();
         }
         lastJudge = {
@@ -837,16 +848,19 @@ function activeVectorDim() {
   return config.kind === 'hashed' ? DIM : remoteDim;
 }
 
-function backfillVectors(db) {
+function backfillVectors(db, options = {}) {
   if (backendConfig().kind !== 'hashed') return; // remote rows are queued on demand
+  const limit = Math.max(0, Number(options.limit ?? 0));
+  let remaining = limit || Infinity;
   const jobs = [
     ['note', 'notes', 'text'],
     ['fact', 'facts', 'text'],
     ['chunk', 'chunks', 'text'],
   ];
   for (const [kind, table, column] of jobs) {
+    if (remaining <= 0) break;
     try {
-      const rows = db.prepare(`
+      const sql = `
         SELECT t.id AS id, t.${column} AS text
         FROM ${table} t
         WHERE t.deleted_at IS NULL
@@ -854,12 +868,17 @@ function backfillVectors(db) {
             SELECT 1 FROM vectors v
             WHERE v.kind = ? AND v.owner_id = t.id AND v.dim = ?
           )
-      `).all(kind, DIM);
+        ${limit ? 'LIMIT ?' : ''}
+      `;
+      const rows = limit
+        ? db.prepare(sql).all(kind, DIM, Number(remaining))
+        : db.prepare(sql).all(kind, DIM);
       for (const row of rows) {
         const vector = embedText(row.text);
         db.prepare('INSERT OR REPLACE INTO vectors(kind, owner_id, dim, vec) VALUES (?, ?, ?, ?)')
           .run(kind, Number(row.id), DIM, toBlob(vector));
       }
+      if (limit) remaining -= rows.length;
     } catch { /* index backfill is best effort */ }
   }
 }
@@ -905,13 +924,18 @@ const EXPORT_VERSION = 1;
 /** Build one portable snapshot of the store. Vectors are derived and excluded. */
 function snapshotStore(s, options = {}) {
   const audit = options.audit !== false;
-  const where = audit ? '' : 'WHERE deleted_at IS NULL';
+  const notesWhere = audit ? '' : 'WHERE deleted_at IS NULL AND superseded_by IS NULL';
+  const factsWhere = audit ? '' : 'WHERE deleted_at IS NULL AND valid_to IS NULL';
+  const chunksWhere = audit ? '' : 'WHERE deleted_at IS NULL';
   const edgesWhere = audit ? '' : 'WHERE valid_to IS NULL';
-  const notes = s.db.prepare(`SELECT * FROM notes ${where} ORDER BY id`).all();
-  const facts = s.db.prepare(`SELECT * FROM facts ${where} ORDER BY id`).all();
-  const chunks = s.db.prepare(`SELECT * FROM chunks ${where} ORDER BY id`).all();
+  const notes = s.db.prepare(`SELECT * FROM notes ${notesWhere} ORDER BY id`).all();
+  const facts = s.db.prepare(`SELECT * FROM facts ${factsWhere} ORDER BY id`).all();
+  const chunks = s.db.prepare(`SELECT * FROM chunks ${chunksWhere} ORDER BY id`).all();
   const edges = s.db.prepare(`SELECT * FROM edges ${edgesWhere} ORDER BY id`).all();
   const entities = s.db.prepare('SELECT name FROM entities ORDER BY name').all().map(row => row.name);
+  const relations = s.db.prepare('SELECT name, cardinality, aliases, updated_at FROM relations ORDER BY name').all();
+  const entityAliases = s.db.prepare('SELECT alias, canonical, updated_at FROM entity_aliases ORDER BY alias').all();
+  const persona = s.db.prepare('SELECT key, value, updated_at FROM persona ORDER BY key').all();
   return {
     format: EXPORT_FORMAT,
     version: EXPORT_VERSION,
@@ -921,8 +945,9 @@ function snapshotStore(s, options = {}) {
     counts: {
       notes: notes.length, facts: facts.length, chunks: chunks.length,
       edges: edges.length, entities: entities.length,
+      relations: relations.length, entityAliases: entityAliases.length, persona: persona.length,
     },
-    notes, facts, chunks, edges, entities,
+    notes, facts, chunks, edges, entities, relations, entityAliases, persona,
   };
 }
 
@@ -959,8 +984,11 @@ function mergeSnapshot(s, snapshot, options = {}) {
   if (!snapshot || snapshot.format !== EXPORT_FORMAT) throw new Error('not an omni-memory backup');
   if (Number(snapshot.version) > EXPORT_VERSION) throw new Error('backup was written by a newer version');
   const dryRun = options.dryRun !== false;
-  const stats = { notes: 0, facts: 0, chunks: 0, edges: 0, entities: 0, skipped: 0, dryRun };
-  const plan = { notes: [], facts: [], chunks: [], edges: [], entities: [] };
+  const stats = {
+    notes: 0, facts: 0, chunks: 0, edges: 0, entities: 0,
+    relations: 0, entityAliases: 0, persona: 0, skipped: 0, dryRun,
+  };
+  const plan = { notes: [], facts: [], chunks: [], edges: [], entities: [], relations: [], entityAliases: [], persona: [] };
 
   const noteExists = s.db.prepare('SELECT id FROM notes WHERE scope = ? AND text = ? AND superseded_by IS NULL');
   const factExists = s.db.prepare('SELECT id FROM facts WHERE subject = ? AND relation = ? AND object = ? AND scope = ?');
@@ -995,12 +1023,35 @@ function mergeSnapshot(s, snapshot, options = {}) {
     if (!name) { stats.skipped += 1; continue; }
     plan.entities.push(String(name));
   }
+  for (const relation of Array.isArray(snapshot.relations) ? snapshot.relations : []) {
+    const name = String(relation?.name ?? '').trim();
+    if (!name) { stats.skipped += 1; continue; }
+    plan.relations.push({ ...relation, name });
+  }
+  for (const alias of Array.isArray(snapshot.entityAliases) ? snapshot.entityAliases : (Array.isArray(snapshot.aliases) ? snapshot.aliases : [])) {
+    const name = String(alias?.alias ?? '').trim();
+    const canonical = String(alias?.canonical ?? '').trim();
+    if (!name || !canonical) { stats.skipped += 1; continue; }
+    plan.entityAliases.push({ ...alias, alias: name, canonical });
+  }
+  const personaRows = Array.isArray(snapshot.persona)
+    ? snapshot.persona
+    : Object.entries(snapshot.persona ?? {}).map(([key, value]) => ({ key, value }));
+  for (const item of personaRows) {
+    const key = String(item?.key ?? '').trim();
+    const value = String(item?.value ?? '').trim();
+    if (!key || !value) { stats.skipped += 1; continue; }
+    plan.persona.push({ ...item, key, value });
+  }
 
   stats.notes = plan.notes.length;
   stats.facts = plan.facts.length;
   stats.chunks = plan.chunks.length;
   stats.edges = plan.edges.length;
   stats.entities = plan.entities.length;
+  stats.relations = plan.relations.length;
+  stats.entityAliases = plan.entityAliases.length;
+  stats.persona = plan.persona.length;
   if (dryRun) return stats;
 
   const idMap = new Map();
@@ -1033,14 +1084,14 @@ function mergeSnapshot(s, snapshot, options = {}) {
     }
     for (const fact of plan.facts) {
       const info = s.db.prepare(`
-        INSERT INTO facts(subject, relation, object, text, valid_from, valid_to, recorded_at, confidence, source, contested, scope, deleted_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO facts(subject, relation, object, text, valid_from, valid_to, recorded_at, confidence, source, contested, scope, deleted_at, cardinality)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         String(fact.subject), String(fact.relation), String(fact.object ?? ''),
         String(fact.text ?? `${fact.subject} ${fact.relation} ${fact.object ?? ''}`),
         Number(fact.valid_from ?? now()), fact.valid_to ?? null, fact.recorded_at ?? null,
         Number(fact.confidence ?? 0.7), fact.source ?? null, Number(fact.contested ?? 0),
-        fact.scope ?? SCOPE_GLOBAL, fact.deleted_at ?? null,
+        fact.scope ?? SCOPE_GLOBAL, fact.deleted_at ?? null, fact.cardinality === 'multi' ? 'multi' : 'single',
       );
       const newId = Number(info.lastInsertRowid);
       if (s.fts.facts) {
@@ -1077,6 +1128,35 @@ function mergeSnapshot(s, snapshot, options = {}) {
       );
     }
     for (const name of plan.entities) s.db.prepare('INSERT OR IGNORE INTO entities(name) VALUES (?)').run(name);
+    for (const relation of plan.relations) {
+      s.db.prepare(`
+        INSERT INTO relations(name, cardinality, aliases, updated_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+          cardinality = excluded.cardinality,
+          aliases = excluded.aliases,
+          updated_at = excluded.updated_at
+      `).run(
+        String(relation.name), String(relation.cardinality ?? 'single'),
+        relation.aliases === null || relation.aliases === undefined ? null : String(relation.aliases),
+        Number(relation.updated_at ?? now()),
+      );
+    }
+    for (const alias of plan.entityAliases) {
+      s.db.prepare(`
+        INSERT INTO entity_aliases(alias, canonical, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(alias) DO UPDATE SET
+          canonical = excluded.canonical,
+          updated_at = excluded.updated_at
+      `).run(String(alias.alias), String(alias.canonical), Number(alias.updated_at ?? now()));
+    }
+    for (const setting of plan.persona) {
+      s.db.prepare(`
+        INSERT INTO persona(key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+          value = excluded.value,
+          updated_at = excluded.updated_at
+      `).run(String(setting.key), String(setting.value), Number(setting.updated_at ?? now()));
+    }
   });
   entityCache = { names: [], at: 0 };
   invalidateProfile();
@@ -1087,9 +1167,21 @@ function mergeSnapshot(s, snapshot, options = {}) {
 function restoreMemory(s, kind, id) {
   const table = { note: 'notes', fact: 'facts', chunk: 'chunks' }[String(kind)];
   if (!table) throw new Error('kind must be note, fact or chunk');
-  const restored = transaction(s.db, () => {
+  const result = transaction(s.db, () => {
     const row = s.db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(Number(id));
-    if (!row || !row.deleted_at) return false;
+    if (!row) return { restored: false, reason: 'not found' };
+    if (!row.deleted_at) return { restored: false, reason: 'not tombstoned' };
+    if (table === 'chunks') {
+      // The unique index is (hash, scope) among active rows. Restoring an old
+      // copy while a newer active copy exists would abort the whole transaction
+      // with a raw UNIQUE error; return a structured conflict instead.
+      const active = s.db.prepare(`
+        SELECT id FROM chunks
+        WHERE hash = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global')
+          AND deleted_at IS NULL AND id <> ?
+      `).get(row.hash, row.scope, Number(id));
+      if (active) return { restored: false, reason: 'active duplicate', activeId: Number(active.id) };
+    }
     s.db.prepare(`UPDATE ${table} SET deleted_at = NULL WHERE id = ?`).run(Number(id));
     if (table === 'notes') {
       if (s.fts.notes) {
@@ -1119,10 +1211,10 @@ function restoreMemory(s, kind, id) {
       indexBigrams(s.db, 'chunk', Number(id), row.text);
       upsertVector(s, 'chunk', Number(id), row.text);
     }
-    return true;
+    return { restored: true };
   });
-  if (restored) invalidateProfile();
-  return restored;
+  if (result.restored) invalidateProfile();
+  return result;
 }
 
 function insertChunk(s, input) {
@@ -1210,6 +1302,9 @@ function likeClause(columns, terms) {
  */
 function scopeClause(column, scope, nulls = true) {
   if (!scope || scope === 'all') return { sql: '', params: [] };
+  // The panel's "project" layer means every project row, excluding global. It is
+  // not the same as one exact project key (which is a project + global view).
+  if (scope === 'project') return { sql: `AND ${column} LIKE 'proj:%'`, params: [] };
   const parts = [`${column} = ?`, `${column} = 'global'`];
   if (nulls) parts.push(`${column} IS NULL`);
   return { sql: `AND (${parts.join(' OR ')})`, params: [scope] };
@@ -1361,6 +1456,7 @@ function setRelationCardinality(db, name, cardinality) {
 
 function scopeAllows(value, scope, nulls = true) {
   if (!scope || scope === 'all') return true;
+  if (scope === 'project') return String(value ?? '').startsWith('proj:');
   if (value === scope || value === 'global') return true;
   return nulls && (value === null || value === undefined);
 }
@@ -1441,7 +1537,7 @@ function searchNotes(s, terms, limit, scope) {
       revision: Number(row.revision ?? 1),
       contested: Number(row.contested ?? 0) === 1,
       text: String(row.text).slice(0, 400),
-      score: 0.6 * Math.max(0.6, textScore, matchRatio(row, ['text', 'scope'], terms))
+      score: 0.6 * Math.max(0.6, textScore, matchRatio(row, ['text'], terms))
         + 0.2 * Number(row.importance ?? 0.5)
         + 0.2 * recencyScore(row.ts),
     };
@@ -1450,7 +1546,7 @@ function searchNotes(s, terms, limit, scope) {
   };
 
   const filter = scopeClause('scope', scope, false);
-  for (const row of recentWindowRows(s.db, 'notes', terms, ['text', 'scope'], filter, limit, 'AND superseded_by IS NULL')) {
+  for (const row of recentWindowRows(s.db, 'notes', terms, ['text'], filter, limit, 'AND superseded_by IS NULL')) {
     push(row, 0.5);
   }
   if (s.fts.notes) {
@@ -2137,11 +2233,14 @@ function personaNormalize(input) {
   return values;
 }
 
-function personaSet(db, input) {
+function personaSet(db, input, options = {}) {
   const values = personaNormalize(input);
   transaction(db, () => {
-    db.exec('DELETE FROM persona');
-    const insert = db.prepare('INSERT INTO persona(key, value, updated_at) VALUES (?, ?, ?)');
+    if (options.replace !== false) db.exec('DELETE FROM persona');
+    const insert = db.prepare(`
+      INSERT INTO persona(key, value, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `);
     for (const [key, value] of Object.entries(values)) insert.run(key, value, now());
   });
   return personaGet(db);
@@ -2156,6 +2255,7 @@ function personaEvidence(db) {
     const rows = db.prepare(`
       SELECT text FROM notes
       WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0
+        AND (scope = 'global' OR scope IS NULL)
       ORDER BY importance DESC, ts DESC LIMIT 40
     `).all();
     for (const row of rows) {
@@ -2167,6 +2267,7 @@ function personaEvidence(db) {
     const rows = db.prepare(`
       SELECT subject, relation, object FROM facts
       WHERE deleted_at IS NULL AND valid_to IS NULL
+        AND (scope = 'global' OR scope IS NULL)
       ORDER BY confidence DESC, valid_from DESC LIMIT 80
     `).all();
     for (const row of rows) facts.push(`${row.subject} ${row.relation} ${row.object}`);
@@ -2176,6 +2277,7 @@ function personaEvidence(db) {
     const rows = db.prepare(`
       SELECT text FROM chunks
       WHERE role = 'user' AND deleted_at IS NULL
+        AND (scope = 'global' OR scope IS NULL)
       ORDER BY ts DESC LIMIT 100
     `).all();
     for (const row of rows) {
@@ -2295,22 +2397,33 @@ async function personaFromModel(ctx, evidence) {
 }
 
 /** Synthesize settings from everyday memory; rules first, model refinement second. */
+/** Automatic persona synthesis must be explicitly opted in before it calls the host model. */
+function personaModelEnabled() {
+  const value = String(process.env.OMNI_PERSONA_MODEL ?? 'off').toLowerCase();
+  return value === 'auto' || value === 'on' || value === '1';
+}
+
 async function personaRefresh(ctx, options = {}) {
   const s = openStore();
   const evidence = personaEvidence(s.db);
   const rules = personaFromRules(evidence);
-  const model = await personaFromModel(ctx ?? hostCtx, evidence);
-  const merged = { ...rules, ...(model ?? {}) };
+  const model = options.model === true ? await personaFromModel(ctx ?? hostCtx, evidence) : null;
+  const existing = personaGet(s.db);
+  const merged = { ...existing, ...rules, ...(model ?? {}) };
   const source = model ? 'model' : 'rules';
-  if (options.apply === true && Object.keys(merged).length) {
-    personaSet(s.db, merged);
+  const applied = options.apply === true && Object.keys(merged).length > 0;
+  if (applied) {
+    // Merge instead of replacing: a refresh that only found a preference must not
+    // erase the user's hand-written name or custom fields.
+    personaSet(s.db, merged, { replace: false });
     metaSet(s.db, 'persona_updated_at', now());
     metaSet(s.db, 'persona_source', source);
   }
   return {
     persona: options.apply === true ? personaGet(s.db) : merged,
     source,
-    applied: options.apply === true,
+    applied,
+    modelUsed: Boolean(model),
     evidence: evidence.utterances.length + evidence.notes.length + evidence.facts.length,
   };
 }
@@ -2327,7 +2440,9 @@ function maybeRefreshPersona(ctx) {
       return;
     }
     metaSet(s.db, 'persona_pending', 0);
-    setTimeout(() => { void personaRefresh(ctx, { apply: true }).catch(() => {}); }, 0);
+    setTimeout(() => {
+      void personaRefresh(ctx, { apply: true, model: personaModelEnabled() }).catch(() => {});
+    }, 0);
   } catch { /* best effort */ }
 }
 
@@ -2348,9 +2463,17 @@ function personaLines(db) {
 /** Read the highest-importance notes that fit the always-injected budget. */
 function buildProfileText(projectKey) {
   const s = openStore();
+  // Filter the layer in SQL instead of taking 60 rows from every project and
+  // discarding most of them in JS: a busy foreign project could otherwise crowd
+  // the global notes out of the profile budget.
+  const noteScope = projectKey
+    ? "AND (scope = 'global' OR scope IS NULL OR scope = ?)"
+    : "AND (scope = 'global' OR scope IS NULL)";
   const rows = s.db.prepare(
-    'SELECT id, text, importance, scope FROM notes WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0 ORDER BY importance DESC, ts DESC LIMIT 60'
-  ).all();
+    `SELECT id, text, importance, scope FROM notes
+     WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0 ${noteScope}
+     ORDER BY importance DESC, ts DESC LIMIT 60`
+  ).all(...(projectKey ? [projectKey] : []));
   // Global notes follow the model everywhere; project notes only in their own
   // project. Unknown project => global only, so one project cannot leak into
   // another through the always-injected block.
@@ -2368,7 +2491,7 @@ function buildProfileText(projectKey) {
     lines.push(line);
   }
 
-  for (const line of profileFactLines(s.db, projectKey ?? null, PROFILE_BUDGET - used)) {
+  for (const line of profileFactLines(s.db, projectKey || SCOPE_GLOBAL, PROFILE_BUDGET - used)) {
     const withBullet = line === '相关事实：' ? line : `- ${line}`;
     used += withBullet.length;
     lines.push(withBullet);
@@ -2442,21 +2565,24 @@ function projectForScope(scope) {
   if (!id) return null;
   const known = projectForAgentId(id);
   if (known) return known;
-  // The host may hand over a truncated or opaque id (for example `session-b707`).
-  // Match it as a prefix of a captured session so the current turn keeps its
-  // project, while an unrelated session id still resolves to nothing.
-  for (const [sessionId, cwd] of cwdBySession) {
-    const short = shortId(id);
-    if (sessionId.startsWith(short) || short.startsWith(sessionId.slice(0, short.length))) {
-      const project = projectKeyFromCwd(cwd);
-      if (project !== SCOPE_GLOBAL) return project;
-    }
+  const exact = cwdBySession.get(id);
+  if (exact) {
+    const project = projectKeyFromCwd(exact);
+    if (project !== SCOPE_GLOBAL) return project;
   }
-  return null;
-}
-
-function shortId(id) {
-  return String(id ?? '').slice(0, Math.min(12, String(id ?? '').length));
+  // The host may hand over a truncated or opaque id (for example `session-b707`).
+  // Match it only when both ids share at least 12 characters AND exactly one
+  // captured session matches; an ambiguous prefix must fail closed instead of
+  // guessing another project's layer.
+  const matches = [];
+  for (const [sessionId, cwd] of cwdBySession) {
+    const common = Math.min(sessionId.length, id.length);
+    if (common < 12) continue;
+    if (!sessionId.startsWith(id) && !id.startsWith(sessionId)) continue;
+    const project = projectKeyFromCwd(cwd);
+    if (project !== SCOPE_GLOBAL && !matches.includes(project)) matches.push(project);
+  }
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function rememberUserMessage(agent, message) {
@@ -2485,6 +2611,8 @@ function recallFor(scope) {
   const entry = recallByAgent.get(agentId);
   if (!entry) return null;
   if (now() - entry.at > AUTO_RECALL_TTL_MS) return null;
+  const project = projectForScope({ id: agentId }) ?? SCOPE_GLOBAL;
+  if (entry.project && entry.project !== project) return null;
   return entry;
 }
 
@@ -2802,7 +2930,7 @@ function defineTools(ctx) {
       }
       if (config.kind === 'hashed') {
         const before = Number(s.db.prepare('SELECT COUNT(*) AS n FROM vectors').get().n);
-        backfillVectors(s.db);
+        backfillVectors(s.db, { limit });
         const after = Number(s.db.prepare('SELECT COUNT(*) AS n FROM vectors').get().n);
         return { processed: Math.max(0, after - before), queued: 0, backend: 'hashed', ...(bigrams ? { bigrams } : {}) };
       }
@@ -2829,12 +2957,14 @@ function defineTools(ctx) {
       type: 'object',
       additionalProperties: false,
       properties: {
-        action: { type: 'string', enum: ['get', 'set', 'refresh'], description: 'get reads, set replaces, refresh synthesizes settings from recent memory.' },
+        action: { type: 'string', enum: ['get', 'set', 'refresh'], description: 'get reads, set replaces, refresh synthesizes settings from recent global memory.' },
         values: {
           type: 'object',
           additionalProperties: true,
           description: 'set only: map of field -> text. Empty values are removed; total length is capped at 4000 characters.',
         },
+        apply: { type: 'boolean', description: 'refresh only: false previews; true (default) writes the merged result. Unknown fields already in persona are preserved.' },
+        useModel: { type: 'boolean', description: 'refresh only: true sends evidence to the host model for refinement; false (default) uses offline rules only.' },
       },
       required: ['action'],
     },
@@ -2849,7 +2979,10 @@ function defineTools(ctx) {
     async execute(args = {}) {
       const s = openStore();
       if (String(args.action) === 'refresh') {
-        return personaRefresh(hostCtx, { apply: args.apply !== false });
+        return personaRefresh(hostCtx, {
+          apply: args.apply !== false,
+          model: args.useModel === true,
+        });
       }
       if (String(args.action) === 'set') {
         if (!args.values || typeof args.values !== 'object') throw new Error('values is required for set');
@@ -2944,7 +3077,7 @@ function defineTools(ctx) {
 
   disposers.push(ctx.tools.register({
     name: 'memory_export',
-    description: 'Write a portable JSON backup (notes, facts, transcripts, edges, entities). Vectors are derived and excluded. Tombstones are included by default so a later restore can revive them.',
+    description: 'Write a portable JSON backup (notes, facts, transcripts, edges, entities, relations, entity aliases, persona). Vectors are derived and excluded. Tombstones are included by default so a later restore can revive them.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -2976,8 +3109,8 @@ function defineTools(ctx) {
       required: ['path'],
     },
     output: {
-      schema: { type: 'object', properties: { notes: { type: 'number' }, facts: { type: 'number' }, chunks: { type: 'number' }, skipped: { type: 'number' }, dryRun: { type: 'boolean' } } },
-      render: (_args, value) => textBlock(`${value.dryRun ? 'would import' : 'imported'} ${value.notes} notes, ${value.facts} facts, ${value.chunks} transcripts, ${value.edges} edges (skipped ${value.skipped})`),
+      schema: { type: 'object', properties: { notes: { type: 'number' }, facts: { type: 'number' }, chunks: { type: 'number' }, edges: { type: 'number' }, relations: { type: 'number' }, entityAliases: { type: 'number' }, persona: { type: 'number' }, skipped: { type: 'number' }, dryRun: { type: 'boolean' } } },
+      render: (_args, value) => textBlock(`${value.dryRun ? 'would import' : 'imported'} ${value.notes} notes, ${value.facts} facts, ${value.chunks} transcripts, ${value.edges} edges, ${value.relations} relations, ${value.entityAliases} aliases, ${value.persona} persona (skipped ${value.skipped})`),
     },
     async execute(args = {}) {
       const s = openStore();
@@ -2999,12 +3132,12 @@ function defineTools(ctx) {
       required: ['kind', 'id'],
     },
     output: {
-      schema: { type: 'object', properties: { restored: { type: 'boolean' } } },
-      render: (_args, value) => textBlock(value.restored ? 'restored' : 'nothing to restore'),
+      schema: { type: 'object', properties: { restored: { type: 'boolean' }, reason: { type: 'string' }, activeId: { type: 'number' } } },
+      render: (_args, value) => textBlock(value.restored ? 'restored' : `nothing to restore${value.reason ? `: ${value.reason}` : ''}`),
     },
     async execute(args = {}) {
       const s = openStore();
-      return { restored: restoreMemory(s, String(args.kind), Number(args.id)) };
+      return restoreMemory(s, String(args.kind), Number(args.id));
     },
   }));
 
@@ -3446,7 +3579,7 @@ function registerRoutes(ctx) {
           hasMoreFacts: offset + facts.length < totalFacts,
         },
         stats: {
-          notes: count('notes'),
+          notes: count('notes', 'AND superseded_by IS NULL'),
           facts: count('facts', 'AND valid_to IS NULL'),
           chunks: count('chunks'),
           globalNotes,
@@ -3475,9 +3608,11 @@ function registerRoutes(ctx) {
       // One map per layer: the global map and one per project. `all` merges them.
       const clause = requested === 'all'
         ? { sql: '', params: [] }
-        : requested === 'global'
-          ? { sql: "AND (scope = 'global' OR scope IS NULL)", params: [] }
-          : { sql: 'AND scope = ?', params: [requested] };
+        : requested === 'project'
+          ? { sql: "AND scope LIKE 'proj:%'", params: [] }
+          : requested === 'global'
+            ? { sql: "AND (scope = 'global' OR scope IS NULL)", params: [] }
+            : { sql: 'AND scope = ?', params: [requested] };
 
       const nodes = new Map();
       const links = [];
@@ -3501,8 +3636,9 @@ function registerRoutes(ctx) {
         }
       }
       const keep = new Set([...degree.entries()].sort((a, b) => b[1] - a[1]).slice(0, 220).map(([name]) => name));
+      const layerScope = requested === 'all' ? 'global' : requested;
       for (const name of keep) {
-        addNode(`e:${name}`, 'entity', name, Math.min(1, 0.35 + (degree.get(name) ?? 0) / 12), 'global');
+        addNode(`e:${name}`, 'entity', name, Math.min(1, 0.35 + (degree.get(name) ?? 0) / 12), layerScope);
       }
       const seen = new Set();
       for (const fact of facts) {
@@ -3538,7 +3674,7 @@ function registerRoutes(ctx) {
         "SELECT COALESCE(scope, 'global') AS scope, COUNT(*) AS n FROM facts WHERE deleted_at IS NULL AND valid_to IS NULL GROUP BY COALESCE(scope, 'global')"
       ).all()) bump(row.scope, 'facts', row.n);
       for (const row of s.db.prepare(
-        "SELECT COALESCE(scope, 'global') AS scope, COUNT(*) AS n FROM notes WHERE deleted_at IS NULL GROUP BY COALESCE(scope, 'global')"
+        "SELECT COALESCE(scope, 'global') AS scope, COUNT(*) AS n FROM notes WHERE deleted_at IS NULL AND superseded_by IS NULL GROUP BY COALESCE(scope, 'global')"
       ).all()) bump(row.scope, 'notes', row.n);
 
       const directory = [...scopes.values()]
@@ -3647,8 +3783,9 @@ function registerRoutes(ctx) {
       if (!mutationAllowed(req)) return json(res, 403, { ok: false, error: 'forbidden' });
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       const apply = String(url.searchParams.get('dryRun') ?? '') !== '1';
+      const useModel = String(url.searchParams.get('model') ?? '') === '1';
       try {
-        return json(res, 200, { ok: true, ...await personaRefresh(hostCtx, { apply }) });
+        return json(res, 200, { ok: true, ...await personaRefresh(hostCtx, { apply, model: useModel }) });
       } catch (error) {
         return json(res, 400, { ok: false, error: String(error?.message ?? error) });
       }
@@ -3727,7 +3864,11 @@ function registerRoutes(ctx) {
       const id = Number(url.searchParams.get('id') ?? 0);
       if (!kind || !id) return json(res, 400, { ok: false, error: 'kind and id required' });
       const s = openStore();
-      return json(res, 200, { ok: true, restored: restoreMemory(s, kind, id) });
+      try {
+        return json(res, 200, { ok: true, ...restoreMemory(s, String(kind), id) });
+      } catch (error) {
+        return json(res, 400, { ok: false, error: String(error?.message ?? error) });
+      }
     },
   });
 
