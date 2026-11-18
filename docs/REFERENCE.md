@@ -1,0 +1,560 @@
+# 全息记忆 · 机理与接口参考
+
+> 版本 3.6.1 · 生成日期 2026-11-18 · 依据源码与真实 schema v11 核对
+>
+> **给 AI 的用法**：这份文档按「先原理、后接口、最后剧本」组织。第一次接触时读第 1、2、9 章即可开工；要精确调用某个工具，直接跳到第 9 章对应小节。若这份文档已同步进记忆库（`omni memory:sync`），也可以先用 `memory_search` 搜"全息记忆 接口"定位。
+
+---
+
+## 1. 系统全貌
+
+### 1.1 一句话
+
+一个本地长期记忆内核：**只增不改的原文留底 + 会自我校验的结论 + 按项目分层 + 三路混合召回 + 可复用的故障经验沉淀**。
+
+### 1.2 三层结构
+
+```
+宿主（DSH / MCP 客户端 / CLI / 浏览器）
+        │
+   适配层 hosts/          薄壳：把宿主接口翻译成 ctx
+        │
+   内核 index.js           记忆的全部语义都在这里，不认识任何宿主
+        │
+   SQLite（omni.db）        单文件、本地、可备份
+```
+
+- **内核**：schema、写入、检索、事实、实体图、画像、dream、备份。只依赖 `node:sqlite`、`node:crypto`、`node:fs`、`node:os`、`node:path`，加上自有的 `lib/embed*.mjs`。
+- **适配层**：`hosts/shared/headless.mjs` 提供最小宿主上下文；`hosts/mcp/`、`hosts/http/`、`hosts/cli.mjs` 各自只写传输代码。
+- **宿主**：DSH 插件（`apply(ctx)`）、MCP stdio、MCP over HTTP、REST、CLI。
+
+### 1.3 进程与数据
+
+| 形态 | 入口 | 数据 |
+|---|---|---|
+| DSH 插件 | `index.js` 的 `apply(ctx)` | `$DSH_HOME/memory/omni.db` |
+| MCP stdio | `hosts/mcp/bin.mjs` | 同上（`OMNI_HOME` 可覆盖） |
+| HTTP 面板 / REST / HTTP MCP | `hosts/cli.mjs serve` | 同上，**同一个库** |
+| CLI | `hosts/cli.mjs <命令>` | 同上 |
+
+同一个 `OMNI_HOME`（或同一个 `DSH_HOME`）意味着**所有宿主共享一份记忆**，不是各存各的。这也是本项目的核心卖点。
+
+### 1.4 数据目录优先级
+
+1. `OMNI_HOME`——非 DSH 宿主显式指定
+2. `DSH_HOME`——兼容已有 DSH 安装
+3. `~/.dsh`——历史默认
+
+库文件固定为 `<home>/memory/omni.db`。
+
+---
+
+## 2. 生命周期：一条记忆的完整旅程
+
+### 2.1 写入
+
+```
+memory_write(kind, text, scope?)
+  → decideScope()        决定落哪一层
+  → 去重检查              同层同内容跳过（返回 deduped=true）
+  → 落库                  note / fact / chunk
+  → 派生                  facts 自动生成 entities + edges；notes/chunks 生成向量
+```
+
+三种 `kind`：
+
+- `note`：**结论**。项目约定、踩坑经验、用户偏好、可复用解法。这是最该写的一种。
+- `fact`：**事实三元组**。`subject / relation / object`，带双时态。
+- `episode`：**原始观察**。一般由宿主事件流自动产生，手工写较少。
+
+### 2.2 分层判定（`decideScope`）
+
+优先级从高到低：
+
+1. 显式 `scope`（`global` 或 `proj:*`）；传 `all` 会被拒绝，因为 `all` 只读。
+2. 文本命中**全局提示词**且未命中项目提示词 → `global`。全局提示词包括：偏好、习惯、以后、总是、永远、一律、所有项目、跨项目、通用、铁律、禁止、不要再、宁可不。
+3. 文本命中**项目提示词** → 当前项目层。项目提示词包括：本项目、这个项目、本仓库、src/、docs/、package.json、.mjs、.ts、.js、构建、部署、迁移、表结构、字段。
+4. 都没命中 → 落到当前项目层（`default-to-project`）。
+5. 没有项目信息 → `global`。
+
+设计取向：**宁可把该升级为全局的规则先留在项目层，也不让项目细节泄漏到全局**。项目层的东西以后好找，泄漏出去的收不回来。
+
+### 2.3 项目键
+
+```
+proj:<目录名（截 40 字符，非法字符转 -）>#<路径 FNV-1a 哈希前 6 位>
+```
+
+例：`D:\xiangmu\全息记忆` → `proj:全息记忆#deff23`。
+
+同名目录靠哈希区分，所以两个不同路径的同名项目不会串层。宿主通过"工作目录"推导，DSH 用 `session.header.cwd`，MCP/CLI/HTTP 用 `OMNI_PROJECT_DIR`，落库时同时写入 `meta.agent_project:<sessionId>`，重启后仍能恢复。
+
+### 2.4 事实的冲突与时效
+
+同一 `subject + relation` 在同一层出现新值：
+
+- `cardinality=single`（默认）：旧值 `valid_to` 置为当前时间——**失效但不删除**，历史仍可审计。
+- `cardinality=multi`：多个值并存。
+- 层的边界严格：项目层写新值不会让全局旧值失效，反之亦然。
+
+`facts` 的 `valid_from / valid_to` 就是双时态里的"世界时间"，`recorded_at` 是"记录时间"。
+
+### 2.5 笔记的修订与争议
+
+- 同层同文本 → 去重，不新建。
+- 近重复 → 自动标 `contested`（只标记，不删除、不合并）。
+- 显式 `contradicts: [旧id]` → 新旧双方都标 contested，等人复核。
+- 替代（supersede）只由 dream 的单条确认产生，旧笔记保留、`superseded_by` 指向新笔记。
+- 删除一律是墓碑：`deleted_at` 有值，行还在，`memory_restore` 可复活。
+
+### 2.6 故障经验闭环
+
+`note` 可带四个经验字段：
+
+| 字段 | 含义 |
+|---|---|
+| `problemKey` | 问题指纹。大小写不敏感、空白归一化。命中它就能精确找回 |
+| `solutionStatus` | `verified` / `unverified` / `failed` / `expired` |
+| `evidence` | 证明状态的东西：命令输出、测试结果、URL |
+| `reuseCount` / `lastUsedAt` | 复用统计，由 `memory_solution_report` 维护 |
+
+沉淀一条解法时的标准写法：
+
+```
+症状：npm test 在 Node 22 上 ENOENT，找不到 xyz.mjs
+失败尝试：升级依赖、清 node_modules 都无效
+有效解法：test 脚本改成 node --test "test/*.test.mjs"，让 glob 由 shell 展开
+前提：Windows + PowerShell 7；bash 下不需要
+problemKey: npm test ENOENT on node 22
+solutionStatus: verified
+evidence: npm test → 242/242 passed
+```
+
+### 2.7 检索
+
+三路并行，然后在融合层合并：
+
+1. **词面**：SQLite FTS5（trigram）＋中文二元索引（`bigrams` 表，逐字切 2 字组合）。
+2. **向量**：默认 512 维字符 n-gram 哈希向量（零依赖、离线可用）；配置 `OMNI_EMBED_URL` 后改走真语义嵌入，维度持久化在 `meta`，换模型会触发回填。
+3. **图**：从 `facts` 生成的 `entities` + `edges`，做 2 跳关联召回。
+
+融合用 RRF（Reciprocal Rank Fusion，`K=60`），再叠加重要性、problemKey 精确命中、状态修正。候选池按 `limit × 4` 取，避免小样本抖动。
+
+检索结果默认过滤掉：已删除、被替代、已失效、contested（画像与自动召回尤其严格），以及 `failed` / `expired` 的经验。
+
+`problemKey` 有独立索引，精确命中优先，`verified` 排在 `unverified` 之前，`failed` 保留可见但排后。
+
+### 2.8 注入
+
+DSH 内：
+
+- 每轮从 `agent/inbox/claimed` 拿到用户消息，预取 top-3，缓 120 秒。
+- `systemPrompt.section` 每次装配时输出：persona + 常驻画像（预算 1200 字符，缓存 30 秒）+ 本次预召回 3 条 + 当前项目提示。
+- 预算超了就砍召回，先保画像。
+
+DSH 外（MCP 等）：没有注入点，改为 `memory_context` 显式调用，语义等价。
+
+### 2.9 治理
+
+- `memory_forget`：墓碑单条。
+- `memory_restore`：复活单条。
+- `memory_compact`：把超出保留量的最老转录墓碑化（默认留 5000，最小 50）。
+- `memory_dream`：拿原文核对笔记，结论"与原文矛盾"的只标 contested；`commit=true` 才替代。
+- `memory_export` / `memory_import`：可移植 JSON，默认含墓碑；导入按内容去重、默认 dry-run。
+- `memory_reindex`：向量回填、bigram 全量重建。
+
+---
+
+## 3. 数据模型（schema v11，实测）
+
+共 11 张业务表。字段按真实 `PRAGMA table_info` 导出。
+
+### 3.1 meta
+`key`(pk), `value`
+键值元数据：`schema_version`、`agent_project:<id>`、嵌入维度等。
+
+### 3.2 chunks（原文转录）
+`id`(pk), `ts`, `session_id`, `role`, `text`, `hash`, `source`, `importance`, `deleted_at`, `scope`
+唯一索引 `chunks_hash_active(hash, scope) WHERE deleted_at IS NULL`——同一层同内容只留一份。单条入库上限 4000 字符。
+
+### 3.3 notes（结论）
+`id`(pk), `ts`, `scope`, `text`, `importance`, `source`, `revision`, `superseded_by`, `contested`, `deleted_at`, `problem_key`, `solution_status`, `solution_verified_at`, `reuse_count`, `last_used_at`, `verified_at`, `verification`, `evidence`
+
+### 3.4 facts（事实）
+`id`(pk), `subject`, `relation`, `object`, `text`, `valid_from`, `valid_to`, `recorded_at`, `confidence`, `source`, `contested`, `deleted_at`, `scope`, `cardinality`
+
+### 3.5 entities / edges（实体图）
+- `entities`: `id`, `name`, `kind`
+- `edges`: `id`, `src`, `rel`, `dst`, `valid_from`, `valid_to`, `scope`, `source`
+
+`edges` 由 `facts` 派生，事实失效时对应边同步失效。
+
+### 3.6 relations（关系基数登记）
+`name`(pk), `cardinality`, `aliases`, `updated_at`
+
+### 3.7 entity_aliases（实体别名）
+`alias`(pk), `canonical`, `updated_at`
+
+### 3.8 persona（用户设定）
+`key`(pk), `value`, `updated_at`。总长度上限 4000 字符。
+
+### 3.9 vectors（派生向量）
+`kind`(pk), `owner_id`(pk), `dim`, `vec`。`kind` 区分 note / chunk / fact。
+
+### 3.10 bigrams（中文二元索引）
+`layer`(pk), `owner_id`(pk), `gram`(pk)，索引 `bigrams_gram(gram, layer, owner_id)`。
+
+### 3.11 FTS 影子表
+`notes_fts`、`facts_fts`、`chunks_fts` 及 SQLite 内部表。由触发器/回填维护，不要手写。
+
+---
+
+## 4. 宿主适配机理
+
+### 4.1 契约只有四个必选接口
+
+`apply(ctx)` 实际调用：
+
+| 接口 | 用途 | 适配层实现 |
+|---|---|---|
+| `ctx.tools.register(def)` | 注册工具，返回释放函数 | 存入 Map |
+| `ctx.effect(fn)` | 启动副作用，返回释放函数 | 立即执行并记录释放器 |
+| `ctx.on(event, handler)` | 订阅宿主事件 | 无事件流时返回 undefined（内核按 no-op 处理） |
+| `ctx.get(service)` | 取服务：`llm` / `systemPrompt` / `webServer` | 由调用方注入，缺省 undefined 即优雅降级 |
+
+可选服务：`llm`（模型复核、persona 提炼）、`systemPrompt`（DSH 注入）、`webServer`（挂 REST 路由）。
+
+### 4.2 启动顺序（重要）
+
+`index.js` 在被 import 时就解析数据目录。所以适配器必须**先设好环境变量，再动态 import**。`hosts/shared/boot.mjs` 已经封装好这个顺序。
+
+### 4.3 非 DSH 宿主的作用域登记
+
+`attachSession(sessionId, cwd)`：
+
+- 写入 `cwdBySession`（内存）与 `projectByAgent`（内存）；
+- 持久化 `meta.agent_project:<sessionId>`；
+- 返回解析出的 `proj:*` 键。
+
+MCP 的 sessionId 默认是 `host-<工作目录哈希>`，稳定可复现；同目录再次启动会命中同一层。
+
+### 4.4 规则的五条通道
+
+MCP 无法写客户端系统提示，所以同一份 `RULES_TEXT` 铺五条路：
+
+1. `initialize.instructions`
+2. `prompts/get` 的 `omni-bootstrap`（可带 task）
+3. `resources/read` `omni://rules`
+4. 工具 `memory_rules`
+5. `omni rules --write` 写入项目规则文件的托管区块
+
+托管区块带标记，幂等：
+
+```
+<!-- omni-memory:rules v1 start · 由全息记忆维护，区块内容会被覆盖，请勿手改 -->
+...
+<!-- omni-memory:rules v1 end -->
+```
+
+### 4.5 多进程并发（同一台机器、多个 AI 客户端）
+
+典型场景：一个人同时开 Claude Code、Cursor、Codex、本面板与 CLI，每个客户端各拉起一份服务进程，全部指向同一个 `omni.db`。
+
+| 机制 | 实现 | 原因 |
+|---|---|---|
+| 等锁 | `PRAGMA busy_timeout`（默认 5000ms，`OMNI_BUSY_TIMEOUT_MS`） | 默认拿不到写锁立刻 `SQLITE_BUSY`，第二个窗口会偶发「database is locked」 |
+| 写事务 | 一律 `BEGIN IMMEDIATE` | 进入即抢写锁，避免读后升级写造成死锁 |
+| 去重 | 笔记 `(scope,text)`、转录 `(hash,scope)`、事实 `(subject,relation,scope)` 在写锁内复查 | 事务外检查会让两个进程各插一条相同内容 |
+| 维护租约 | `meta` 的 `lease:open-maintenance`（120s）与 `lease:dream`（一个间隔） | 启动迁移、索引回填、定时做梦全机只跑一份，不然 N 个进程同时全量扫描 |
+| WAL 上限 | `journal_size_limit = 16MB` | 多读者持有快照时 WAL 不会无限增长 |
+
+写仍是串行的：SQLite 单写者。写入是毫秒级，正常排队很短；等待超过 `busy_timeout` 才报错。画像缓存 30s 是**每进程独立**的，要即时一致就调 `memory_context`。
+
+---
+
+## 5. 工具参考（19 个）
+
+所有工具都是"失败即报错、成功即返回值"；MCP 侧错误统一转成 `isError: true` 的文本块。
+
+### 5.1 memory_context（建议每次会话第一个调）
+参数：
+- `query` string，当前任务原文（用户请求、报错、路径）。首轮可省略，只拿画像。
+- `scope` string，可选；省略则用当前项目层 + global。
+- `limit` number，默认 5，最大 10。
+
+返回：`text`（用户设定 + 常驻画像 + 相关记忆 + 风险提示）。
+
+### 5.2 memory_rules
+参数：无。返回工作规则全文。
+
+### 5.3 memory_write
+参数：
+- `kind` string，必填，`note|fact|episode`
+- `text` string，note/episode 必填；fact 给了完整三元组时可省；note 上限 4000 字（超长会报错要求拆分）
+- `scope` string，可选；`all` 会被拒绝；写入未出现过的项目层会返回 `scopeNew:true` 提醒
+- `importance` number，0..1，默认 0.35；越界或非数字直接报错
+- `source` string，可选，如 `session:xxx#3` 或文件路径
+- fact 专用：`subject`（必填）、`relation`（默认 `is`）、`object`、`cardinality`（`single|multi`）
+- note 专用：`contradicts`（number[]，旧笔记 id；无法解析的 id 会出现在 `contradictsIgnored`）、`problemKey`、`solutionStatus`（`verified|unverified|failed|expired`）、`evidence`
+
+返回：`id`、`kind`、`scope`、`scopeReason`、`deduped`、`contradictsIgnored`（如有）、`scopeNew`（如有）。
+
+### 5.4 memory_search
+参数：
+- `query` string，关键词/实体/路径/原话；给了 `problemKey` 时可省
+- `problemKey` string，精确问题指纹
+- `status` string，`all|verified|unverified|failed|expired`，默认 all
+- `kind` string，`all|note|fact|chunk`，默认 all
+- `limit` number，默认 8，1..30；非数字或越界直接报错，不再静默返回空结果
+- `scope` string，可选；`all` 表示跨所有项目
+
+返回：`total`、`scope`、`problemKey`、`hits[]`（含 kind/id/text/scope/score/rrf/contested/solutionStatus）。
+
+### 5.5 memory_solution_report
+参数：
+- `id` number，必填
+- `outcome` string，必填，`success|failed|expired`
+- `evidence` string，可选
+
+作用：`success` 标 verified 并累加 `reuseCount`；`failed`/`expired` 记死路。调用时机是"结果已知之后"，不是写入时。
+
+### 5.6 memory_profile
+参数：`scope` 可选。返回常驻画像文本（预算 1200 字符）与存储统计。
+
+### 5.7 memory_persona
+参数：
+- `action` string，必填，`get|set|refresh`
+- `values` object，set 专用；空值删除条目，总长 4000 字符
+- `apply` boolean，refresh 专用，默认 true
+- `useModel` boolean，refresh 专用，默认 false（只用离线规则）
+
+### 5.8 memory_timeline
+参数：`entity` 必填、`scope` 可选。返回该实体的有效区间事实与提及它的笔记。
+
+### 5.9 memory_link_entity
+参数：`alias` 必填、`canonical` 必填、`apply` boolean（默认 false 演练）。把别名下的 facts/edges 并入规范名。
+
+### 5.10 memory_forget
+参数：`kind`（`note|fact|chunk`）、`id`，均必填。墓碑化，可恢复。返回 `forgotten`；不存在或已墓碑时返回 `forgotten:false` 与 `reason`，与 `memory_restore` 的失败形状一致。
+
+### 5.11 memory_restore
+参数：`kind`、`id`，均必填。复活墓碑。
+
+### 5.12 memory_compact
+参数：`keepChunks` number（默认 5000，最小 50）、`apply` boolean（默认 false）。把最老的转录墓碑化。只对捕获过会话流的宿主有意义；纯 MCP 宿主无转录时返回 `total:0`，是空操作。
+
+### 5.13 memory_dream
+参数：`apply` boolean（默认 false，只报告）、`commit` boolean（仅配合 apply，直接替代）。用原文核对笔记，只标 contested，替代需另走 `memory_dream_replace`。需要会话流与 LLM；纯 MCP 宿主返回 `no_source`。
+
+### 5.14 memory_dream_proposals
+参数：`limit` number（默认 50，最大 200）。列出待替代候选与证据文本。
+
+### 5.15 memory_dream_replace
+参数：`noteId` number、`confirm` boolean（必须 true）。旧笔记被替代但保留，可回滚。
+
+### 5.16 memory_dream_rollback
+参数：`noteId` number（原笔记 id）。撤销 dream 替代。
+
+### 5.17 memory_export
+参数：`path` string（默认落到 `$DSH_HOME/memory/` 的时间戳文件）、`activeOnly` boolean（默认 false，含墓碑）。向量是派生数据，不导出。
+
+### 5.18 memory_import
+参数：`path` 必填、`dryRun` boolean（默认 true）。按内容去重合并。
+
+### 5.19 memory_reindex
+参数：`limit` number（默认 200，最大 1000）、`bigrams` boolean、`vectors` boolean。换嵌入模型或恢复旧库后使用。
+
+---
+
+## 6. REST 接口（13 条）
+
+统一前缀 `/omni-memory`，默认只听回环。写操作要求 `POST` 且同源（有 `Origin` 时必须与 Host 一致）；不带 `Origin` 的本地客户端放行。
+
+`POST /mcp` 与 REST 同级防护：跨站 `Origin` 直接 403；没有 `Origin` 时必须 `Content-Type: application/json` 或带 `x-omni-csrf: 1`。跨站表单只能发 `text/plain`，因此无法借此写入。
+
+| 路径 | 方法 | 参数 | 说明 |
+|---|---|---|---|
+| `/list` | GET | `limit` `offset` `scope` `audit` | 记忆列表 + 统计 + 项目目录；`audit=1` 含墓碑与被替代 |
+| `/graph` | GET | `scope` | 星图：`nodes[]`、`links[]`（`source/target/rel`）、`scopes[]` |
+| `/node` | GET | `node` `scope` | 单实体详情与关联事实 |
+| `/persona` | GET/POST | body `values` | 读/写用户设定 |
+| `/persona/refresh` | POST | `dryRun` `model` | 从近期全局记忆提炼 |
+| `/dream/proposals` | GET | `limit` | 待替代候选 |
+| `/dream/replace` | POST | `noteId` | 确认替代 |
+| `/dream/rollback` | POST | `noteId` | 撤销替代 |
+| `/export` | GET | `activeOnly` `download` | 备份；`download=1` 走附件下载 |
+| `/restore` | POST | `kind` `id` | 复活墓碑 |
+| `/status` | GET | — | 运行态：注入统计、嵌入后端、计数 |
+| `/search` | GET | `q` `limit` `scope` | 混合检索 |
+| `/forget` | POST | `kind` `id`（body 或 query） | 墓碑化 |
+
+响应统一带 `ok`。错误为 `{ ok: false, error }`。
+
+静态面板挂在 `GET /`：记忆列表 / 搜索 / 星图 / 规则。星图默认读 `scope=all`，四旋臂三维投影（移植客户端 `MemoryGraph`），自动旋转、拖拽旋转、滚轮缩放、点选节点查详情；`/?tab=map` 可直接打开星图页签。
+
+---
+
+## 7. MCP 协议面
+
+### 7.1 方法
+
+- `initialize` / `notifications/initialized`
+- `ping`
+- `tools/list` / `tools/call`
+- `prompts/list` / `prompts/get`（`omni-bootstrap`）
+- `resources/list` / `resources/read`（`omni://rules`）
+- `resources/templates/list`（空）
+- `logging/setLevel`
+
+协议版本支持 `2024-11-05`、`2025-03-26`、`2025-06-18`，按客户端请求回选，缺省 `2025-06-18`。
+能力声明：`tools.listChanged=false`、`prompts`、`resources`（`subscribe=false`）。
+
+### 7.2 传输
+
+- **stdio**：一行一帧 JSON-RPC，stdout 只走协议，日志进 stderr，请求按到达顺序处理。
+- **HTTP**：`POST /mcp`，JSON 响应模式；通知返回 202；响应头带 `mcp-session-id`。暂不提供 SSE 流。
+
+### 7.3 错误契约
+
+标准 JSON-RPC 码：`-32700` 解析、`-32600` 非法请求、`-32601` 方法不存在、`-32602` 参数错、`-32603` 内部错。
+**工具执行失败不是 JSON-RPC 错误**，而是结果里的 `{ isError: true, content: [{type:'text', text:'error: ...'}] }`——这样客户端能把失败喂回模型继续处理。
+
+---
+
+## 8. CLI
+
+```
+node hosts/cli.mjs <命令>
+
+rules    [--file <路径>]... [--write] [--create]
+         默认预览；--write 落盘，区块幂等
+context  [--query <文本> | --stdin] [--scope <层级>] [--limit <n>]
+         --stdin 读钩子传入的 JSON，取其中的 prompt / user_prompt / text
+         输出纯文本上下文，供 SessionStart / UserPromptSubmit 钩子拼接
+search   <关键词> | --problem-key <指纹>  [--scope] [--status] [--kind] [--limit]
+write    --kind note|fact|episode (--text <文本> | --stdin | --file <路径>)
+         [--scope] [--importance] [--source]
+         [--problem-key] [--status] [--evidence]
+         [--subject --relation --object] [--cardinality] [--contradicts <id,id>]
+         输出写入结果 JSON：id / scope / scopeReason / deduped / solutionStatus
+report   --id <笔记id> --outcome success|failed|expired [--evidence <证据>]
+forget   --kind note|fact|chunk --id <行id>
+serve    [--port <端口>] [--bind <地址>]
+mcp      以 stdio 启动 MCP（等同 hosts/mcp/bin.mjs）
+```
+
+所有命令共用 `--dir`（项目目录）与 `OMNI_*` 环境变量。`write` / `report` / `forget` 走的是与 MCP 完全相同的工具实现，不存在第二套写入路径。
+
+---
+
+## 9. 环境变量
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `OMNI_HOME` | `$DSH_HOME` → `~/.dsh` | 数据根目录 |
+| `OMNI_PROJECT_DIR` | 当前目录 | 项目层绑定目录（MCP/CLI/HTTP） |
+| `OMNI_SESSION_ID` | `host-<哈希>` | 作用域标识 |
+| `OMNI_HTTP_PORT` / `OMNI_HTTP_BIND` | `7788` / `127.0.0.1` | 面板与 HTTP MCP 监听 |
+| `OMNI_AUTO_RECALL` | 开 | `0` 关闭自动预召回（DSH 内有效） |
+| `OMNI_PROFILE` | 未设置 | 画像预算覆盖 |
+| `OMNI_SCOPE_JUDGE` | `off` | 模型复核归类：`off`/`auto`/`always` |
+| `OMNI_JUDGE_PROVIDER` / `OMNI_JUDGE_MODEL` | 自动 | 复核用模型 |
+| `OMNI_PERSONA_MODEL` | `off` | persona 提炼是否允许调模型 |
+| `OMNI_EMBED_URL` / `OMNI_EMBED_MODEL` / `OMNI_EMBED_KEY` | 未设置 | 远程语义嵌入（OpenAI 兼容） |
+| `OMNI_EMBED_PROVIDER` | 未设置 | 预设：openai/dashscope/zhipu/siliconflow |
+| `OMNI_EMBED_BATCH` / `OMNI_EMBED_RETRIES` / `OMNI_EMBED_TIMEOUT_MS` | `64` / `2` / `10000` | 嵌入批处理与重试 |
+| `OMNI_DREAM_INTERVAL_MS` | `0`（关） | 定时做梦校验 |
+| `OMNI_BUSY_TIMEOUT_MS` | `5000` | 写锁等待上限（毫秒，上限 60000）；多客户端共用一库时调大更稳 |
+| `OMNI_SEARCH_WINDOW` / `OMNI_VECTOR_SAMPLE` | 内部默认 | 检索候选窗口与向量采样 |
+| `OMNI_DISABLE_VECTOR` / `OMNI_DISABLE_GRAPH` | 未设置 | 诊断：关闭某一路 |
+
+---
+
+## 10. 已知边界
+
+- **MCP 无系统提示注入**：只能靠五条规则通道 + 主动调用 `memory_context`。
+- **MCP 无事件流**：原文转录不会自动增长，只有显式写入。
+- **无模型复核 / dream 定时**：非 DSH 宿主不提供 `llm`，两项能力自然关闭。
+- **HTTP 无鉴权**：靠回环 + 同源校验；跨机部署前必须自己加反代与鉴权。
+- **Node 22 上 `node:sqlite` 是实验特性**：可用，但会有一条已被入口屏蔽的警告；声明 `>=24`。
+- **core 未拆分**：`index.js` 仍是单体，新增宿主要走 `hosts/shared/boot.mjs`，不要再写第二套内核。
+- **向量默认是字符 n-gram 哈希**：语义能力有限；要真语义必须接远程嵌入并 `memory_reindex`。
+
+---
+
+## 11. AI 调用剧本
+
+### 11.1 新会话开场
+
+```
+memory_context(query = 用户第一条消息原文)
+```
+读返回的「用户设定」定语言与风格，读「相关记忆」避免重复造轮子。若返回为空，直接干活，不要为了"存点东西"而写。
+
+### 11.2 遇到报错
+
+```
+1) memory_search(problemKey = 报错指纹)          // 精确
+2) memory_search(query = 关键词 / 文件名)         // 放宽
+3) 仍未命中 → 查文档、搜全网
+4) 解决后 memory_write(kind=note, problemKey=..., solutionStatus=..., evidence=...)
+```
+
+### 11.3 用户陈述偏好或铁律
+
+```
+memory_write(kind=note, text="用户偏好：...", scope="global")
+```
+出现「以后」「所有项目」「一律」这类词，落全局；具体到某个仓库的做法，落项目层。
+
+### 11.4 结构化事实
+
+```
+memory_write(kind=fact, subject="全息记忆", relation="数据目录", object="%DSH_HOME%\\memory\\omni.db")
+```
+同一 subject+relation 换值会自动失效旧值，不要手删。多值关系（如"支持"多种格式）用 `cardinality=multi`。
+
+### 11.5 复用别人的解法之后
+
+```
+memory_solution_report(id, outcome="success"|"failed", evidence="...")
+```
+成功会累加复用计数并标 verified；失败让下一个人少走一趟。
+
+### 11.6 怀疑记忆过时
+
+```
+memory_dream(apply=true)            // 只标记，不改写
+memory_dream_proposals()            // 看候选
+memory_dream_replace(noteId, confirm=true)   // 单条确认替代
+```
+
+### 11.7 迁移 / 换机器
+
+```
+memory_export(path="D:\\backup\\omni.json")
+memory_import(path="...", dryRun=false)
+memory_reindex(bigrams=true, vectors=true)
+```
+
+---
+
+## 12. 文件地图
+
+```
+index.js                内核 + DSH 插件入口（约 4400 行）
+client.js               DSH 客户端星图（React）
+lib/embed.mjs           512 维字符 n-gram 哈希向量
+lib/embed-provider.mjs  远程嵌入适配
+hosts/shared/headless.mjs   最小宿主上下文
+hosts/shared/boot.mjs       三个入口共用启动
+hosts/shared/context-tool.mjs  memory_context
+hosts/shared/rules.mjs      规则文本 + 幂等区块 + memory_rules
+hosts/mcp/bin.mjs       MCP stdio 入口
+hosts/mcp/server.mjs    协议内核 createProtocol + stdio 传输
+hosts/http/server.mjs   面板 / REST 挂载 / HTTP MCP
+hosts/http/web/         独立面板（列表/星图/规则）
+hosts/cli.mjs           omni 命令行
+scripts/check-docs.mjs  文档漂移闸门
+test/*.test.mjs         242 个用例
+```

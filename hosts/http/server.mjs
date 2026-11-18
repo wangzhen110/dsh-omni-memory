@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: LicenseRef-Omni-Memory-Personal-Use-1.1
+// © 2026 wangzhen110 · https://github.com/wangzhen110/dsh-omni-memory
+
+/**
+ * Standalone daemon: REST + Streamable HTTP MCP + a small web UI.
+ *
+ * The plugin's 13 HTTP routes already exist. Rather than rewriting them for a
+ * standalone product, this server implements the one thing they ask for — a
+ * `webServer` service with `register(route)` — and mounts them unchanged. Same
+ * handlers, same validation, same loopback guard.
+ *
+ * MCP over HTTP reuses the protocol core from mcp/server.mjs, so a client gets
+ * byte-identical answers whether it spoke stdio or HTTP.
+ */
+
+import { createServer } from 'node:http';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { bootHost } from '../shared/boot.mjs';
+import { createProtocol, RULES_URI } from '../mcp/server.mjs';
+import { RULES_TEXT } from '../shared/rules.mjs';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const WEB_DIR = path.join(HERE, 'web');
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.json': 'application/json; charset=utf-8',
+};
+
+function sendJson(res, status, body) {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+  res.end(payload);
+}
+
+/**
+ * Mutating MCP requests need the same protection as REST writes.
+ *
+ * A browser cannot send `application/json` cross-origin without a preflight,
+ * and a form post can only send text/plain, so requiring JSON (or the explicit
+ * CSRF header used by scripts) blocks the drive-by case while keeping ordinary
+ * MCP clients working.
+ */
+function mcpMutationAllowed(req) {
+  const origin = String(req.headers?.origin ?? '').trim();
+  if (origin) {
+    const host = String(req.headers?.host ?? '').trim();
+    if (!host || (origin !== `http://${host}` && origin !== `https://${host}`)) return false;
+  }
+  if (String(req.headers?.['x-omni-csrf'] ?? '') === '1') return true;
+  const type = String(req.headers?.['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+  return type === 'application/json';
+}
+
+function readBody(req, limit = 4 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const parts = [];
+    req.on('data', chunk => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(new Error('request body too large'));
+        req.destroy();
+        return;
+      }
+      parts.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(parts).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+export async function startHttpServer({
+  workdir = process.cwd(),
+  port = Number(process.env.OMNI_HTTP_PORT ?? 7788),
+  bind = process.env.OMNI_HTTP_BIND || '127.0.0.1',
+  version = '0.0.0',
+  log = message => console.error(`[omni-http] ${message}`),
+} = {}) {
+  const routes = [];
+  const webServer = {
+    register(route) {
+      if (!route || typeof route.path !== 'string') return undefined;
+      routes.push(route);
+      return () => {
+        const index = routes.indexOf(route);
+        if (index >= 0) routes.splice(index, 1);
+      };
+    },
+  };
+
+  const { host, project, sessionId, toolContext } = await bootHost({
+    workdir,
+    services: { webServer },
+  });
+
+  const protocol = createProtocol({
+    host,
+    toolContext,
+    serverInfo: { name: 'omni-memory', version },
+    instructions: '全息记忆本地服务：REST 在 /omni-memory/*，MCP 在 POST /mcp，规则在 ' + RULES_URI + '。',
+    rulesText: RULES_TEXT,
+  });
+
+  async function serveStatic(res, pathname) {
+    const name = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+    if (name.includes('..')) return sendJson(res, 403, { ok: false, error: 'bad path' });
+
+    const file = path.join(WEB_DIR, name);
+    if (!file.startsWith(WEB_DIR)) return sendJson(res, 403, { ok: false, error: 'bad path' });
+
+    try {
+      const body = await readFile(file);
+      const type = MIME[path.extname(name)] ?? 'application/octet-stream';
+      res.writeHead(200, { 'content-type': type, 'cache-control': 'no-store' });
+      res.end(body);
+    } catch {
+      sendJson(res, 404, { ok: false, error: 'not found' });
+    }
+  }
+
+  async function serveMcp(req, res) {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { allow: 'POST', 'content-type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: 'use POST' }));
+      return;
+    }
+
+    let payload;
+    try {
+      payload = JSON.parse(await readBody(req));
+    } catch (err) {
+      sendJson(res, 400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: `invalid JSON: ${err.message}` } });
+      return;
+    }
+
+    const batch = Array.isArray(payload);
+    const messages = batch ? payload : [payload];
+    const replies = [];
+
+    for (const message of messages) {
+      if (!message || typeof message !== 'object') {
+        replies.push({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'invalid request' } });
+        continue;
+      }
+      const reply = await protocol.handle(message);
+      if (reply) replies.push({ jsonrpc: '2.0', ...reply });
+    }
+
+    if (!replies.length) {
+      res.writeHead(202, { 'mcp-session-id': sessionId });
+      res.end();
+      return;
+    }
+
+    const body = batch ? replies : replies[0];
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      'mcp-session-id': sessionId,
+    });
+    res.end(JSON.stringify(body));
+  }
+
+  const server = createServer(async (req, res) => {
+    let url;
+    try {
+      url = new URL(req.url ?? '/', `http://${bind}`);
+    } catch {
+      sendJson(res, 400, { ok: false, error: 'bad url' });
+      return;
+    }
+
+    const pathname = url.pathname;
+
+    try {
+      if (pathname === '/health') {
+        sendJson(res, 200, { ok: true, version, project, sessionId, tools: host.tools.size() });
+        return;
+      }
+
+      if (pathname === '/rules') {
+        res.writeHead(200, { 'content-type': 'text/markdown; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(RULES_TEXT);
+        return;
+      }
+
+      if (pathname === '/mcp') {
+        if (req.method === 'POST' && !mcpMutationAllowed(req)) {
+          sendJson(res, 403, { ok: false, error: 'forbidden' });
+          return;
+        }
+        await serveMcp(req, res);
+        return;
+      }
+
+      if (req.method === 'GET' && (pathname === '/' || MIME[path.extname(pathname)])) {
+        await serveStatic(res, pathname);
+        return;
+      }
+
+      const route = routes.find(item => item.kind === 'exact' && item.path === pathname);
+      if (route) {
+        await route.handler(req, res);
+        return;
+      }
+
+      sendJson(res, 404, { ok: false, error: 'not found' });
+    } catch (err) {
+      log(`request failed ${pathname}: ${err?.message ?? err}`);
+      if (!res.headersSent) sendJson(res, 500, { ok: false, error: 'internal error' });
+      else res.end();
+    }
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, bind, resolve);
+  });
+
+  const actual = server.address();
+  const actualPort = typeof actual === 'object' && actual ? actual.port : port;
+  log(`listening http://${bind}:${actualPort} · project ${project ?? 'global'} · ${host.tools.size()} tools · ${routes.length} routes`);
+
+  return {
+    host,
+    project,
+    sessionId,
+    port: actualPort,
+    url: `http://${bind}:${actualPort}`,
+    routes: routes.length,
+    close: () => new Promise(resolve => {
+      server.close(() => {
+        try { host.dispose(); } catch { /* best effort */ }
+        resolve();
+      });
+    }),
+  };
+}

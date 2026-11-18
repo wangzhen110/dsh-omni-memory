@@ -26,12 +26,25 @@ import path from 'node:path';
 import { DIM, embedText, dot, toBlob, fromBlob, tokenize } from './lib/embed.mjs';
 import { backendConfig, embedRemote } from './lib/embed-provider.mjs';
 
-const DSH_HOME = process.env.DSH_HOME || path.join(homedir(), '.dsh');
+// Data home resolution, in priority order:
+//   1. OMNI_HOME   — set by non-DSH adapters (MCP, CLI, HTTP) to point at a shared store
+//   2. DSH_HOME    — kept for existing DSH installs, so their memory carries over untouched
+//   3. ~/.dsh      — historical default
+// The store file itself stays `memory/omni.db` under that home, so a DSH install and a
+// standalone adapter that resolve to the same home share one database instead of forking.
+const DSH_HOME = process.env.OMNI_HOME || process.env.DSH_HOME || path.join(homedir(), '.dsh');
 const DB_DIR = path.join(DSH_HOME, 'memory');
 const DB_FILE = path.join(DB_DIR, 'omni.db');
 const PROFILE_BUDGET = 1200;
 const PROFILE_CACHE_MS = 30_000;
 const MAX_CAPTURE_CHARS = 4000;
+// How long a write waits for the file lock before giving up. Every host shares
+// one SQLite file, so concurrent writers are normal, not exceptional.
+const BUSY_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.OMNI_BUSY_TIMEOUT_MS ?? 5000);
+  if (!Number.isFinite(raw) || raw < 0) return 5000;
+  return Math.min(raw, 60_000);
+})();
 
 let store;
 
@@ -152,6 +165,24 @@ function decideScope(explicit, text, project = currentProject()) {
   if (given === 'all') throw new Error('scope=all is read-only; choose global or a project scope');
   if (given) return { scope: given === SCOPE_GLOBAL ? SCOPE_GLOBAL : given, reason: 'explicit', confidence: 1 };
   return classifyScope(text, project);
+}
+
+/**
+ * An explicit layer that has never been written before is legal (a new project
+ * must be able to create itself), but the caller should be told: an orphan key
+ * is far more often a typo than a new workspace.
+ */
+function newScopeFlag(db, scope) {
+  if (scope === SCOPE_GLOBAL) return undefined;
+  const project = currentProject();
+  if (project && scope === project) return undefined;
+  const row = db.prepare(`
+    SELECT 1 AS hit FROM notes WHERE scope = ?
+    UNION ALL SELECT 1 FROM facts WHERE scope = ?
+    UNION ALL SELECT 1 FROM chunks WHERE scope = ?
+    LIMIT 1
+  `).get(scope, scope, scope);
+  return row ? undefined : true;
 }
 
 /**
@@ -302,9 +333,19 @@ function openStore() {
   const db = new DatabaseSync(DB_FILE);
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA synchronous = NORMAL');
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+  // Several AI hosts can hold the same file open at once. Without a busy
+  // timeout SQLite fails instantly when another process holds the write lock,
+  // so a second Claude window would see "database is locked" instead of waiting
+  // its turn. Blocking is correct here: every write is short.
+  db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+  // Keep the WAL from growing without bound when many readers keep snapshots
+  // alive; the limit is applied at the next checkpoint.
+  db.exec('PRAGMA journal_size_limit = 16777216');
+  // The lease table must exist before anything else can coordinate, including
+  // the schema migration itself.
+  db.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)');
 
+  db.exec(`
     CREATE TABLE IF NOT EXISTS chunks (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts INTEGER NOT NULL,
@@ -399,12 +440,29 @@ function openStore() {
 
   // Schema migrations. A fresh database and an upgraded one must converge on the
   // same structure, so every structural change is a numbered migration.
+  // Schema migrations. A fresh database and an upgraded one must converge on the
+  // same structure, so every structural change is a numbered migration.
+  // One process migrates and rebuilds; the rest wait for the lease to clear so
+  // two hosts opening at the same moment never run DDL against each other.
+  const MAINTENANCE = 'open-maintenance';
+  let lease = acquireLease(db, MAINTENANCE, 120_000);
+  for (let attempt = 0; !lease && attempt < 25; attempt += 1) {
+    sleepSync(200);
+    lease = acquireLease(db, MAINTENANCE, 120_000);
+  }
+
   const schemaVersion = migrate(db);
-  if (notesMode) backfillFts(db, 'notes_fts', 'notes');
-  if (factsMode) backfillFts(db, 'facts_fts', 'facts');
-  backfillBigrams(db);
-  restoreRemoteState(db);
-  backfillVectors(db);
+  if (lease) {
+    try {
+      if (notesMode) backfillFts(db, 'notes_fts', 'notes');
+      if (factsMode) backfillFts(db, 'facts_fts', 'facts');
+      backfillBigrams(db);
+      restoreRemoteState(db);
+      backfillVectors(db);
+    } finally {
+      releaseLease(db, MAINTENANCE);
+    }
+  }
 
   db.prepare('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)').run('fts_mode', ftsMode);
   store = {
@@ -926,6 +984,40 @@ function transaction(db, fn) {
   }
 }
 
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Cross-process lease: `meta` holds `lease:<name>` with an expiry timestamp.
+ * Whoever writes it first owns the work for the TTL; every other process skips
+ * instead of doing the same rebuild on top of the first one.
+ *
+ * This matters once several AI hosts each spawn their own server process: at
+ * startup they all want to migrate the schema and backfill indexes.
+ */
+function acquireLease(db, name, ttlMs) {
+  const key = `lease:${name}`;
+  try {
+    return transaction(db, () => {
+      const row = db.prepare('SELECT value FROM meta WHERE key = ?').get(key);
+      const until = Number(row?.value ?? 0);
+      if (Number.isFinite(until) && until > now()) return false;
+      db.prepare('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+        .run(key, String(now() + ttlMs));
+      return true;
+    });
+  } catch {
+    return false;
+  }
+}
+
+function releaseLease(db, name) {
+  try {
+    db.prepare('DELETE FROM meta WHERE key = ?').run(`lease:${name}`);
+  } catch { /* a stale lease expires on its own */ }
+}
+
 /** Tombstone one row and keep its derived graph edges consistent. */
 function forgetMemory(s, kind, id) {
   const table = { note: 'notes', fact: 'facts', chunk: 'chunks' }[String(kind)];
@@ -1261,12 +1353,14 @@ function insertChunk(s, input) {
   if (!text) return null;
   const digest = hash(text);
   const scope = input.scope ?? null;
-  const existing = db.prepare(`
-    SELECT id FROM chunks
-    WHERE hash = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global') AND deleted_at IS NULL
-  `).get(digest, scope);
-  if (existing) return { id: Number(existing.id), deduped: true };
   return transaction(db, () => {
+    // Inside the write lock: two hosts writing the same transcript line would
+    // otherwise both pass the check and insert a duplicate chunk.
+    const existing = db.prepare(`
+      SELECT id FROM chunks
+      WHERE hash = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global') AND deleted_at IS NULL
+    `).get(digest, scope);
+    if (existing) return { id: Number(existing.id), deduped: true };
     const ts = Number(input.ts ?? now());
     const info = db.prepare(
       'INSERT INTO chunks(ts, session_id, role, text, hash, source, importance, scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
@@ -2484,6 +2578,12 @@ function personaValueOk(value) {
   const text = String(value ?? '').trim();
   if (!text || text.length < 2 || text.length > 200) return false;
   if (PERSONA_BAD_VALUE.test(text)) return false;
+  // Reject heading residues and note fragments: markdown marks, em dashes,
+  // blockquote/table syntax, or more than one clause separator. Those are
+  // section titles copied out of a document, not a stable user setting.
+  if (/[*#`>\[\]{}|]|——/.test(text)) return false;
+  if ((text.match(/[。；;]/g) ?? []).length > 1) return false;
+  if (/^(?:即|参见|详见|见第|第[一二三四五六七八九十\d]+[章节])/.test(text)) return false;
   return true;
 }
 
@@ -2604,6 +2704,16 @@ function personaLines(db) {
   return lines;
 }
 
+/** Join profile lines and enforce the budget on the final string, separators included. */
+function capProfileLines(lines) {
+  let text = lines.join('\n');
+  while (text.length > PROFILE_BUDGET && lines.length) {
+    lines.pop();
+    text = lines.join('\n');
+  }
+  return text;
+}
+
 /** Read the highest-importance notes that fit the always-injected budget. */
 function buildProfileText(projectKey) {
   const s = openStore();
@@ -2641,7 +2751,7 @@ function buildProfileText(projectKey) {
     used += withBullet.length;
     lines.push(withBullet);
   }
-  return lines.join('\n');
+  return capProfileLines(lines);
 }
 
 const profileCache = new Map();
@@ -2814,18 +2924,18 @@ function defineTools(ctx) {
 
   disposers.push(ctx.tools.register({
     name: 'memory_write',
-    description: 'Store one durable memory. kind=note for conclusions, rules and problem-solving experience; kind=fact for subject/relation/object triples; kind=episode for raw observations. Returns the stored id. For experience notes, set problemKey to the stable error signature and solutionStatus to what actually happened.',
+    description: 'Store one durable memory. kind=note for conclusions, rules and problem-solving experience; kind=fact for subject/relation/object triples (text optional when the triple is complete); kind=episode for raw observations. Returns the stored id. For experience notes, set problemKey to the stable error signature and solutionStatus to what actually happened.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         kind: { type: 'string', enum: ['note', 'fact', 'episode'], description: 'Which layer to write.' },
-        text: { type: 'string', description: 'The memory, stated so it is useful without the original conversation. For a solution, include the symptom, what failed, what worked, and the preconditions.' },
+        text: { type: 'string', description: 'The memory, stated so it is useful without the original conversation. Required for note and episode; optional for fact when the subject/relation/object triple is supplied. For a solution, include the symptom, what failed, what worked, and the preconditions.' },
         scope: {
           type: 'string',
           description: 'Optional. Omit to let the plugin judge: project-specific wording goes to the current project layer, cross-project rules to global. Pass a project key or global to override; all is read-only and rejected.',
         },
-        importance: { type: 'number', description: '0..1; higher survives prompt-budget trimming longer.' },
+        importance: { type: 'number', description: '0..1 (default 0.35); higher survives prompt-budget trimming longer. Values outside 0..1 are rejected.' },
         source: { type: 'string', description: 'Where this came from, e.g. session id plus turn, or a file path.' },
         subject: { type: 'string', description: 'fact only: the entity.' },
         relation: { type: 'string', description: 'fact only: the predicate.' },
@@ -2854,22 +2964,32 @@ function defineTools(ctx) {
           description: 'note only: what proves the status, e.g. a command output, a test result, a URL, or a short verification note.',
         },
       },
-      required: ['kind', 'text'],
+      required: ['kind'],
     },
     output: {
-      schema: { type: 'object', properties: { id: { type: 'number' }, kind: { type: 'string' }, deduped: { type: 'boolean' } } },
+      schema: { type: 'object', properties: { id: { type: 'number' }, kind: { type: 'string' }, deduped: { type: 'boolean' }, scopeNew: { type: 'boolean' }, contradictsIgnored: { type: 'array', items: {} } } },
       render: (_args, value) => {
       const layer = value.scope === 'global' ? 'global' : (value.scope ? 'project' : '');
       const detail = layer ? ` · ${layer}` : '';
       const reason = value.scopeReason && value.scopeReason !== 'explicit' ? ` (${value.scopeReason})` : '';
-      return textBlock(`stored ${value.kind} #${value.id}${detail}${reason}${value.deduped ? ' (duplicate)' : ''}`);
+      return textBlock(`stored ${value.kind} #${value.id}${detail}${reason}${value.deduped ? ' (duplicate)' : ''}${value.scopeNew ? ' · new project scope' : ''}${value.contradictsIgnored?.length ? ` · ignored contradicts: ${value.contradictsIgnored.join(', ')}` : ''}`);
     },
     },
     async execute(args, toolContext = {}) {
       const s = openStore();
       const kind = String(args.kind ?? 'note');
-      const text = String(args.text ?? '');
-      const importance = Number.isFinite(args.importance) ? Number(args.importance) : 0.5;
+      const text = String(args.text ?? '').trim();
+      let importance = 0.35;
+      if (args.importance != null) {
+        const value = Number(args.importance);
+        if (!Number.isFinite(value) || value < 0 || value > 1) {
+          throw new Error('importance must be a number between 0 and 1');
+        }
+        importance = value;
+      }
+      if (kind === 'note' && text.length > 4000) {
+        throw new Error(`note is ${text.length} characters; split it into smaller notes (max 4000)`);
+      }
       const requestedStatus = args.solutionStatus == null ? null : String(args.solutionStatus).trim().toLowerCase();
       if (requestedStatus && !SOLUTION_STATUSES.has(requestedStatus)) {
         throw new Error('solutionStatus must be verified, unverified, failed, or expired');
@@ -2887,6 +3007,7 @@ function defineTools(ctx) {
         if (!subject) throw new Error('subject is required for kind=fact');
         const decision = decideScope(args.scope, text, project);
         const factScope = decision.scope;
+        const factScopeNew = newScopeFlag(s.db, factScope);
         const requested = args.cardinality === 'single' || args.cardinality === 'multi' ? args.cardinality : null;
         const cardinality = requested ?? relationCardinality(s.db, relation);
         const ts = now();
@@ -2896,12 +3017,15 @@ function defineTools(ctx) {
         const scopeFilter = factScope === SCOPE_GLOBAL
           ? "(scope = 'global' OR scope IS NULL)"
           : 'scope = ?';
-        const previous = s.db.prepare(`
-          SELECT id, object, scope FROM facts
-          WHERE subject = ? AND relation = ? AND valid_to IS NULL AND deleted_at IS NULL
-            AND ${scopeFilter}
-        `).all(subject, relation, ...(factScope === SCOPE_GLOBAL ? [] : [factScope]));
         const result = transaction(s.db, () => {
+          // Re-read under the write lock. Otherwise two hosts can both see "no
+          // current value" and insert two active facts for a single-cardinality
+          // relation -- a contradiction the store would then have to untangle.
+          const current = s.db.prepare(`
+            SELECT id, object, scope FROM facts
+            WHERE subject = ? AND relation = ? AND valid_to IS NULL AND deleted_at IS NULL
+              AND ${scopeFilter}
+          `).all(subject, relation, ...(factScope === SCOPE_GLOBAL ? [] : [factScope]));
           if (requested) setRelationCardinality(s.db, relation, requested);
           const insertFact = () => {
             const info = s.db.prepare(`
@@ -2929,7 +3053,7 @@ function defineTools(ctx) {
           if (cardinality === 'multi') {
             // Several values may be true at once: keep siblings active, and treat
             // a repeated identical value as the same fact rather than a new one.
-            const same = previous.find(row => String(row.object ?? '') === object);
+            const same = current.find(row => String(row.object ?? '') === object);
             if (same) {
               s.db.prepare('UPDATE facts SET recorded_at = ?, source = COALESCE(?, source) WHERE id = ?')
                 .run(ts, args.source ?? null, Number(same.id));
@@ -2937,7 +3061,7 @@ function defineTools(ctx) {
             }
             return { factId: insertFact(), deduped: false, invalidated: 0 };
           }
-          for (const row of previous) {
+          for (const row of current) {
             s.db.prepare('UPDATE facts SET valid_to = ? WHERE id = ?').run(ts, Number(row.id));
             // Edges are the graph projection of a fact. If the fact stops being
             // current, the edge must stop being traversable too.
@@ -2947,7 +3071,7 @@ function defineTools(ctx) {
                 AND (scope = ? OR scope IS NULL)
             `).run(ts, subject, relation, String(row.object ?? ''), row.scope ?? SCOPE_GLOBAL);
           }
-          return { factId: insertFact(), deduped: false, invalidated: previous.length };
+          return { factId: insertFact(), deduped: false, invalidated: current.length };
         });
         entityCache = { names: [], at: 0 };
         invalidateProfile();
@@ -2965,10 +3089,12 @@ function defineTools(ctx) {
           cardinality,
           scope: factScope,
           scopeReason: decision.reason,
+          ...(factScopeNew ? { scopeNew: true } : {}),
         };
       }
       if (kind === 'episode') {
         const decision = decideScope(args.scope, text, project);
+        const scopeNew = newScopeFlag(s.db, decision.scope);
         const row = insertChunk(s, {
           text, role: 'note', importance, source: args.source, sessionId: null,
           scope: decision.scope,
@@ -2979,12 +3105,23 @@ function defineTools(ctx) {
           kind: 'episode', table: 'chunks', id: Number(row.id), text,
           project, scope: decision.scope, confidence: decision.confidence, reason: decision.reason,
         });
-        return { id: row.id, kind: 'episode', deduped: row.deduped, scope: decision.scope, scopeReason: decision.reason };
+        return { id: row.id, kind: 'episode', deduped: row.deduped, scope: decision.scope, scopeReason: decision.reason, ...(scopeNew ? { scopeNew: true } : {}) };
       }
       const ts = now();
       const decision = decideScope(args.scope, text, project);
       const scope = decision.scope;
+      const scopeNew = newScopeFlag(s.db, scope);
       if (!text.trim()) throw new Error('text is required');
+      // Explicit ids that do not resolve are reported back instead of being
+      // silently dropped: a bulk script must be able to see that it flagged
+      // nothing.
+      const invalidContradicts = [];
+      for (const value of Array.isArray(args.contradicts) ? args.contradicts : []) {
+        const id = Number(value);
+        const ok = Number.isFinite(id) && id > 0 && id !== 0
+          && s.db.prepare('SELECT id FROM notes WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL AND scope = ?').get(id, scope);
+        if (!ok) invalidContradicts.push(value);
+      }
       // Scope is part of a note's identity: the same wording in two layers is two
       // deliberate records (a global rule and its project-specific restatement).
       const prev = s.db.prepare(
@@ -3017,14 +3154,23 @@ function defineTools(ctx) {
           id: Number(prev.id),
           kind: 'note',
           deduped: true,
+          contradictsIgnored: invalidContradicts,
           scope,
           scopeReason: decision.reason,
+          ...(scopeNew ? { scopeNew: true } : {}),
           problemKey: problemKey || prev.problem_key || null,
           solutionStatus: solutionStatusOf(requestedStatus ?? prev.solution_status),
           reuseCount: Number(s.db.prepare('SELECT reuse_count FROM notes WHERE id = ?').get(Number(prev.id))?.reuse_count ?? 0),
         };
       }
       const result = transaction(s.db, () => {
+        // Re-check inside the write transaction. Two hosts can both miss the
+        // earlier lookup and then queue up here; the loser of the race would
+        // otherwise insert a second identical note.
+        const raced = s.db.prepare(
+          'SELECT id FROM notes WHERE scope = ? AND text = ? AND deleted_at IS NULL AND superseded_by IS NULL'
+        ).get(scope, text);
+        if (raced) return { noteId: Number(raced.id), raced: true, contestedWith: [] };
         const info = s.db.prepare(`
           INSERT INTO notes(
             ts, scope, text, importance, source, problem_key, solution_status,
@@ -3048,6 +3194,38 @@ function defineTools(ctx) {
         const contestedWith = markContradictions(s, noteId, text, args.contradicts, scope);
         return { noteId, contestedWith };
       });
+      if (result.raced) {
+        // Another host won the race and wrote the same text first. Keep one
+        // record, but still record the status/evidence this caller brought.
+        const updates = [];
+        const values = [];
+        if (problemKey) { updates.push('problem_key = ?'); values.push(problemKey); }
+        if (requestedStatus) {
+          updates.push('solution_status = ?'); values.push(requestedStatus);
+          updates.push('solution_verified_at = ?'); values.push(requestedStatus === 'verified' ? ts : null);
+        }
+        if (evidence) { updates.push('evidence = ?'); values.push(evidence); }
+        if (updates.length) {
+          transaction(s.db, () => {
+            s.db.prepare(`UPDATE notes SET ${updates.join(', ')} WHERE id = ?`).run(...values, result.noteId);
+          });
+        }
+        invalidateProfile();
+        return {
+          id: result.noteId,
+          kind: 'note',
+          deduped: true,
+          contested: false,
+          contestedWith: [],
+          contradictsIgnored: invalidContradicts,
+          scope,
+          scopeReason: decision.reason,
+          ...(scopeNew ? { scopeNew: true } : {}),
+          problemKey: problemKey || null,
+          solutionStatus: solutionStatusOf(requestedStatus),
+          reuseCount: 0,
+        };
+      }
       invalidateProfile();
       enqueueJudge(ctx, {
         kind: 'note', table: 'notes', id: Number(result.noteId), text,
@@ -3059,8 +3237,10 @@ function defineTools(ctx) {
         deduped: false,
         contested: result.contestedWith.length > 0,
         contestedWith: result.contestedWith,
+        contradictsIgnored: invalidContradicts,
         scope,
         scopeReason: decision.reason,
+        ...(scopeNew ? { scopeNew: true } : {}),
         problemKey: problemKey || null,
         solutionStatus: solutionStatusOf(requestedStatus),
         reuseCount: 0,
@@ -3117,7 +3297,14 @@ function defineTools(ctx) {
     },
     async execute(args, toolContext = {}) {
       const s = openStore();
-      const limit = Math.min(30, Math.max(1, Number(args.limit ?? 8)));
+      let limit = 8;
+      if (args.limit != null) {
+        const value = Number(args.limit);
+        if (!Number.isFinite(value) || value < 1 || value > 30) {
+          throw new Error('limit must be a number between 1 and 30');
+        }
+        limit = Math.floor(value);
+      }
       const query = String(args.query ?? '');
       const problemKey = normalizeProblemKey(args.problemKey);
       const requestedStatus = String(args.status ?? 'all').trim().toLowerCase();
@@ -3515,7 +3702,7 @@ function defineTools(ctx) {
         fts: s.ftsMode,
       };
       const text = picked.length
-        ? picked.map(item => `- ${item.text}`).join('\n')
+        ? capProfileLines(picked.map(item => `- ${item.text}`))
         : '';
       return { text, stats, picked: picked.length, budget: PROFILE_BUDGET };
     },
@@ -3606,20 +3793,24 @@ function defineTools(ctx) {
       required: ['kind', 'id'],
     },
     output: {
-      schema: { type: 'object', properties: { forgotten: { type: 'boolean' } } },
-      render: (_args, value) => textBlock(value.forgotten ? 'tombstoned' : 'nothing to forget'),
+      schema: { type: 'object', properties: { forgotten: { type: 'boolean' }, reason: { type: 'string' } } },
+      render: (_args, value) => textBlock(value.forgotten ? 'tombstoned' : `nothing to forget${value.reason ? `: ${value.reason}` : ''}`),
     },
     async execute(args) {
       const s = openStore();
-      const forgotten = forgetMemory(s, String(args.kind), Number(args.id));
+      const kind = String(args.kind);
+      const id = Number(args.id);
+      const forgotten = forgetMemory(s, kind, id);
       invalidateProfile();
-      return { forgotten };
+      return forgotten
+        ? { forgotten: true }
+        : { forgotten: false, reason: `no active ${kind} #${id}` };
     },
   }));
 
   disposers.push(ctx.tools.register({
     name: 'memory_dream',
-    description: 'Verify stored notes against the transcripts they came from. Dry run by default; apply=true records each verdict and flags unsupported notes as contested, but never replaces anything. commit=true (with apply) or memory_dream_replace performs a reversible replacement.',
+    description: 'Verify stored notes against the transcripts they came from. Dry run by default; apply=true records each verdict and flags unsupported notes as contested, but never replaces anything. commit=true (with apply) or memory_dream_replace performs a reversible replacement. Needs a captured session stream and an LLM; under a plain MCP host it reports no_source.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -3659,7 +3850,7 @@ function defineTools(ctx) {
 
   disposers.push(ctx.tools.register({
     name: 'memory_compact',
-    description: 'Bound transcript growth by tombstoning the oldest chunks beyond a keep limit. Rows stay auditable and recoverable; the raw record is never destroyed. Dry run by default.',
+    description: 'Bound transcript growth by tombstoning the oldest chunks beyond a keep limit. Rows stay auditable and recoverable; the raw record is never destroyed. Dry run by default. Requires the host to have captured a transcript stream; under a plain MCP host with no sessions this is a no-op that reports total 0.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -4291,6 +4482,29 @@ function registerRoutes(ctx) {
   };
 }
 
+/**
+ * Host port for adapters that are not DSH.
+ *
+ * DSH learns a session's working directory from its event stream; an MCP server,
+ * a CLI call or an HTTP request has no such stream. Those adapters announce the
+ * working directory once at startup instead. The mapping is persisted in `meta`
+ * as well, so a restarted adapter recovers the same layer without announcing
+ * again — and so a DSH session opened later in the same directory sees the same
+ * project layer.
+ *
+ * Returns the resolved project scope (`global` or `proj:<name>#<hash>`).
+ */
+export function attachSession(sessionId, cwd) {
+  const id = String(sessionId ?? '').trim();
+  if (!id) return null;
+  const raw = String(cwd ?? '').trim();
+  const project = raw ? projectKeyFromCwd(raw) : SCOPE_GLOBAL;
+  if (raw) cwdBySession.set(id, raw);
+  projectByAgent.set(id, project);
+  try { metaSet(openStore().db, `agent_project:${id}`, project); } catch { /* best effort */ }
+  return project;
+}
+
 export function apply(ctx) {
   hostCtx = ctx;
   ctx.effect(() => {
@@ -4388,7 +4602,14 @@ export function apply(ctx) {
     const intervalMs = Number(process.env.OMNI_DREAM_INTERVAL_MS ?? 0);
     if (!Number.isFinite(intervalMs) || intervalMs <= 0 || typeof setInterval !== 'function') return undefined;
     const timer = setInterval(() => {
-      try { dreamRun(openStore(), true); } catch { /* never break the host */ }
+      try {
+        const s = openStore();
+        // Several hosts can run this timer at once. The lease makes it one
+        // verification pass per interval across the whole machine instead of one
+        // per open window.
+        if (!acquireLease(s.db, 'dream', intervalMs)) return;
+        try { dreamRun(s, true); } finally { releaseLease(s.db, 'dream'); }
+      } catch { /* never break the host */ }
     }, intervalMs);
     if (typeof timer.unref === 'function') timer.unref();
     return () => clearInterval(timer);

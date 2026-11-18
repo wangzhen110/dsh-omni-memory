@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | 3.2.2 |
-| 插件版本 | 3.2.2 |
+| 文档版本 | 3.6.1 |
+| 插件版本 | 3.6.1 |
 | 状态 | 已评审（本文为开发与验收的**唯一依据**） |
 | 目标平台 | DeepSeek Harness 0.2.2-rc.3（Desktop，Windows 11，Node 24.17） |
 | 最后更新 | 2026-11-18 |
@@ -84,8 +84,9 @@
 | NFR-07 | 失败隔离 | 任一子系统（FTS/路由/注入）失效不得导致会话不可用 | 满足（全部 try/catch + 可选降级） |
 | NFR-08 | 隐私 | 所有数据仅存本机 `$DSH_HOME/memory/omni.db`；HTTP 仅 loopback，且浏览器跨站写请求被 Origin 校验拦截 | 部分满足：数据库未加密，loopback HTTP 仍依赖本机进程边界，未做进程级鉴权（ADR-017） |
 | NFR-09 | 可卸载 | 卸载插件后不残留运行中的监听；数据文件保留由用户决定 | 满足 |
-| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 235/235（100%） |
+| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 242/242（100%） |
 | NFR-11 | 界面本地化 | 中英词典注册，切换语言无需重载插件 | 已实现（词典 + 订阅重渲染） |
+| NFR-12 | 多进程并发 | 同机 N 个宿主进程共用一个库，同时读写不丢数据、不报锁错 | 242/242 含 6 进程并发用例；写入等待上限 5s（ADR-028） |
 
 ### 1.3 约束
 
@@ -121,6 +122,7 @@
 | ADR-015 | 模型复核归类 | 规则先落层，`llm` 后台复核并纠偏；失败保留规则 | [ADR/015-model-scope-judge.md](ADR/015-model-scope-judge.md) |
 | ADR-016 | 星图实现 | Canvas 2D 手写投影，零依赖；拖拽/缩放/惯性/自转 | [ADR/016-star-map.md](ADR/016-star-map.md) |
 | ADR-017 | HTTP 写入安全与默认隐私 | 写操作只接受 POST；Origin/CSRF 校验；模型复核默认关闭；队列有界 | [ADR/017-http-security.md](ADR/017-http-security.md) |
+| ADR-028 | 多进程并发 | busy_timeout + BEGIN IMMEDIATE + 事务内去重 + meta 租约 | [ADR/028-multi-process-concurrency.md](ADR/028-multi-process-concurrency.md) |
 
 ### 2.1 参考实现对照（可移植部分）
 

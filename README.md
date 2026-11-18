@@ -7,10 +7,12 @@
 > **源码/架构**后做商业替代、竞品或商业服务；且**必须署名作者**。
 > 商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-235%2F235-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-242%2F242-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-Personal%20Use%201.1-lightgrey)](LICENSE)
 
 ---
+
+**完整机理与接口参考**：[`docs/REFERENCE.md`](docs/REFERENCE.md) —— schema、写入与检索机理、19 个工具、13 条路由、MCP 协议面、CLI、环境变量、AI 调用剧本。执行 `npm run memory:sync` 可把整本手册拆成笔记写进记忆库，之后用 `memory_search` 就能直接检索到。
 
 ## 它解决什么问题
 
@@ -36,6 +38,7 @@
 - **记忆星图**：整屏旋臂星系，拖拽旋转/滚轮缩放/分层切换；**单击任意星点弹出记忆卡**，搜索命中会亮起脉冲光环
 - **活跃视图**：列表/搜索默认只显示活跃记忆；历史（被替代、已删除、已失效）通过面板「审计」查看并可单条**恢复**
 - **备份/导出/导入**：`memory_export` 导出可移植 JSON（含墓碑），`memory_import` 合并导入（默认 dry-run），`memory_restore` 复活单条
+- **多客户端并发**：同一台机器上多个 AI 客户端各起一个服务进程，共用一个 `omni.db`；写入等待而不是报锁错，去重与事实失效在写锁内完成，迁移/索引重建/做梦由全机唯一的租约持有者执行（见 [ADR-028](docs/ADR/028-multi-process-concurrency.md)）
 - **隐私**：全部数据在本地 SQLite（`$DSH_HOME/memory/omni.db`），HTTP 只监听 loopback；写操作只接受 POST 并校验 Origin/CSRF 头
 
 ## 安装
@@ -48,11 +51,36 @@
 
 ```bash
 cd memory-core
-npm test          # 235 个用例
+npm test          # 242 个用例
 npm run check     # 语法与 JSON 校验
 ```
 
 然后在 DSH 插件管理器中选择本地目录安装。
+
+### 在 DSH 之外使用（MCP / HTTP / CLI）
+
+同一份内核可以脱离 DSH 运行，三个入口共用一个本地记忆库：
+
+- `hosts/mcp/bin.mjs` — 零依赖 stdio MCP 服务，Claude Code、Cursor、Cline、Codex CLI、Zed 都能接
+- `hosts/http/server.mjs` — 独立面板 + REST（直接挂载插件原有的 13 条路由）+ HTTP 上的 MCP（`POST /mcp`）
+- `hosts/cli.mjs` — `omni rules / context / search / serve / mcp`
+
+**规则怎么送到模型**：MCP 没有系统提示注入点，所以准备五条通道，同一份文本、永不漂移：
+
+1. `initialize` 返回的 `instructions`
+2. `prompts/get` 的 `omni-bootstrap`（可带当前任务一起返回）
+3. `resources/read` 的 `omni://rules`
+4. 工具 `memory_rules`
+5. `omni rules --write` 把托管区块写进项目自己的 `CLAUDE.md` / `AGENTS.md` / `.cursorrules` / `.clinerules`；区块幂等，可以挂在 SessionStart 钩子上反复执行
+
+```bash
+node hosts/mcp/bin.mjs            # stdio MCP
+node hosts/cli.mjs serve          # 面板 http://127.0.0.1:7788
+node hosts/cli.mjs rules --write  # 把规则写进项目规则文件
+node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
+```
+
+接入配置、能力边界与自检方法见 [`hosts/mcp/README.md`](hosts/mcp/README.md)。
 
 ## 配置
 
@@ -60,6 +88,7 @@ npm run check     # 语法与 JSON 校验
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
+| `OMNI_HOME` | 先 `$DSH_HOME`，再 `~/.dsh` | 数据根目录；非 DSH 宿主靠它指向同一个库 |
 | `OMNI_AUTO_RECALL` | 开 | `0` 关闭每轮自动召回 |
 | `OMNI_SCOPE_JUDGE` | `off` | 模型复核归类：`off` / `auto` / `always`；开启后写入正文会发给复核模型 |
 | `OMNI_JUDGE_PROVIDER` / `OMNI_JUDGE_MODEL` | 自动 | 指定复核用的模型 |
@@ -106,7 +135,7 @@ npm run check     # 语法与 JSON 校验
 
 ## 测试与指标
 
-- 自动化用例：**235 / 235 通过**
+- 自动化用例：**242 / 242 通过**
 - 检索延迟（本机复核，Node 22.23.2；标准 bench 已改为 global scope 并断言真实命中）：10,000 行 p95 ≈ **2.4ms**；100,000 行 ≈ 2.4ms；1,000,000 行 ≈ 6.0ms；1M + 5 万向量 + 100 万 bigram ≈ **116.8ms**（两段式有界检索，见 ADR-020）
 - 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 混合检索 **0.927**
 
@@ -125,7 +154,7 @@ npm run bench:golden   # 黄金集
 ## 文档
 
 - [设计规格](docs/DESIGN.md)（需求、架构、数据模型、契约、失败模式、追溯矩阵）
-- [架构决策记录](docs/ADR)（27 份）
+- [架构决策记录](docs/ADR)（28 份）
 - [威胁模型](docs/THREAT-MODEL.md)（信任边界、残余风险、新增路由检查清单）
 - 备份/恢复设计见 [ADR-019](docs/ADR/019-backup-restore.md)
 - 1M 行检索改造见 [ADR-020](docs/ADR/020-bounded-retrieval.md)
@@ -135,6 +164,7 @@ npm run bench:golden   # 黄金集
 - 实体别名与多值画像见 [ADR-024](docs/ADR/024-entity-aliases.md)
 - 用户设定见 [ADR-026](docs/ADR/026-persona-settings.md)
 - 故障经验库见 [ADR-027](docs/ADR/027-problem-experience.md)
+- 多进程并发（多个 AI 客户端共用一个库）见 [ADR-028](docs/ADR/028-multi-process-concurrency.md)
 - 远程 embedding 加固与 ANN 边界见 [ADR-025](docs/ADR/025-remote-embedding-and-ann.md)
 - [更新日志](docs/CHANGELOG.md)
 - [架构图](docs/architecture.png)

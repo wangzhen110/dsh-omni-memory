@@ -2,6 +2,109 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.6.1] — 2026-11-18
+
+### 修复 · 按用户层面功能测试报告（14 项）
+- **安全**：`POST /mcp` 补同源与 CSRF 防护。跨站 `Origin` 直接 403；无 `Origin` 时必须是 `application/json` 或带 `x-omni-csrf: 1`，跨站表单的 `text/plain` 被挡。REST 行为不变。
+- **去重**：笔记写入先 `trim()` 再查重（与 chunks 对齐），前后空格/尾随换行不再产生重复条目。
+- **权重**：`memory_write` 的 `importance` 默认从 0.5 降到 0.35；非数字或越界（<0、>1）直接报错，不再把 `5`/`-1` 写进库。
+- **persona**：提炼时过滤标题残片——含 Markdown 标记、`——`、多个分句或章节引用开头的值不再进入「偏好」。
+- **参数校验**：`memory_search` 的 `limit` 非数字/越界报错；`contradicts` 中无法解析的 id 通过 `contradictsIgnored` 显式返回；新项目层写入返回 `scopeNew:true` 提示。
+- **长度**：笔记超过 4000 字拒绝入库并提示拆分；画像最终字符串按 1200 字硬截断（标题与换行计入预算）。
+- **一致性**：`memory_forget` 失败时返回 `forgotten:false` + `reason`，与 `memory_restore` 同形；`memory_compact` / `memory_dream` 的描述注明纯 MCP 宿主下的空操作语义。
+- **schema**：`memory_write` 不再要求所有 kind 都带 `text`（fact 可只给三元组），服务端仍按 kind 校验。
+- 版本号统一为 3.6.1。
+
+### 版本
+- 3.6.0 → 3.6.1；测试 242 / 242。
+
+## [3.6.0] — 2026-11-18
+
+### 改进 · 面板星图移植客户端 MemoryGraph
+- 面板星图不再另写简化版，直接移植 `client.js` 里已有的 `MemoryGraph`：四旋臂螺旋、`yaw/pitch` 三维旋转 + 透视投影、深度衰减、三层辉光、虚线 mentions/实线事实箭头。
+- 背景星尘 12000 颗（暖芯冷边、闪烁、深度亮度），叠加两层星云与暖色核心辉光；俯角默认 `-0.55`，旋臂全貌可见。
+- 交互与 DSH 客户端一致：拖拽旋转（`yaw += dx*0.006`，`pitch` 限 ±1.3）、惯性衰减、闲置 2.5s 后自转、滚轮 0.45–2.8 缩放、16px 拾取、hover 提示、点击节点查详情。
+- 保留自适应降质（帧耗时 > 34ms 时按 stride 抽稀背景星）与窗口隐藏暂停。
+
+### 版本
+- 3.5.1 → 3.6.0；测试 242 / 242。
+
+## [3.5.1] — 2026-11-18
+
+### 修复 · 独立面板星图
+- 默认视图由 `scope=global` 改为 `all`：记忆几乎都在项目层时，全局视图只剩一圈无连线的散点。
+- 布局改为螺旋银河：半径与权重决定旋臂位置，`spin` 随半径变化，另加 1500 颗星尘与脉动核心；参数沿用 three.js "Galaxy Generator" 的公开做法（branches / spin / randomness），零依赖用 Canvas 2D 实现。
+- 恢复持续旋转：`requestAnimationFrame` 循环，切走页签或窗口隐藏时停止，回来再启动。
+- 交互修复：拖拽平移、滚轮以光标为中心缩放、悬停高亮、点击节点选中并查询详情；指针事件不再依赖画布预先有尺寸。
+- 背景星点改用独立随机：原先复用节点 id 的 FNV 哈希，`star#N` 相邻编号相关，背景被画成一条斜线。
+- 支持 `?tab=map` 深链直接打开星图。
+
+### 版本
+- 3.5.0 → 3.5.1；测试 242 / 242。
+
+## [3.5.0] — 2026-11-18
+
+### 新增 · 多进程并发：多个 AI 客户端共用一份记忆
+- `PRAGMA busy_timeout`（默认 5000ms，`OMNI_BUSY_TIMEOUT_MS` 可调，上限 60s）：写锁被占时等待而不是立刻 `SQLITE_BUSY`。
+- `PRAGMA journal_size_limit = 16MB`：多读者场景下给 WAL 设上限。
+- 去重检查全部搬进 `BEGIN IMMEDIATE` 事务：笔记按 `(scope, text)`、转录按 `(hash, scope)`、事实按 `(subject, relation, scope)` 在写锁内复查，输的一方返回 `deduped: true`，不再各插一条。
+- `meta` 租约：`lease:open-maintenance`（迁移 + 索引回填）、`lease:dream`（定时校验）由全机一个进程持有，其余进程跳过而不是重复全量扫描。
+- 新增 `test/concurrency.test.mjs` + `test/fixtures/concurrency-worker.mjs`：6 个真实进程同时写一个临时库，24 条不同文本全部落库，3 个进程写同一段文字只留 1 条。
+
+### 文档
+- 新增 ADR-028（多进程并发）；DESIGN 增加 NFR-12，NFR-10 更新为 242/242。
+- REFERENCE 增补并发章节与 `OMNI_BUSY_TIMEOUT_MS`。
+
+### 已知边界
+- 写仍是串行（SQLite 单写者），几十进程持续写入会排队；个人机场景不做写队列。
+- 画像缓存 30s 是每进程独立的，其他窗口刚写的规则最多 30s 后才进入本窗口注入；要即时一致请调 `memory_context`。
+
+### 版本
+- 3.4.0 → 3.5.0；测试 242 / 242。
+
+## [3.4.0] — 2026-11-18
+
+### 新增 · 多宿主收尾：规则固化、HTTP 传输、独立面板
+- `hosts/shared/`：抽出三个入口共用的 `boot.mjs`、`headless.mjs`、`context-tool.mjs`、`rules.mjs`；MCP 与 HTTP 复用同一个协议内核，不再各写一套。
+- `hosts/mcp/server.mjs` 重构为 `createProtocol()`（传输无关）+ stdio 包装；新增 `prompts/list|get`（`omni-bootstrap`）、`resources/list|read`（`omni://rules`）；通知类消息静默处理。
+- 规则固化：同一份 `RULES_TEXT` 走五条通道——`initialize.instructions`、prompt、resource、`memory_rules` 工具、写进项目规则文件。`applyManagedBlock()` 幂等，可挂在 SessionStart 钩子上反复执行而不改脏文件。
+- 新增 `hosts/cli.mjs`：`omni rules | context | search | serve | mcp`；`context` 直接输出纯文本上下文，供 hooks 拼接。
+- CLI 补成完整入口：新增 `write` / `report` / `forget`（与 MCP 走同一套工具实现）、`context --stdin`（直接吃钩子 JSON）、`search --problem-key / --status / --kind`。
+- 新增 `hosts/http/server.mjs`：实现 `webServer.register` 壳，原样挂载插件 13 条路由；提供 `POST /mcp`（Streamable HTTP 的 JSON 响应模式）、`/health`、`/rules` 与静态面板。
+- 新增 `hosts/http/web/`：独立只读面板（记忆 / 星图 / 规则），Canvas 星图支持拖拽、缩放、点选节点查事实。
+- 新增 `test/rules.test.mjs`（幂等、追加、替换、文本自洽）与 `test/http.test.mjs`（路由挂载 + HTTP MCP + 面板）。
+- 工具数 18 → 19（新增 `memory_rules`）。
+
+### 文档
+- 新增 `docs/REFERENCE.md`：按源码与真实 schema v11 逐项核对的机理与接口手册（三层结构、11 张表、写入与检索机理、19 个工具、13 条路由、MCP 协议面、CLI、环境变量、边界、AI 调用剧本）。
+- 新增 `scripts/reference-to-memory.mjs` 与 `npm run memory:sync`：把手册按章节拆成笔记写进库，`memory_write` 自身去重保证幂等；章节 `importance` 刻意压到 0.35，避免挤占 1200 字符的常驻画像预算。
+
+### 已知边界
+- HTTP MCP 只实现 JSON 响应模式，未提供 SSE 流与 OAuth 鉴权；服务默认只听 `127.0.0.1`。
+- 面板只读：写入仍走 MCP 工具或 POST 路由。
+- core 仍未拆分，`index.js` 保持单体。
+
+### 版本
+- 3.3.0 → 3.4.0；测试 241 / 241。
+
+## [3.3.0] — 2026-11-18
+
+### 新增 · MCP 适配层（可脱离 DSH 运行）
+- `hosts/mcp/`：零依赖、纯 stdio 的 MCP 服务，把同一份内核的 17 个 `memory_*` 工具原样暴露给 Claude Code / Cursor / Cline / Codex CLI / Zed，并新增 `memory_context` 作为「画像 + 相关记忆」的一次性引导调用（共 18 个工具）。
+- `hosts/mcp/headless.mjs`：最小宿主上下文，只实现插件真正调用的 `tools.register` / `effect` / `on` / `get`；`index.js` 的工具与检索逻辑一行未改，适配层不复制内核。
+- `hosts/mcp/server.mjs`：手写 JSON-RPC 2.0（单行一帧、按到达顺序处理、stdout 只走协议），不引入任何运行时依赖。
+- `index.js` 新增宿主端口 `attachSession(sessionId, cwd)`：非 DSH 宿主启动时登记工作目录，项目分层沿用同一套 `proj:*` 规则，并持久化到 `meta.agent_project:*`，与其后打开的 DSH 会话共用同一层。
+- 数据目录新增 `OMNI_HOME` 优先级（`OMNI_HOME` → `DSH_HOME` → `~/.dsh`）：DSH 与 MCP 默认共用同一个 `memory/omni.db`，不是两份库。
+- `test/mcp.test.mjs`：真进程 stdio 契约测试（握手、工具列表、写入、召回、错误路径、未知工具）。
+
+### 已知边界
+- MCP 没有系统提示注入点，自动召回退化为「先调 `memory_context`」，靠服务级 `instructions`、工具描述与客户端项目规则三层引导。
+- MCP 没有 `session/event` 事件流，原文转录不会自动增长；MCP 侧只有显式 `memory_write` 的内容。
+- 无模型复核与 dream 定时校验（缺 `llm` 与定时器）；无 HTTP/SSE 传输。
+
+### 版本
+- 3.2.2 → 3.3.0；测试 236 / 236。
+
 ## [3.2.2] — 2026-11-18
 
 ### 许可
