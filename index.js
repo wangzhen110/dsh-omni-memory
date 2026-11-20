@@ -471,30 +471,34 @@ function openStore() {
     sleepSync(200);
     lease = acquireLease(db, MAINTENANCE, 120_000);
   }
+  if (!lease) throw new Error('database maintenance lease unavailable; refusing to read an unmigrated store');
 
-  const schemaVersion = migrate(db);
-  if (lease) {
-    try {
-      const ftsMarker = metaGet(db, 'fts_backfill_version');
-      if (ftsMarker !== String(SCHEMA_VERSION)) {
-        let ftsOk = true;
-        if (chunksMode) ftsOk = backfillFts(db, 'chunks_fts', 'chunks') && ftsOk;
-        if (notesMode) ftsOk = backfillFts(db, 'notes_fts', 'notes') && ftsOk;
-        if (factsMode) ftsOk = backfillFts(db, 'facts_fts', 'facts') && ftsOk;
-        if (ftsOk) metaSet(db, 'fts_backfill_version', SCHEMA_VERSION);
-      }
-      backfillBigrams(db);
-      restoreRemoteState(db);
-      if (backendConfig().kind === 'hashed') {
-        const vectorMarker = `${SCHEMA_VERSION}:${DIM}`;
-        if (metaGet(db, 'vector_backfill_version') !== vectorMarker) {
-          const report = backfillVectors(db, { limit: STARTUP_VECTOR_BATCH });
-          if (!report.remaining && report.errors === 0) metaSet(db, 'vector_backfill_version', vectorMarker);
-        }
-      }
-    } finally {
-      releaseLease(db, MAINTENANCE);
+  // Migration and derived-index maintenance are one owner-only unit. Running
+  // migrate() outside the lease let a second process replay destructive DDL
+  // (for example the v4 vector reset) after the first process already set the
+  // backfill marker, silently breaking vector recall.
+  let schemaVersion = SCHEMA_VERSION;
+  try {
+    schemaVersion = migrate(db);
+    const ftsMarker = metaGet(db, 'fts_backfill_version');
+    if (ftsMarker !== String(SCHEMA_VERSION)) {
+      let ftsOk = true;
+      if (chunksMode) ftsOk = backfillFts(db, 'chunks_fts', 'chunks') && ftsOk;
+      if (notesMode) ftsOk = backfillFts(db, 'notes_fts', 'notes') && ftsOk;
+      if (factsMode) ftsOk = backfillFts(db, 'facts_fts', 'facts') && ftsOk;
+      if (ftsOk) metaSet(db, 'fts_backfill_version', SCHEMA_VERSION);
     }
+    backfillBigrams(db);
+    restoreRemoteState(db);
+    if (backendConfig().kind === 'hashed') {
+      const vectorMarker = `${SCHEMA_VERSION}:${DIM}`;
+      if (metaGet(db, 'vector_backfill_version') !== vectorMarker) {
+        const report = backfillVectors(db, { limit: STARTUP_VECTOR_BATCH });
+        if (!report.remaining && report.errors === 0) metaSet(db, 'vector_backfill_version', vectorMarker);
+      }
+    }
+  } finally {
+    releaseLease(db, MAINTENANCE, lease);
   }
 
   prepareCached(db, 'INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)').run('fts_mode', ftsMode);
@@ -1060,18 +1064,26 @@ function acquireLease(db, name, ttlMs) {
       const row = prepareCached(db, 'SELECT value FROM meta WHERE key = ?').get(key);
       const until = Number(row?.value ?? 0);
       if (Number.isFinite(until) && until > now()) return false;
+      const token = now() + ttlMs;
       prepareCached(db, 'INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
-        .run(key, String(now() + ttlMs));
-      return true;
+        .run(key, String(token));
+      return token;
     });
   } catch {
     return false;
   }
 }
 
-function releaseLease(db, name) {
+function releaseLease(db, name, token) {
+  const key = `lease:${name}`;
   try {
-    prepareCached(db, 'DELETE FROM meta WHERE key = ?').run(`lease:${name}`);
+    if (token === undefined || token === null) {
+      prepareCached(db, 'DELETE FROM meta WHERE key = ?').run(key);
+    } else {
+      // If this owner exceeded its TTL and another process took over, do not
+      // delete the new owner's lease.
+      prepareCached(db, 'DELETE FROM meta WHERE key = ? AND value = ?').run(key, String(token));
+    }
   } catch { /* a stale lease expires on its own */ }
 }
 
@@ -2488,7 +2500,7 @@ function profileFactLines(db, scopeKey, budget) {
   try {
     rows = prepareCached(db, `
       SELECT subject, relation, object FROM facts
-      WHERE deleted_at IS NULL AND valid_to IS NULL ${filter}
+      WHERE deleted_at IS NULL AND valid_to IS NULL AND contested = 0 ${filter}
       ORDER BY confidence DESC, valid_from DESC LIMIT 40
     `).all(...(scopeKey && scopeKey !== SCOPE_GLOBAL ? [scopeKey] : []));
   } catch {
@@ -2581,7 +2593,7 @@ function personaEvidence(db) {
   try {
     const rows = prepareCached(db, `
       SELECT subject, relation, object FROM facts
-      WHERE deleted_at IS NULL AND valid_to IS NULL
+      WHERE deleted_at IS NULL AND valid_to IS NULL AND contested = 0
         AND (scope = 'global' OR scope IS NULL)
       ORDER BY confidence DESC, valid_from DESC LIMIT 80
     `).all();
@@ -4684,8 +4696,9 @@ export function apply(ctx) {
         // Several hosts can run this timer at once. The lease makes it one
         // verification pass per interval across the whole machine instead of one
         // per open window.
-        if (!acquireLease(s.db, 'dream', intervalMs)) return;
-        try { dreamRun(s, true); } finally { releaseLease(s.db, 'dream'); }
+        const dreamLease = acquireLease(s.db, 'dream', intervalMs);
+        if (!dreamLease) return;
+        try { dreamRun(s, true); } finally { releaseLease(s.db, 'dream', dreamLease); }
       } catch { /* never break the host */ }
     }, intervalMs);
     if (typeof timer.unref === 'function') timer.unref();

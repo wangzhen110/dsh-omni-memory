@@ -134,7 +134,15 @@ async function commandRules() {
     }
 
     const current = exists ? readFileSync(target, 'utf8') : '';
-    const { changed, text } = applyManagedBlock(current);
+    let applied;
+    try {
+      applied = applyManagedBlock(current);
+    } catch (error) {
+      // A malformed marker must never be auto-repaired by deleting prose.
+      log(`跳过 ${target}：${error?.message ?? error}`);
+      continue;
+    }
+    const { changed, text } = applied;
 
     if (!write) {
       process.stdout.write(`--- ${target} ${exists ? '' : '（将新建）'}\n`);

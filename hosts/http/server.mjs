@@ -46,6 +46,12 @@ function sendJson(res, status, body) {
   res.end(payload);
 }
 
+/** The same socket-only loopback check used by the REST routes. */
+function isLoopback(req) {
+  const address = req.socket?.remoteAddress ?? '';
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
 /**
  * Mutating MCP requests need the same protection as REST writes.
  *
@@ -221,6 +227,13 @@ export async function startHttpServer({
       }
 
       if (pathname === '/mcp') {
+        // /mcp exposes the whole tool surface. REST routes already require a
+        // loopback peer; this route must not become the one unauthenticated
+        // door when someone runs `omni serve --bind 0.0.0.0`.
+        if (!isLoopback(req)) {
+          sendJson(res, 403, { ok: false, error: 'forbidden' });
+          return;
+        }
         if (req.method === 'POST' && !mcpMutationAllowed(req)) {
           sendJson(res, 403, { ok: false, error: 'forbidden' });
           return;

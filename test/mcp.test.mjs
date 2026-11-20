@@ -18,9 +18,24 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
+import { createProtocol } from '../hosts/mcp/server.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const entry = path.join(root, 'hosts', 'mcp', 'bin.mjs');
+
+test('MCP: id:null is a request and notifications never receive a frame', async () => {
+  const protocol = createProtocol({
+    host: { tools: { get: () => undefined, list: () => [] } },
+    serverInfo: { name: 'test', version: '1' },
+  });
+  const ping = await protocol.handle({ jsonrpc: '2.0', id: null, method: 'ping' });
+  assert.deepEqual(ping, { id: null, result: {} });
+  const initialized = await protocol.handle({ jsonrpc: '2.0', id: null, method: 'initialize', params: {} });
+  assert.equal(initialized.id, null);
+  assert.ok(initialized.result.protocolVersion);
+  assert.equal(await protocol.handle({ jsonrpc: '2.0', method: 'tools/list' }), null);
+  assert.equal(await protocol.handle({ jsonrpc: '2.0', method: 'initialize', params: {} }), null);
+});
 
 function startServer(home) {
   const child = spawn(process.execPath, [entry], {

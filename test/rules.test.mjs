@@ -37,6 +37,17 @@ test('rules: an outdated block is replaced in place', () => {
   assert.equal(result.text.match(/omni-memory:rules/g).length, 2);
 });
 
+test('rules: unpaired managed markers fail closed instead of swallowing prose', () => {
+  assert.throws(
+    () => applyManagedBlock('# 项目规则\n\n<!-- omni-memory:rules v3 start · 只有开头 -->\n用户写的规则\n'),
+    /not paired/,
+  );
+  assert.throws(
+    () => applyManagedBlock('# 项目规则\n\n用户写的规则\n<!-- omni-memory:rules v3 end -->\n'),
+    /not paired/,
+  );
+});
+
 test('rules: the exported text stays self-consistent', () => {
   assert.ok(RULES_TEXT.includes('memory_context'));
   assert.ok(RULES_TEXT.includes('memory_write'));

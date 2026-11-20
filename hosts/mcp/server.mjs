@@ -72,13 +72,18 @@ export function createProtocol({ host, toolContext = {}, serverInfo, instruction
 
   async function handle(message) {
     const { id, method, params } = message;
-    const isRequest = id !== undefined && id !== null;
+    // JSON-RPC notifications are messages WITHOUT an id member. `id: null` is a
+    // legal request id, not a notification; treating it as one made ping hang.
+    const hasId = Object.prototype.hasOwnProperty.call(message, 'id');
+    const isRequest = hasId && id !== undefined;
+    const reply = result => (isRequest ? okResult(id, result) : null);
+    const reject = (code, text) => (isRequest ? errorResult(id, code, text) : null);
 
     switch (method) {
       case 'initialize': {
         const requested = String(params?.protocolVersion ?? '');
         const protocolVersion = KNOWN_PROTOCOLS.has(requested) ? requested : DEFAULT_PROTOCOL;
-        return okResult(id, {
+        return reply({
           protocolVersion,
           capabilities: {
             tools: { listChanged: false },
@@ -95,10 +100,10 @@ export function createProtocol({ host, toolContext = {}, serverInfo, instruction
         return null;
 
       case 'ping':
-        return isRequest ? okResult(id, {}) : null;
+        return reply({});
 
       case 'tools/list':
-        return okResult(id, {
+        return reply({
           tools: host.tools.list().map(def => ({
             name: def.name,
             description: def.description ?? '',
@@ -108,12 +113,12 @@ export function createProtocol({ host, toolContext = {}, serverInfo, instruction
 
       case 'tools/call': {
         const name = String(params?.name ?? '');
-        if (!name) return errorResult(id, RPC.invalidParams, 'tools/call needs a name');
-        return okResult(id, await callTool(name, params?.arguments ?? {}));
+        if (!name) return reject(RPC.invalidParams, 'tools/call needs a name');
+        return reply(await callTool(name, params?.arguments ?? {}));
       }
 
       case 'prompts/list':
-        return okResult(id, {
+        return reply({
           prompts: [{
             name: 'omni-bootstrap',
             title: '全息记忆 · 工作规则',
@@ -128,15 +133,15 @@ export function createProtocol({ host, toolContext = {}, serverInfo, instruction
 
       case 'prompts/get': {
         const name = String(params?.name ?? '');
-        if (name !== 'omni-bootstrap') return errorResult(id, RPC.invalidParams, `unknown prompt: ${name}`);
-        return okResult(id, {
+        if (name !== 'omni-bootstrap') return reject(RPC.invalidParams, `unknown prompt: ${name}`);
+        return reply({
           description: '全息记忆工作规则',
           messages: ruleMessages(params?.arguments?.task),
         });
       }
 
       case 'resources/list':
-        return okResult(id, {
+        return reply({
           resources: [{
             uri: RULES_URI,
             name: 'Omni memory 工作规则',
@@ -146,18 +151,18 @@ export function createProtocol({ host, toolContext = {}, serverInfo, instruction
         });
 
       case 'resources/templates/list':
-        return okResult(id, { resourceTemplates: [] });
+        return reply({ resourceTemplates: [] });
 
       case 'resources/read': {
         const uri = String(params?.uri ?? '');
-        if (uri !== RULES_URI) return errorResult(id, RPC.invalidParams, `unknown resource: ${uri}`);
-        return okResult(id, {
+        if (uri !== RULES_URI) return reject(RPC.invalidParams, `unknown resource: ${uri}`);
+        return reply({
           contents: [{ uri: RULES_URI, mimeType: 'text/markdown', text: rulesText }],
         });
       }
 
       case 'logging/setLevel':
-        return isRequest ? okResult(id, {}) : null;
+        return reply({});
 
       default:
         return isRequest ? errorResult(id, RPC.methodNotFound, `method not found: ${method}`) : null;
@@ -198,7 +203,7 @@ export function serveStdio({ host, toolContext = {}, serverInfo, instructions = 
 
     chain = chain.then(() => dispatch(message)).catch(err => {
       log(`dispatch failed: ${err?.message ?? err}`);
-      if (message?.id !== undefined && message?.id !== null) {
+      if (message && Object.prototype.hasOwnProperty.call(message, 'id') && message.id !== undefined) {
         write({ jsonrpc: '2.0', id: message.id, error: { code: RPC.internal, message: String(err?.message ?? err) } });
       }
     });

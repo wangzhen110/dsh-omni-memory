@@ -101,6 +101,21 @@ test('lifecycle matrix: expired facts leave search, timeline keeps the history',
   assert.ok(timeline.text.includes('裸机'), 'timeline should show the current value');
 });
 
+test('lifecycle matrix: contested facts stay out of profile and persona evidence', async () => {
+  const app = await boot();
+  const fact = await app.call('memory_write', {
+    kind: 'fact', scope: 'global', text: 'LifeSecretState 有争议的机密状态', subject: 'LifeSecretState', relation: '状态', object: '机密',
+  });
+  const db = dbOf(app);
+  db.prepare('UPDATE facts SET contested = 1 WHERE id = ?').run(fact.value.id);
+  db.close();
+
+  const profile = await app.call('memory_profile', { scope: 'global' });
+  assert.ok(!profile.text.includes('LifeSecretState'), 'contested fact leaked into profile');
+  const refreshed = await app.call('memory_persona', { action: 'refresh' });
+  assert.ok(!JSON.stringify(refreshed.value.persona).includes('LifeSecretState'), 'contested fact leaked into persona');
+});
+
 test('lifecycle matrix: graph and node routes respect active state and scope', async () => {
   const app = await boot();
   const rows = await seed(app);

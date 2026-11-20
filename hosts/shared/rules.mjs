@@ -89,10 +89,20 @@ export function managedBlock(version = RULE_VERSION) {
 export function applyManagedBlock(existing, version = RULE_VERSION) {
   const text = String(existing ?? '');
   const block = managedBlock(version);
-  const pattern = new RegExp(`<!-- ${MARK} v\\d+ start[^>]*-->[\\s\\S]*?<!-- ${MARK} v\\d+ end -->`);
+  const startCount = (text.match(new RegExp(`<!-- ${MARK} v\\d+ start[^>]*-->`, 'g')) ?? []).length;
+  const endCount = (text.match(new RegExp(`<!-- ${MARK} v\\d+ end -->`, 'g')) ?? []).length;
 
-  if (pattern.test(text)) {
-    return { changed: text.replace(pattern, block) !== text, text: text.replace(pattern, block) };
+  // Fail closed on a hand-edited or interrupted file. Appending a second block
+  // when one start marker has no end marker lets the next write swallow the
+  // user's prose between the two blocks.
+  if (startCount !== endCount || startCount > 1) {
+    throw new Error(`managed rule markers are not paired (start=${startCount}, end=${endCount}); refusing to rewrite`);
+  }
+
+  const pattern = new RegExp(`<!-- ${MARK} v\\d+ start[^>]*-->[\\s\\S]*?<!-- ${MARK} v\\d+ end -->`);
+  if (startCount === 1) {
+    const next = text.replace(pattern, block);
+    return { changed: next !== text, text: next };
   }
 
   const trimmed = text.replace(/\s+$/, '');
