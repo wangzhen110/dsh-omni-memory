@@ -14,7 +14,8 @@
  */
 
 import { createServer } from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
+import { gzipSync } from 'node:zlib';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -25,12 +26,18 @@ import { RULES_TEXT } from '../shared/rules.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = path.join(HERE, 'web');
 
+const STATIC_CACHE = new Map();
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
 };
 
 function sendJson(res, status, body) {
@@ -108,7 +115,7 @@ export async function startHttpServer({
     rulesText: RULES_TEXT,
   });
 
-  async function serveStatic(res, pathname) {
+  async function serveStatic(req, res, pathname) {
     const name = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
     if (name.includes('..')) return sendJson(res, 403, { ok: false, error: 'bad path' });
 
@@ -116,10 +123,32 @@ export async function startHttpServer({
     if (!file.startsWith(WEB_DIR)) return sendJson(res, 403, { ok: false, error: 'bad path' });
 
     try {
-      const body = await readFile(file);
+      const info = await stat(file);
+      let entry = STATIC_CACHE.get(file);
+      if (!entry || entry.mtimeMs !== info.mtimeMs || entry.size !== info.size) {
+        const body = await readFile(file);
+        const etag = `W/"${info.size.toString(16)}-${Math.floor(info.mtimeMs).toString(16)}"`;
+        // The star map is a single 650 KB HTML file with inlined WebGL code.
+        // Cache the compressed body once per file version so repeat opens and
+        // conditional revalidation do not re-read or re-compress it.
+        entry = { mtimeMs: info.mtimeMs, size: info.size, body, etag, gzip: body.length > 1024 ? gzipSync(body, { level: 6 }) : null };
+        STATIC_CACHE.set(file, entry);
+      }
+      const inm = req.headers['if-none-match'];
+      if (inm && inm === entry.etag) {
+        res.writeHead(304, { 'cache-control': 'no-cache', etag: entry.etag });
+        res.end();
+        return;
+      }
       const type = MIME[path.extname(name)] ?? 'application/octet-stream';
-      res.writeHead(200, { 'content-type': type, 'cache-control': 'no-store' });
-      res.end(body);
+      const useGzip = entry.gzip && /\bgzip\b/i.test(req.headers['accept-encoding'] || '');
+      res.writeHead(200, {
+        'content-type': type,
+        'cache-control': 'no-cache',
+        etag: entry.etag,
+        ...(useGzip ? { 'content-encoding': 'gzip' } : {}),
+      });
+      res.end(useGzip ? entry.gzip : entry.body);
     } catch {
       sendJson(res, 404, { ok: false, error: 'not found' });
     }
@@ -201,7 +230,7 @@ export async function startHttpServer({
       }
 
       if (req.method === 'GET' && (pathname === '/' || MIME[path.extname(pathname)])) {
-        await serveStatic(res, pathname);
+        await serveStatic(req, res, pathname);
         return;
       }
 

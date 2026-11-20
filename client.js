@@ -824,13 +824,14 @@ const EMPTY_HIGHLIGHT = [];
       const focusModeRef = React.useRef(false);
       focusModeRef.current = Boolean(props.focusMode);
       const canvasRef = React.useRef(null);
-      const dataRef = React.useRef({ nodes: [], links: [], stars: [] });
+      const dataRef = React.useRef({ nodes: [], links: [], stars: [], labels: new Map() });
       const viewRef = React.useRef({
         yaw: 0.35, pitch: -0.32, zoom: 1.05,
         vx: 0.0011, vy: 0.0001, dragging: false,
         lastX: 0, lastY: 0, lastMove: 0,
-        tooltipId: null, screen: new Map(), w: 0, h: 0, dpr: 1,
+        tooltipId: null, screen: new Map(), linkScreen: [], nebula: null, w: 0, h: 0, dpr: 1,
         stride: 1, slowFrames: 0, frameTime: 16,
+        trig: { cy: 1, sy: 0, cp: 1, sp: 0 }, radius: 1,
       });
       const [tooltip, setTooltip] = React.useState(null);
       const [scopes, setScopes] = React.useState([]);
@@ -868,7 +869,7 @@ const EMPTY_HIGHLIGHT = [];
               const rand = galaxyRng(Math.imul(i + 3, 40503));
               stars.push({ ...point, size: 0.6 + rand() * 1.5, warm: point.r < 0.5, bright: 0.35 + rand() * 0.65 });
             }
-            dataRef.current = { nodes, links: body.links ?? [], stars };
+            dataRef.current = { nodes, links: body.links ?? [], stars, labels: new Map(nodes.map(node => [node.id, node.label])) };
           })
           .catch(() => { /* keep the panel usable without a graph */ });
         return () => { alive = false; };
@@ -895,6 +896,7 @@ const EMPTY_HIGHLIGHT = [];
             view.dpr = dpr;
             canvas.width = Math.round(view.w * dpr);
             canvas.height = Math.round(view.h * dpr);
+            view.nebula = null;
           } catch { /* keep last known size */ }
         };
         resize();
@@ -906,13 +908,14 @@ const EMPTY_HIGHLIGHT = [];
         window.addEventListener('resize', resize);
 
         const project = point => {
-          const cy = Math.cos(view.yaw), sy = Math.sin(view.yaw);
-          const cp = Math.cos(view.pitch), sp = Math.sin(view.pitch);
+          // Trig and the radius are frame constants. Recomputing them per star
+          // meant 2800 × four trig calls every frame.
+          const { cy, sy, cp, sp } = view.trig;
           const x1 = point.x * cy - point.z * sy;
           const z1 = point.x * sy + point.z * cy;
           const y2 = point.y * cp - z1 * sp;
           const z2 = point.y * sp + z1 * cp;
-          const radius = Math.min(view.w * 0.55, view.h * 0.82) * view.zoom;
+          const radius = view.radius;
           const perspective = 1 / (1.65 - z2 * 0.55);
           return {
             x: view.w / 2 + x1 * radius * perspective,
@@ -926,15 +929,16 @@ const EMPTY_HIGHLIGHT = [];
         let last = performance.now();
         let disposed = false;
         const frame = time => {
-          if (disposed) return;
-          if (typeof document !== 'undefined' && document.hidden) {
-            last = time;
-            raf = requestAnimationFrame(frame);
-            return;
-          }
+          raf = 0;
+          if (disposed || (typeof document !== 'undefined' && document.hidden)) return;
           try {
             const delta = Math.max(1, time - last);
             last = time;
+            view.trig = {
+              cy: Math.cos(view.yaw), sy: Math.sin(view.yaw),
+              cp: Math.cos(view.pitch), sp: Math.sin(view.pitch),
+            };
+            view.radius = Math.min(view.w * 0.55, view.h * 0.82) * view.zoom;
             // Adaptive quality: if frames stay slow, draw fewer background stars.
             view.frameTime = view.frameTime * 0.92 + delta * 0.08;
             if (view.frameTime > 34) {
@@ -947,26 +951,34 @@ const EMPTY_HIGHLIGHT = [];
               view.slowFrames = Math.max(0, view.slowFrames - 1);
             }
 
-            const { nodes, links, stars } = dataRef.current;
+            const { nodes, links, stars, labels } = dataRef.current;
             const dpr = view.dpr || 1;
             ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
             ctx.globalCompositeOperation = 'source-over';
             ctx.fillStyle = '#05060f';
             ctx.fillRect(0, 0, view.w, view.h);
 
-            const nebula = (cx, cy, radius, rgb, alpha) => {
-              const gradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
-              gradient.addColorStop(0, `rgba(${rgb},${alpha})`);
-              gradient.addColorStop(1, 'rgba(0,0,0,0)');
+            if (!view.nebula) {
+              const common = Math.min(view.w, view.h);
+              const make = (cx, cy, radius, rgb, alpha) => {
+                const gradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
+                gradient.addColorStop(0, `rgba(${rgb},${alpha})`);
+                gradient.addColorStop(1, 'rgba(0,0,0,0)');
+                return gradient;
+              };
+              view.nebula = [
+                make(view.w * 0.5, view.h * 0.52, common * 0.55, '74,58,160', 0.30),
+                make(view.w * 0.62, view.h * 0.42, common * 0.34, '36,110,180', 0.22),
+              ];
+            }
+            for (const gradient of view.nebula) {
               ctx.fillStyle = gradient;
               ctx.fillRect(0, 0, view.w, view.h);
-            };
-            nebula(view.w * 0.5, view.h * 0.52, Math.min(view.w, view.h) * 0.55, '74,58,160', 0.30);
-            nebula(view.w * 0.62, view.h * 0.42, Math.min(view.w, view.h) * 0.34, '36,110,180', 0.22);
+            }
 
-            const screenNodes = new Map();
+            const screenNodes = view.screen;
+            screenNodes.clear();
             for (const node of nodes) screenNodes.set(node.id, project(node));
-            view.screen = screenNodes;
 
             ctx.globalCompositeOperation = 'lighter';
             const twinkle = time * 0.0016;
@@ -993,8 +1005,8 @@ const EMPTY_HIGHLIGHT = [];
               }
               return set;
             })();
-            const labels = new Map(nodes.map(node => [node.id, node.label]));
-            const linkScreen = [];
+            const linkScreen = view.linkScreen;
+            linkScreen.length = 0;
             for (const link of links) {
               const a = screenNodes.get(link.source);
               const b = screenNodes.get(link.target);
@@ -1089,11 +1101,23 @@ const EMPTY_HIGHLIGHT = [];
           }
           raf = requestAnimationFrame(frame);
         };
-        raf = requestAnimationFrame(frame);
+        const onVisibility = () => {
+          if (disposed || typeof document === 'undefined') return;
+          if (document.hidden) {
+            cancelAnimationFrame(raf);
+            raf = 0;
+          } else if (!raf) {
+            last = performance.now();
+            raf = requestAnimationFrame(frame);
+          }
+        };
+        if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility);
+        if (typeof document === 'undefined' || !document.hidden) raf = requestAnimationFrame(frame);
 
         return () => {
           disposed = true;
           cancelAnimationFrame(raf);
+          if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility);
           window.removeEventListener('resize', resize);
           if (observer) observer.disconnect();
         };
@@ -1305,15 +1329,22 @@ const EMPTY_HIGHLIGHT = [];
       React.useEffect(() => {
         let alive = true;
         const read = async () => {
+          if (typeof document !== 'undefined' && document.hidden) return;
           try {
             const response = await fetch('/omni-memory/status', { headers: { accept: 'application/json' } });
             const body = await response.json();
             if (alive && body?.ok) setStatus(body);
           } catch { /* keep the last known state */ }
         };
+        const onVisibility = () => { if (!document.hidden) read(); };
         read();
         const timer = setInterval(read, 5000);
-        return () => { alive = false; clearInterval(timer); };
+        if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility);
+        return () => {
+          alive = false;
+          clearInterval(timer);
+          if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility);
+        };
       }, []);
 
       if (!status) return null;

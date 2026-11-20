@@ -48,6 +48,27 @@ const BUSY_TIMEOUT_MS = (() => {
 
 let store;
 
+// Prepared statements are compiled once per SQL string and database. The hot
+// paths used to re-compile the same SELECT/INSERT every row, which shows up
+// most clearly during backfills and repeated panel reads.
+const statementCache = new WeakMap();
+const STATEMENT_CACHE_MAX = 256;
+
+function prepareCached(db, sql) {
+  let cache = statementCache.get(db);
+  if (!cache) {
+    cache = new Map();
+    statementCache.set(db, cache);
+  }
+  let statement = cache.get(sql);
+  if (!statement) {
+    if (cache.size >= STATEMENT_CACHE_MAX) cache.delete(cache.keys().next().value);
+    statement = db.prepare(sql);
+    cache.set(sql, statement);
+  }
+  return statement;
+}
+
 /**
  * Scope layers.
  *
@@ -176,7 +197,7 @@ function newScopeFlag(db, scope) {
   if (scope === SCOPE_GLOBAL) return undefined;
   const project = currentProject();
   if (project && scope === project) return undefined;
-  const row = db.prepare(`
+  const row = prepareCached(db, `
     SELECT 1 AS hit FROM notes WHERE scope = ?
     UNION ALL SELECT 1 FROM facts WHERE scope = ?
     UNION ALL SELECT 1 FROM chunks WHERE scope = ?
@@ -268,11 +289,11 @@ async function flushJudge(ctx) {
         if (moved) {
           const s = openStore();
           const oldScope = item.scope ?? SCOPE_GLOBAL;
-          s.db.prepare(`UPDATE ${item.table} SET scope = ? WHERE id = ?`).run(verdict, Number(item.id));
+          prepareCached(s.db, `UPDATE ${item.table} SET scope = ? WHERE id = ?`).run(verdict, Number(item.id));
           if (item.kind === 'fact') {
-            const fact = s.db.prepare('SELECT subject, relation, object FROM facts WHERE id = ?').get(Number(item.id));
+            const fact = prepareCached(s.db, 'SELECT subject, relation, object FROM facts WHERE id = ?').get(Number(item.id));
             if (fact) {
-              s.db.prepare(`
+              prepareCached(s.db, `
                 UPDATE edges SET scope = ?
                 WHERE src = ? AND rel = ? AND dst = ? AND valid_to IS NULL
                   AND (scope = ? OR scope IS NULL)
@@ -454,17 +475,29 @@ function openStore() {
   const schemaVersion = migrate(db);
   if (lease) {
     try {
-      if (notesMode) backfillFts(db, 'notes_fts', 'notes');
-      if (factsMode) backfillFts(db, 'facts_fts', 'facts');
+      const ftsMarker = metaGet(db, 'fts_backfill_version');
+      if (ftsMarker !== String(SCHEMA_VERSION)) {
+        let ftsOk = true;
+        if (chunksMode) ftsOk = backfillFts(db, 'chunks_fts', 'chunks') && ftsOk;
+        if (notesMode) ftsOk = backfillFts(db, 'notes_fts', 'notes') && ftsOk;
+        if (factsMode) ftsOk = backfillFts(db, 'facts_fts', 'facts') && ftsOk;
+        if (ftsOk) metaSet(db, 'fts_backfill_version', SCHEMA_VERSION);
+      }
       backfillBigrams(db);
       restoreRemoteState(db);
-      backfillVectors(db);
+      if (backendConfig().kind === 'hashed') {
+        const vectorMarker = `${SCHEMA_VERSION}:${DIM}`;
+        if (metaGet(db, 'vector_backfill_version') !== vectorMarker) {
+          const report = backfillVectors(db, { limit: STARTUP_VECTOR_BATCH });
+          if (!report.remaining && report.errors === 0) metaSet(db, 'vector_backfill_version', vectorMarker);
+        }
+      }
     } finally {
       releaseLease(db, MAINTENANCE);
     }
   }
 
-  db.prepare('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)').run('fts_mode', ftsMode);
+  prepareCached(db, 'INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)').run('fts_mode', ftsMode);
   store = {
     db,
     ftsMode,
@@ -479,7 +512,7 @@ let hostCtx = null;
 
 function columnExists(db, table, column) {
   try {
-    return db.prepare(`PRAGMA table_info(${table})`).all().some(row => row.name === column);
+    return prepareCached(db, `PRAGMA table_info(${table})`).all().some(row => row.name === column);
   } catch {
     return false;
   }
@@ -534,7 +567,7 @@ const MIGRATIONS = [
   db => {
     for (const table of ['notes', 'facts', 'chunks']) {
       try {
-        db.prepare(`UPDATE ${table} SET scope = 'global' WHERE scope LIKE 'proj:%' AND scope NOT LIKE '%#%'`).run();
+        prepareCached(db, `UPDATE ${table} SET scope = 'global' WHERE scope LIKE 'proj:%' AND scope NOT LIKE '%#%'`).run();
       } catch { /* column may be absent on very old databases */ }
     }
   },
@@ -632,7 +665,7 @@ const MIGRATIONS = [
 ];
 
 function migrate(db) {
-  const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get();
+  const row = prepareCached(db, "SELECT value FROM meta WHERE key = 'schema_version'").get();
   let version = row ? Number(row.value) : 0;
   if (!Number.isFinite(version) || version < 1) {
     // Unversioned database: treat as v1 and apply the remaining steps.
@@ -686,7 +719,7 @@ function migrate(db) {
       CREATE INDEX IF NOT EXISTS notes_solution_status ON notes(solution_status);
     `);
   }
-  db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)")
+  prepareCached(db, "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)")
     .run(String(SCHEMA_VERSION));
   return SCHEMA_VERSION;
 }
@@ -698,7 +731,8 @@ function backfillFts(db, ftsTable, sourceTable) {
       SELECT id, text FROM ${sourceTable}
       WHERE id NOT IN (SELECT rowid FROM ${ftsTable})
     `);
-  } catch { /* backfill is best effort */ }
+    return true;
+  } catch { return false; }
 }
 
 const CJK_BIGRAM = /^[\u4e00-\u9fff]{2}$/;
@@ -707,8 +741,8 @@ const CJK_BIGRAM = /^[\u4e00-\u9fff]{2}$/;
 function indexBigrams(db, layer, id, text) {
   try {
     const grams = [...new Set(tokenize(text).filter(token => CJK_BIGRAM.test(token)))];
-    db.prepare('DELETE FROM bigrams WHERE layer = ? AND owner_id = ?').run(layer, Number(id));
-    const insert = db.prepare('INSERT OR IGNORE INTO bigrams(layer, owner_id, gram) VALUES (?, ?, ?)');
+    prepareCached(db, 'DELETE FROM bigrams WHERE layer = ? AND owner_id = ?').run(layer, Number(id));
+    const insert = prepareCached(db, 'INSERT OR IGNORE INTO bigrams(layer, owner_id, gram) VALUES (?, ?, ?)');
     for (const gram of grams) insert.run(layer, Number(id), gram);
   } catch { /* optional index */ }
 }
@@ -725,16 +759,18 @@ function backfillBigrams(db, options = {}) {
       const cursorKey = `bigrams_cursor_${layer}`;
       let cursor = options.force ? 0 : Number(metaGet(db, cursorKey) ?? 0);
       if (options.force) metaSet(db, cursorKey, 0);
-      const rows = db.prepare(`
+      const rows = prepareCached(db, `
         SELECT id, text FROM ${table}
         WHERE deleted_at IS NULL AND id > ?
         ORDER BY id LIMIT ?
       `).all(cursor, limit);
       if (!rows.length) continue;
-      for (const row of rows) indexBigrams(db, layer, row.id, row.text);
+      transaction(db, () => {
+        for (const row of rows) indexBigrams(db, layer, row.id, row.text);
+        metaSet(db, cursorKey, Number(rows[rows.length - 1].id));
+      });
       report.scanned += rows.length;
       cursor = Number(rows[rows.length - 1].id);
-      metaSet(db, cursorKey, cursor);
       if (rows.length >= limit) remaining = true;
     }
     if (!remaining) metaSet(db, 'bigrams_version', SCHEMA_VERSION);
@@ -787,7 +823,7 @@ const REMOTE_PROBE_COOLDOWN_MS = 60_000;
 
 function metaGet(db, key) {
   try {
-    return db.prepare('SELECT value FROM meta WHERE key = ?').get(key)?.value ?? null;
+    return prepareCached(db, 'SELECT value FROM meta WHERE key = ?').get(key)?.value ?? null;
   } catch {
     return null;
   }
@@ -795,7 +831,7 @@ function metaGet(db, key) {
 
 function metaSet(db, key, value) {
   try {
-    db.prepare('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)').run(key, String(value));
+    prepareCached(db, 'INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)').run(key, String(value));
   } catch { /* meta is best effort */ }
 }
 
@@ -879,7 +915,7 @@ function indexVector(s, kind, id, text) {
   if (config.kind === 'hashed') {
     try {
       const vector = embedText(text);
-      s.db.prepare('INSERT OR REPLACE INTO vectors(kind, owner_id, dim, vec) VALUES (?, ?, ?, ?)')
+      prepareCached(s.db, 'INSERT OR REPLACE INTO vectors(kind, owner_id, dim, vec) VALUES (?, ?, ?, ?)')
         .run(kind, Number(id), DIM, toBlob(vector));
     } catch { /* the vector route is optional */ }
     return;
@@ -892,7 +928,7 @@ async function backfillRemoteBatch(s) {
   if (backendConfig().kind !== 'remote' || remoteDim <= 0) return;
   for (const [kind, table] of [['note', 'notes'], ['fact', 'facts'], ['chunk', 'chunks']]) {
     try {
-      const rows = s.db.prepare(`
+      const rows = prepareCached(s.db, `
         SELECT t.id AS id, t.text AS text
         FROM ${table} t
         WHERE t.deleted_at IS NULL
@@ -921,7 +957,7 @@ async function flushPendingVectors(s) {
     const vectors = await embedRemote(entries.map(entry => entry.text), config);
     remoteDim = vectors[0].length;
     for (const [index, entry] of entries.entries()) {
-      s.db.prepare('INSERT OR REPLACE INTO vectors(kind, owner_id, dim, vec) VALUES (?, ?, ?, ?)')
+      prepareCached(s.db, 'INSERT OR REPLACE INTO vectors(kind, owner_id, dim, vec) VALUES (?, ?, ?, ?)')
         .run(entry.kind, entry.id, remoteDim, toBlob(vectors[index]));
       pendingVectors.delete(`${entry.kind}:${entry.id}`);
     }
@@ -936,39 +972,60 @@ function activeVectorDim() {
   return config.kind === 'hashed' ? DIM : remoteDim;
 }
 
+const STARTUP_VECTOR_BATCH = 20_000;
+
 function backfillVectors(db, options = {}) {
-  if (backendConfig().kind !== 'hashed') return; // remote rows are queued on demand
-  const limit = Math.max(0, Number(options.limit ?? 0));
-  let remaining = limit || Infinity;
+  if (backendConfig().kind !== 'hashed') return { processed: 0, remaining: false, errors: 0, supported: false };
+  const limit = Math.max(0, Number(options.limit ?? STARTUP_VECTOR_BATCH));
+  let remaining = limit;
+  let processed = 0;
+  let errors = 0;
+  let hasMore = false;
   const jobs = [
     ['note', 'notes', 'text'],
     ['fact', 'facts', 'text'],
     ['chunk', 'chunks', 'text'],
   ];
-  for (const [kind, table, column] of jobs) {
-    if (remaining <= 0) break;
+  const missingSql = table => `
+    SELECT t.id AS id, t.text AS text
+    FROM ${table} t
+    WHERE t.deleted_at IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM vectors v
+        WHERE v.kind = ? AND v.owner_id = t.id AND v.dim = ?
+      )
+  `;
+  for (const [kind, table] of jobs) {
     try {
-      const sql = `
-        SELECT t.id AS id, t.${column} AS text
-        FROM ${table} t
-        WHERE t.deleted_at IS NULL
-          AND NOT EXISTS (
-            SELECT 1 FROM vectors v
-            WHERE v.kind = ? AND v.owner_id = t.id AND v.dim = ?
-          )
-        ${limit ? 'LIMIT ?' : ''}
-      `;
-      const rows = limit
-        ? db.prepare(sql).all(kind, DIM, Number(remaining))
-        : db.prepare(sql).all(kind, DIM);
-      for (const row of rows) {
-        const vector = embedText(row.text);
-        db.prepare('INSERT OR REPLACE INTO vectors(kind, owner_id, dim, vec) VALUES (?, ?, ?, ?)')
-          .run(kind, Number(row.id), DIM, toBlob(vector));
+      const base = missingSql(table);
+      const quota = Math.max(0, remaining);
+      // If the batch is exhausted, still check whether this table has missing
+      // rows so the caller knows whether the index is complete.
+      const sql = quota > 0 ? `${base} LIMIT ?` : `${base} LIMIT 1`;
+      const rows = quota > 0
+        ? prepareCached(db, sql).all(kind, DIM, quota + 1)
+        : prepareCached(db, sql).all(kind, DIM);
+      if (quota <= 0) {
+        if (rows.length) hasMore = true;
+        continue;
       }
-      if (limit) remaining -= rows.length;
-    } catch { /* index backfill is best effort */ }
+      const take = rows.length > quota ? rows.slice(0, quota) : rows;
+      if (rows.length > quota) hasMore = true;
+      if (take.length) {
+        transaction(db, () => {
+          const insert = prepareCached(db, 'INSERT OR REPLACE INTO vectors(kind, owner_id, dim, vec) VALUES (?, ?, ?, ?)');
+          for (const row of take) insert.run(kind, Number(row.id), DIM, toBlob(embedText(row.text)));
+        });
+        processed += take.length;
+        remaining -= take.length;
+      }
+      if (remaining <= 0) continue;
+    } catch {
+      errors += 1;
+      hasMore = true;
+    }
   }
+  return { processed, remaining: hasMore, errors, supported: true };
 }
 
 /** Run a multi-step write atomically. SQLite has no nested transaction here. */
@@ -1000,10 +1057,10 @@ function acquireLease(db, name, ttlMs) {
   const key = `lease:${name}`;
   try {
     return transaction(db, () => {
-      const row = db.prepare('SELECT value FROM meta WHERE key = ?').get(key);
+      const row = prepareCached(db, 'SELECT value FROM meta WHERE key = ?').get(key);
       const until = Number(row?.value ?? 0);
       if (Number.isFinite(until) && until > now()) return false;
-      db.prepare('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      prepareCached(db, 'INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
         .run(key, String(now() + ttlMs));
       return true;
     });
@@ -1014,7 +1071,7 @@ function acquireLease(db, name, ttlMs) {
 
 function releaseLease(db, name) {
   try {
-    db.prepare('DELETE FROM meta WHERE key = ?').run(`lease:${name}`);
+    prepareCached(db, 'DELETE FROM meta WHERE key = ?').run(`lease:${name}`);
   } catch { /* a stale lease expires on its own */ }
 }
 
@@ -1025,12 +1082,12 @@ function forgetMemory(s, kind, id) {
   return transaction(s.db, () => {
     let fact = null;
     if (table === 'facts') {
-      fact = s.db.prepare('SELECT subject, relation, object, scope FROM facts WHERE id = ?').get(Number(id));
+      fact = prepareCached(s.db, 'SELECT subject, relation, object, scope FROM facts WHERE id = ?').get(Number(id));
     }
-    const info = s.db.prepare(`UPDATE ${table} SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL`)
+    const info = prepareCached(s.db, `UPDATE ${table} SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL`)
       .run(now(), Number(id));
     if (fact && Number(info.changes) > 0) {
-      s.db.prepare(`
+      prepareCached(s.db, `
         UPDATE edges SET valid_to = ?
         WHERE src = ? AND rel = ? AND dst = ? AND valid_to IS NULL
           AND (scope = ? OR scope IS NULL)
@@ -1050,14 +1107,14 @@ function snapshotStore(s, options = {}) {
   const factsWhere = audit ? '' : 'WHERE deleted_at IS NULL AND valid_to IS NULL';
   const chunksWhere = audit ? '' : 'WHERE deleted_at IS NULL';
   const edgesWhere = audit ? '' : 'WHERE valid_to IS NULL';
-  const notes = s.db.prepare(`SELECT * FROM notes ${notesWhere} ORDER BY id`).all();
-  const facts = s.db.prepare(`SELECT * FROM facts ${factsWhere} ORDER BY id`).all();
-  const chunks = s.db.prepare(`SELECT * FROM chunks ${chunksWhere} ORDER BY id`).all();
-  const edges = s.db.prepare(`SELECT * FROM edges ${edgesWhere} ORDER BY id`).all();
-  const entities = s.db.prepare('SELECT name FROM entities ORDER BY name').all().map(row => row.name);
-  const relations = s.db.prepare('SELECT name, cardinality, aliases, updated_at FROM relations ORDER BY name').all();
-  const entityAliases = s.db.prepare('SELECT alias, canonical, updated_at FROM entity_aliases ORDER BY alias').all();
-  const persona = s.db.prepare('SELECT key, value, updated_at FROM persona ORDER BY key').all();
+  const notes = prepareCached(s.db, `SELECT * FROM notes ${notesWhere} ORDER BY id`).all();
+  const facts = prepareCached(s.db, `SELECT * FROM facts ${factsWhere} ORDER BY id`).all();
+  const chunks = prepareCached(s.db, `SELECT * FROM chunks ${chunksWhere} ORDER BY id`).all();
+  const edges = prepareCached(s.db, `SELECT * FROM edges ${edgesWhere} ORDER BY id`).all();
+  const entities = prepareCached(s.db, 'SELECT name FROM entities ORDER BY name').all().map(row => row.name);
+  const relations = prepareCached(s.db, 'SELECT name, cardinality, aliases, updated_at FROM relations ORDER BY name').all();
+  const entityAliases = prepareCached(s.db, 'SELECT alias, canonical, updated_at FROM entity_aliases ORDER BY alias').all();
+  const persona = prepareCached(s.db, 'SELECT key, value, updated_at FROM persona ORDER BY key').all();
   return {
     format: EXPORT_FORMAT,
     version: EXPORT_VERSION,
@@ -1112,10 +1169,10 @@ function mergeSnapshot(s, snapshot, options = {}) {
   };
   const plan = { notes: [], facts: [], chunks: [], edges: [], entities: [], relations: [], entityAliases: [], persona: [] };
 
-  const noteExists = s.db.prepare('SELECT id FROM notes WHERE scope = ? AND text = ? AND superseded_by IS NULL');
-  const factExists = s.db.prepare('SELECT id FROM facts WHERE subject = ? AND relation = ? AND object = ? AND scope = ?');
-  const chunkExists = s.db.prepare("SELECT id FROM chunks WHERE hash = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global')");
-  const edgeExists = s.db.prepare("SELECT id FROM edges WHERE src = ? AND rel = ? AND dst = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global')");
+  const noteExists = prepareCached(s.db, 'SELECT id FROM notes WHERE scope = ? AND text = ? AND superseded_by IS NULL');
+  const factExists = prepareCached(s.db, 'SELECT id FROM facts WHERE subject = ? AND relation = ? AND object = ? AND scope = ?');
+  const chunkExists = prepareCached(s.db, "SELECT id FROM chunks WHERE hash = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global')");
+  const edgeExists = prepareCached(s.db, "SELECT id FROM edges WHERE src = ? AND rel = ? AND dst = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global')");
 
   for (const note of Array.isArray(snapshot.notes) ? snapshot.notes : []) {
     if (!note?.text) { stats.skipped += 1; continue; }
@@ -1179,7 +1236,7 @@ function mergeSnapshot(s, snapshot, options = {}) {
   const idMap = new Map();
   transaction(s.db, () => {
     for (const note of plan.notes) {
-      const info = s.db.prepare(`
+      const info = prepareCached(s.db, `
         INSERT INTO notes(
           ts, scope, text, importance, source, revision, superseded_by, contested, deleted_at,
           verification, verified_at, evidence, problem_key, solution_status,
@@ -1199,7 +1256,7 @@ function mergeSnapshot(s, snapshot, options = {}) {
       const newId = Number(info.lastInsertRowid);
       idMap.set(Number(note.id), newId);
       if (s.fts.notes) {
-        try { s.db.prepare('INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(newId, String(note.text)); } catch { /* duplicate */ }
+        try { prepareCached(s.db, 'INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(newId, String(note.text)); } catch { /* duplicate */ }
       }
       indexBigrams(s.db, 'note', newId, String(note.text));
       upsertVector(s, 'note', newId, String(note.text));
@@ -1210,10 +1267,10 @@ function mergeSnapshot(s, snapshot, options = {}) {
       if (!replacement) continue;
       const newId = idMap.get(Number(note.id));
       const target = idMap.get(replacement) ?? replacement;
-      if (newId) s.db.prepare('UPDATE notes SET superseded_by = ? WHERE id = ?').run(target, newId);
+      if (newId) prepareCached(s.db, 'UPDATE notes SET superseded_by = ? WHERE id = ?').run(target, newId);
     }
     for (const fact of plan.facts) {
-      const info = s.db.prepare(`
+      const info = prepareCached(s.db, `
         INSERT INTO facts(subject, relation, object, text, valid_from, valid_to, recorded_at, confidence, source, contested, scope, deleted_at, cardinality)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
@@ -1225,14 +1282,14 @@ function mergeSnapshot(s, snapshot, options = {}) {
       );
       const newId = Number(info.lastInsertRowid);
       if (s.fts.facts) {
-        try { s.db.prepare('INSERT INTO facts_fts(rowid, text) VALUES (?, ?)').run(newId, String(fact.text ?? '')); } catch { /* duplicate */ }
+        try { prepareCached(s.db, 'INSERT INTO facts_fts(rowid, text) VALUES (?, ?)').run(newId, String(fact.text ?? '')); } catch { /* duplicate */ }
       }
       indexBigrams(s.db, 'fact', newId, String(fact.text ?? `${fact.subject} ${fact.relation} ${fact.object ?? ''}`));
       upsertVector(s, 'fact', newId, String(fact.text ?? `${fact.subject} ${fact.relation} ${fact.object ?? ''}`));
     }
     for (const chunk of plan.chunks) {
       const text = String(chunk.text);
-      const info = s.db.prepare(`
+      const info = prepareCached(s.db, `
         INSERT INTO chunks(ts, session_id, role, text, hash, source, importance, scope, deleted_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
@@ -1242,13 +1299,13 @@ function mergeSnapshot(s, snapshot, options = {}) {
       );
       const newId = Number(info.lastInsertRowid);
       if (s.fts.chunks) {
-        try { s.db.prepare('INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)').run(newId, text); } catch { /* duplicate */ }
+        try { prepareCached(s.db, 'INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)').run(newId, text); } catch { /* duplicate */ }
       }
       indexBigrams(s.db, 'chunk', newId, text);
       upsertVector(s, 'chunk', newId, text);
     }
     for (const edge of plan.edges) {
-      s.db.prepare(`
+      prepareCached(s.db, `
         INSERT INTO edges(src, rel, dst, valid_from, valid_to, scope, source)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `).run(
@@ -1257,9 +1314,9 @@ function mergeSnapshot(s, snapshot, options = {}) {
         edge.scope ?? null, edge.source ?? null,
       );
     }
-    for (const name of plan.entities) s.db.prepare('INSERT OR IGNORE INTO entities(name) VALUES (?)').run(name);
+    for (const name of plan.entities) prepareCached(s.db, 'INSERT OR IGNORE INTO entities(name) VALUES (?)').run(name);
     for (const relation of plan.relations) {
-      s.db.prepare(`
+      prepareCached(s.db, `
         INSERT INTO relations(name, cardinality, aliases, updated_at) VALUES (?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
           cardinality = excluded.cardinality,
@@ -1272,7 +1329,7 @@ function mergeSnapshot(s, snapshot, options = {}) {
       );
     }
     for (const alias of plan.entityAliases) {
-      s.db.prepare(`
+      prepareCached(s.db, `
         INSERT INTO entity_aliases(alias, canonical, updated_at) VALUES (?, ?, ?)
         ON CONFLICT(alias) DO UPDATE SET
           canonical = excluded.canonical,
@@ -1280,7 +1337,7 @@ function mergeSnapshot(s, snapshot, options = {}) {
       `).run(String(alias.alias), String(alias.canonical), Number(alias.updated_at ?? now()));
     }
     for (const setting of plan.persona) {
-      s.db.prepare(`
+      prepareCached(s.db, `
         INSERT INTO persona(key, value, updated_at) VALUES (?, ?, ?)
         ON CONFLICT(key) DO UPDATE SET
           value = excluded.value,
@@ -1298,45 +1355,45 @@ function restoreMemory(s, kind, id) {
   const table = { note: 'notes', fact: 'facts', chunk: 'chunks' }[String(kind)];
   if (!table) throw new Error('kind must be note, fact or chunk');
   const result = transaction(s.db, () => {
-    const row = s.db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(Number(id));
+    const row = prepareCached(s.db, `SELECT * FROM ${table} WHERE id = ?`).get(Number(id));
     if (!row) return { restored: false, reason: 'not found' };
     if (!row.deleted_at) return { restored: false, reason: 'not tombstoned' };
     if (table === 'chunks') {
       // The unique index is (hash, scope) among active rows. Restoring an old
       // copy while a newer active copy exists would abort the whole transaction
       // with a raw UNIQUE error; return a structured conflict instead.
-      const active = s.db.prepare(`
+      const active = prepareCached(s.db, `
         SELECT id FROM chunks
         WHERE hash = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global')
           AND deleted_at IS NULL AND id <> ?
       `).get(row.hash, row.scope, Number(id));
       if (active) return { restored: false, reason: 'active duplicate', activeId: Number(active.id) };
     }
-    s.db.prepare(`UPDATE ${table} SET deleted_at = NULL WHERE id = ?`).run(Number(id));
+    prepareCached(s.db, `UPDATE ${table} SET deleted_at = NULL WHERE id = ?`).run(Number(id));
     if (table === 'notes') {
       if (s.fts.notes) {
-        try { s.db.prepare('INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(Number(id), row.text); } catch { /* already indexed */ }
+        try { prepareCached(s.db, 'INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(Number(id), row.text); } catch { /* already indexed */ }
       }
       indexBigrams(s.db, 'note', Number(id), row.text);
       upsertVector(s, 'note', Number(id), row.text);
     } else if (table === 'facts') {
       const text = String(row.text ?? `${row.subject} ${row.relation} ${row.object}`);
       if (s.fts.facts) {
-        try { s.db.prepare('INSERT INTO facts_fts(rowid, text) VALUES (?, ?)').run(Number(id), text); } catch { /* already indexed */ }
+        try { prepareCached(s.db, 'INSERT INTO facts_fts(rowid, text) VALUES (?, ?)').run(Number(id), text); } catch { /* already indexed */ }
       }
       indexBigrams(s.db, 'fact', Number(id), text);
       upsertVector(s, 'fact', Number(id), text);
-      const edge = s.db.prepare(`
+      const edge = prepareCached(s.db, `
         SELECT id FROM edges WHERE src = ? AND rel = ? AND dst = ? AND valid_to IS NULL
           AND (scope = ? OR scope IS NULL)
       `).get(row.subject, row.relation, String(row.object ?? ''), row.scope ?? SCOPE_GLOBAL);
       if (!edge) {
-        s.db.prepare('INSERT INTO edges(src, rel, dst, valid_from, scope, source) VALUES (?, ?, ?, ?, ?, ?)')
+        prepareCached(s.db, 'INSERT INTO edges(src, rel, dst, valid_from, scope, source) VALUES (?, ?, ?, ?, ?, ?)')
           .run(row.subject, row.relation, String(row.object ?? ''), Number(row.valid_from ?? now()), row.scope ?? SCOPE_GLOBAL, row.source ?? null);
       }
     } else {
       if (s.fts.chunks) {
-        try { s.db.prepare('INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)').run(Number(id), row.text); } catch { /* already indexed */ }
+        try { prepareCached(s.db, 'INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)').run(Number(id), row.text); } catch { /* already indexed */ }
       }
       indexBigrams(s.db, 'chunk', Number(id), row.text);
       upsertVector(s, 'chunk', Number(id), row.text);
@@ -1356,13 +1413,13 @@ function insertChunk(s, input) {
   return transaction(db, () => {
     // Inside the write lock: two hosts writing the same transcript line would
     // otherwise both pass the check and insert a duplicate chunk.
-    const existing = db.prepare(`
+    const existing = prepareCached(db, `
       SELECT id FROM chunks
       WHERE hash = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global') AND deleted_at IS NULL
     `).get(digest, scope);
     if (existing) return { id: Number(existing.id), deduped: true };
     const ts = Number(input.ts ?? now());
-    const info = db.prepare(
+    const info = prepareCached(db,
       'INSERT INTO chunks(ts, session_id, role, text, hash, source, importance, scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
     ).run(
       ts,
@@ -1377,7 +1434,7 @@ function insertChunk(s, input) {
     const id = Number(info.lastInsertRowid);
     if (ftsMode !== 'like') {
       try {
-        db.prepare('INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)').run(id, text);
+        prepareCached(db, 'INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)').run(id, text);
       } catch { /* index write is best effort */ }
     }
     indexBigrams(db, 'chunk', id, text);
@@ -1478,9 +1535,9 @@ const BIGRAM_SAMPLE = 200;
 function recentWindowRows(db, table, terms, columns, filter, limit, extra = '') {
   const clause = likeClause(columns, terms);
   try {
-    const max = Number(db.prepare(`SELECT MAX(id) AS n FROM ${table}`).get()?.n ?? 0);
+    const max = Number(prepareCached(db, `SELECT MAX(id) AS n FROM ${table}`).get()?.n ?? 0);
     if (!max) return [];
-    return db.prepare(`
+    return prepareCached(db, `
       SELECT * FROM ${table}
       WHERE id > ? AND deleted_at IS NULL ${extra} AND ${clause.sql} ${filter.sql}
       ORDER BY id DESC LIMIT ?
@@ -1502,7 +1559,7 @@ function recentWindowRows(db, table, terms, columns, filter, limit, extra = '') 
 function ftsRowIds(db, ftsTable, term, limit) {
   const quoted = `"${String(term).replaceAll('"', '""')}"`;
   try {
-    return db.prepare(`SELECT rowid FROM ${ftsTable} WHERE ${ftsTable} MATCH ? LIMIT ?`)
+    return prepareCached(db, `SELECT rowid FROM ${ftsTable} WHERE ${ftsTable} MATCH ? LIMIT ?`)
       .all(quoted, limit)
       .map(row => Number(row.rowid));
   } catch {
@@ -1515,7 +1572,7 @@ function rowsByIds(db, table, ids, extraSql = '') {
   if (!ids.length) return [];
   const placeholders = ids.map(() => '?').join(',');
   try {
-    return db.prepare(`SELECT * FROM ${table} WHERE id IN (${placeholders}) ${extraSql}`).all(...ids);
+    return prepareCached(db, `SELECT * FROM ${table} WHERE id IN (${placeholders}) ${extraSql}`).all(...ids);
   } catch {
     return [];
   }
@@ -1539,7 +1596,7 @@ function canonicalEntity(db, name) {
   if (!current) return current;
   try {
     for (let depth = 0; depth < 5; depth += 1) {
-      const row = db.prepare('SELECT canonical FROM entity_aliases WHERE alias = ?').get(current);
+      const row = prepareCached(db, 'SELECT canonical FROM entity_aliases WHERE alias = ?').get(current);
       if (!row || row.canonical === current) break;
       current = String(row.canonical);
     }
@@ -1553,16 +1610,16 @@ function linkEntity(s, aliasInput, canonicalInput, options = {}) {
   if (!alias || !canonical) throw new Error('alias and canonical are required');
   if (alias === canonical) throw new Error('alias and canonical are the same entity');
   const dryRun = options.apply !== true;
-  const affectedFacts = Number(s.db.prepare('SELECT COUNT(*) AS n FROM facts WHERE subject = ?').get(alias)?.n ?? 0);
-  const affectedEdges = Number(s.db.prepare("SELECT COUNT(*) AS n FROM edges WHERE src = ?").get(alias)?.n ?? 0);
+  const affectedFacts = Number(prepareCached(s.db, 'SELECT COUNT(*) AS n FROM facts WHERE subject = ?').get(alias)?.n ?? 0);
+  const affectedEdges = Number(prepareCached(s.db, "SELECT COUNT(*) AS n FROM edges WHERE src = ?").get(alias)?.n ?? 0);
   if (dryRun) return { alias, canonical, affectedFacts, affectedEdges, applied: false };
   transaction(s.db, () => {
-    s.db.prepare('INSERT OR REPLACE INTO entity_aliases(alias, canonical, updated_at) VALUES (?, ?, ?)')
+    prepareCached(s.db, 'INSERT OR REPLACE INTO entity_aliases(alias, canonical, updated_at) VALUES (?, ?, ?)')
       .run(alias, canonical, now());
-    s.db.prepare('INSERT OR IGNORE INTO entities(name) VALUES (?)').run(canonical);
-    s.db.prepare('UPDATE facts SET subject = ? WHERE subject = ?').run(canonical, alias);
-    s.db.prepare('UPDATE edges SET src = ? WHERE src = ?').run(canonical, alias);
-    s.db.prepare('DELETE FROM entities WHERE name = ?').run(alias);
+    prepareCached(s.db, 'INSERT OR IGNORE INTO entities(name) VALUES (?)').run(canonical);
+    prepareCached(s.db, 'UPDATE facts SET subject = ? WHERE subject = ?').run(canonical, alias);
+    prepareCached(s.db, 'UPDATE edges SET src = ? WHERE src = ?').run(canonical, alias);
+    prepareCached(s.db, 'DELETE FROM entities WHERE name = ?').run(alias);
   });
   entityCache = { names: [], at: 0 };
   invalidateProfile();
@@ -1571,7 +1628,7 @@ function linkEntity(s, aliasInput, canonicalInput, options = {}) {
 
 function relationCardinality(db, name) {
   try {
-    return db.prepare('SELECT cardinality FROM relations WHERE name = ?').get(name)?.cardinality ?? 'single';
+    return prepareCached(db, 'SELECT cardinality FROM relations WHERE name = ?').get(name)?.cardinality ?? 'single';
   } catch {
     return 'single';
   }
@@ -1579,7 +1636,7 @@ function relationCardinality(db, name) {
 
 function setRelationCardinality(db, name, cardinality) {
   try {
-    db.prepare(`
+    prepareCached(db, `
       INSERT INTO relations(name, cardinality, updated_at) VALUES (?, ?, ?)
       ON CONFLICT(name) DO UPDATE SET cardinality = excluded.cardinality, updated_at = excluded.updated_at
     `).run(name, cardinality, now());
@@ -1640,7 +1697,7 @@ function solutionFields(row) {
 function searchBigrams(s, layer, table, term, limit, filter, extra = '') {
   if (!CJK_BIGRAM.test(term)) return [];
   try {
-    return s.db.prepare(`
+    return prepareCached(s.db, `
       SELECT t.* FROM (
         SELECT owner_id FROM bigrams
         WHERE layer = ? AND gram = ?
@@ -1749,7 +1806,7 @@ function searchProblemKey(s, problemKey, limit, scope, options = {}) {
   const filter = scopeClause('scope', scope, false);
   const statusSql = status ? "AND COALESCE(solution_status, 'unverified') = ?" : '';
   try {
-    return s.db.prepare(`
+    return prepareCached(s.db, `
       SELECT * FROM notes
       WHERE deleted_at IS NULL AND superseded_by IS NULL AND problem_key = ?
         ${filter.sql} ${statusSql}
@@ -1848,7 +1905,7 @@ function dreamEvidence(s, note, scope = note.scope ?? SCOPE_GLOBAL) {
   const scopeFilter = scopeClause('scope', scope);
   if (note.source) {
     try {
-      const rows = s.db.prepare(`
+      const rows = prepareCached(s.db, `
         SELECT id, text, source FROM chunks
         WHERE source = ? AND deleted_at IS NULL ${scopeFilter.sql}
         LIMIT 1
@@ -1862,7 +1919,7 @@ function dreamEvidence(s, note, scope = note.scope ?? SCOPE_GLOBAL) {
   let bestScore = 0;
   let rows = [];
   try {
-    rows = s.db.prepare(`
+    rows = prepareCached(s.db, `
       SELECT id, text, source FROM chunks
       WHERE deleted_at IS NULL ${scopeFilter.sql}
       ORDER BY ts DESC LIMIT ?
@@ -1895,7 +1952,7 @@ function dreamRun(s, apply, options = {}) {
   // therefore opt-in and every replacement records its source as dream:<noteId>
   // so it can be rolled back.
   const commit = options.commit === true;
-  const notes = s.db.prepare(`
+  const notes = prepareCached(s.db, `
     SELECT * FROM notes
     WHERE deleted_at IS NULL AND superseded_by IS NULL AND COALESCE(revision, 1) < 3
     ORDER BY importance DESC, ts DESC LIMIT ?
@@ -1931,21 +1988,21 @@ function dreamRun(s, apply, options = {}) {
     };
     if (apply) {
       transaction(s.db, () => {
-        s.db.prepare('UPDATE notes SET verified_at = ?, verification = ?, evidence = ? WHERE id = ?')
+        prepareCached(s.db, 'UPDATE notes SET verified_at = ?, verification = ?, evidence = ? WHERE id = ?')
           .run(now(), verdict, evidenceRef, Number(note.id));
         if ((verdict === 'unsupported' || verdict === 'contradicted') && evidence) {
-          s.db.prepare('UPDATE notes SET contested = 1 WHERE id = ?').run(Number(note.id));
+          prepareCached(s.db, 'UPDATE notes SET contested = 1 WHERE id = ?').run(Number(note.id));
           action.proposedText = String(evidence.text).slice(0, 600);
           if (!commit) return;
           const replacementText = action.proposedText;
-          const info = s.db.prepare(
+          const info = prepareCached(s.db,
             'INSERT INTO notes(ts, scope, text, importance, source, revision) VALUES (?, ?, ?, ?, ?, ?)'
           ).run(now(), note.scope, replacementText, 0.5, `dream:${note.id}`, Number(note.revision ?? 1) + 1);
           const replacementId = Number(info.lastInsertRowid);
-          s.db.prepare('UPDATE notes SET superseded_by = ? WHERE id = ?').run(replacementId, Number(note.id));
+          prepareCached(s.db, 'UPDATE notes SET superseded_by = ? WHERE id = ?').run(replacementId, Number(note.id));
           if (s.fts.notes) {
             try {
-              s.db.prepare('INSERT INTO notes_fts(rowid, text) VALUES (?, ?)')
+              prepareCached(s.db, 'INSERT INTO notes_fts(rowid, text) VALUES (?, ?)')
                 .run(replacementId, replacementText);
             } catch { /* best effort */ }
           }
@@ -1963,7 +2020,7 @@ function dreamRun(s, apply, options = {}) {
 
 /** Evidence-backed replacement candidates for notes already flagged by a dream run. */
 function dreamProposals(s, limit = 50) {
-  const rows = s.db.prepare(`
+  const rows = prepareCached(s.db, `
     SELECT * FROM notes
     WHERE deleted_at IS NULL AND superseded_by IS NULL
       AND verification IN ('unsupported', 'contradicted')
@@ -1986,20 +2043,20 @@ function dreamProposals(s, limit = 50) {
 /** Replace one flagged note with its evidence text. Explicit per-note action. */
 function dreamReplace(s, noteId) {
   const result = transaction(s.db, () => {
-    const note = s.db.prepare(
+    const note = prepareCached(s.db,
       'SELECT * FROM notes WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL'
     ).get(Number(noteId));
     if (!note) throw new Error('note not found or already superseded');
     const evidence = dreamEvidence(s, note, note.scope ?? SCOPE_GLOBAL);
     if (!evidence) throw new Error('no evidence to build a replacement');
     const replacementText = String(evidence.text).slice(0, 600);
-    const info = s.db.prepare(
+    const info = prepareCached(s.db,
       'INSERT INTO notes(ts, scope, text, importance, source, revision) VALUES (?, ?, ?, ?, ?, ?)'
     ).run(now(), note.scope, replacementText, 0.5, `dream:${note.id}`, Number(note.revision ?? 1) + 1);
     const replacementId = Number(info.lastInsertRowid);
-    s.db.prepare('UPDATE notes SET superseded_by = ?, contested = 1 WHERE id = ?').run(replacementId, Number(note.id));
+    prepareCached(s.db, 'UPDATE notes SET superseded_by = ?, contested = 1 WHERE id = ?').run(replacementId, Number(note.id));
     if (s.fts.notes) {
-      try { s.db.prepare('INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(replacementId, replacementText); } catch { /* best effort */ }
+      try { prepareCached(s.db, 'INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(replacementId, replacementText); } catch { /* best effort */ }
     }
     indexBigrams(s.db, 'note', replacementId, replacementText);
     upsertVector(s, 'note', replacementId, replacementText);
@@ -2016,14 +2073,14 @@ function dreamReplace(s, noteId) {
 /** Undo a dream replacement: revive the original, tombstone the generated note. */
 function dreamRollback(s, noteId) {
   const result = transaction(s.db, () => {
-    const note = s.db.prepare('SELECT id, superseded_by FROM notes WHERE id = ?').get(Number(noteId));
+    const note = prepareCached(s.db, 'SELECT id, superseded_by FROM notes WHERE id = ?').get(Number(noteId));
     if (!note || !note.superseded_by) return { restored: false, reason: 'not superseded' };
-    const replacement = s.db.prepare('SELECT id, source, deleted_at FROM notes WHERE id = ?').get(Number(note.superseded_by));
+    const replacement = prepareCached(s.db, 'SELECT id, source, deleted_at FROM notes WHERE id = ?').get(Number(note.superseded_by));
     if (!replacement || !String(replacement.source ?? '').startsWith('dream:')) {
       return { restored: false, reason: 'not a dream replacement' };
     }
-    s.db.prepare('UPDATE notes SET superseded_by = NULL, contested = 0 WHERE id = ?').run(Number(note.id));
-    s.db.prepare('UPDATE notes SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL')
+    prepareCached(s.db, 'UPDATE notes SET superseded_by = NULL, contested = 0 WHERE id = ?').run(Number(note.id));
+    prepareCached(s.db, 'UPDATE notes SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL')
       .run(now(), Number(replacement.id));
     return { restored: true, replacementId: Number(replacement.id) };
   });
@@ -2080,7 +2137,7 @@ async function vectorSearch(s, queryText, limit, scope, candidates = []) {
     // read every vector in the table.
     const sampleIds = [];
     try {
-      for (const row of s.db.prepare(`
+      for (const row of prepareCached(s.db, `
         SELECT owner_id FROM vectors WHERE kind = ? AND dim = ?
         ORDER BY owner_id DESC LIMIT ?
       `).all(spec.kind, dim, VECTOR_SAMPLE)) sampleIds.push(Number(row.owner_id));
@@ -2092,7 +2149,7 @@ async function vectorSearch(s, queryText, limit, scope, candidates = []) {
       const chunk = ids.slice(offset, offset + 500);
       const placeholders = chunk.map(() => '?').join(',');
       try {
-        for (const row of s.db.prepare(`
+        for (const row of prepareCached(s.db, `
           SELECT v.owner_id AS owner_id, v.vec AS vec, t.*
           FROM vectors v JOIN ${spec.table} t ON t.id = v.owner_id
           WHERE v.kind = ? AND v.dim = ? AND v.owner_id IN (${placeholders})
@@ -2162,7 +2219,7 @@ const ENTITY_CACHE_MS = 30_000;
 function markContradictions(s, noteId, text, explicit, scope = null) {
   const ids = new Set();
   const scopeFilter = scope ? 'AND scope = ?' : '';
-  const exists = s.db.prepare(`SELECT id FROM notes WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL ${scopeFilter}`);
+  const exists = prepareCached(s.db, `SELECT id FROM notes WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL ${scopeFilter}`);
   for (const value of Array.isArray(explicit) ? explicit : []) {
     const id = Number(value);
     if (!Number.isFinite(id) || id <= 0 || id === noteId) continue;
@@ -2172,19 +2229,39 @@ function markContradictions(s, noteId, text, explicit, scope = null) {
   }
   try {
     const vector = embedText(text);
-    const rows = s.db.prepare(`
-      SELECT id, text FROM notes
-      WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0 AND id != ? ${scopeFilter}
-      ORDER BY ts DESC LIMIT 500
-    `).all(...(scope ? [noteId, scope] : [noteId]));
+    const hashed = backendConfig().kind === 'hashed';
+    let rows;
+    if (hashed) {
+      const aliasScope = scope ? 'AND n.scope = ?' : '';
+      // The candidate's note vector is already stored by upsertVector before
+      // this call. Re-tokenising 500 old notes on every write was the dominant
+      // write cost; read their stored vectors instead and fall back only for
+      // rows that have no compatible vector yet.
+      rows = prepareCached(s.db, `
+        SELECT n.id AS id, n.text AS text, v.vec AS vec
+        FROM notes n
+        LEFT JOIN vectors v
+          ON v.kind = 'note' AND v.owner_id = n.id AND v.dim = ?
+        WHERE n.deleted_at IS NULL AND n.superseded_by IS NULL
+          AND n.contested = 0 AND n.id != ? ${aliasScope}
+        ORDER BY n.ts DESC LIMIT 500
+      `).all(DIM, noteId, ...(scope ? [scope] : []));
+    } else {
+      rows = prepareCached(s.db, `
+        SELECT id, text FROM notes
+        WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0 AND id != ? ${scopeFilter}
+        ORDER BY ts DESC LIMIT 500
+      `).all(...(scope ? [noteId, scope] : [noteId]));
+    }
     for (const row of rows) {
       const id = Number(row.id);
       if (ids.has(id)) continue;
-      if (dot(vector, embedText(row.text)) >= CONTRADICTION_COSINE) ids.add(id);
+      const candidate = hashed && row.vec ? fromBlob(row.vec, DIM) : embedText(row.text);
+      if (dot(vector, candidate) >= CONTRADICTION_COSINE) ids.add(id);
     }
   } catch { /* similarity flagging is best effort */ }
   if (ids.size) {
-    const mark = s.db.prepare('UPDATE notes SET contested = 1 WHERE id = ? AND deleted_at IS NULL');
+    const mark = prepareCached(s.db, 'UPDATE notes SET contested = 1 WHERE id = ? AND deleted_at IS NULL');
     for (const id of ids) mark.run(id);
     mark.run(noteId);
   }
@@ -2197,7 +2274,7 @@ function entityNames(s) {
   if (entityCache.at > 0 && now() - entityCache.at < ENTITY_CACHE_MS) return entityCache.names;
   let names = [];
   try {
-    names = s.db.prepare('SELECT name FROM entities LIMIT 5000').all()
+    names = prepareCached(s.db, 'SELECT name FROM entities LIMIT 5000').all()
       .map(row => String(row.name ?? ''))
       .filter(Boolean);
   } catch { names = []; }
@@ -2237,7 +2314,7 @@ function graphExpand(s, hits, limit, scope) {
       let rows = [];
       const edgeScope = scopeClause('scope', scope);
       try {
-        rows = s.db.prepare(`
+        rows = prepareCached(s.db, `
           SELECT src, rel, dst FROM edges
           WHERE (src = ? OR dst = ?) AND (valid_to IS NULL OR valid_to > ?)
           ${edgeScope.sql}
@@ -2292,7 +2369,7 @@ function graphExpand(s, hits, limit, scope) {
   for (const edge of discovered) {
     if (out.length >= limit) break;
     try {
-      const row = s.db.prepare(`
+      const row = prepareCached(s.db, `
         SELECT * FROM facts
         WHERE deleted_at IS NULL AND valid_to IS NULL
           AND subject = ? AND relation = ? AND object = ?
@@ -2409,7 +2486,7 @@ function profileFactLines(db, scopeKey, budget) {
       : "AND (scope = ? OR scope = 'global' OR scope IS NULL)";
   let rows;
   try {
-    rows = db.prepare(`
+    rows = prepareCached(db, `
       SELECT subject, relation, object FROM facts
       WHERE deleted_at IS NULL AND valid_to IS NULL ${filter}
       ORDER BY confidence DESC, valid_from DESC LIMIT 40
@@ -2443,7 +2520,7 @@ const PERSONA_MAX_TOTAL = 4000;
 
 function personaGet(db) {
   try {
-    const rows = db.prepare('SELECT key, value FROM persona ORDER BY key').all();
+    const rows = prepareCached(db, 'SELECT key, value FROM persona ORDER BY key').all();
     const out = {};
     for (const row of rows) out[String(row.key)] = String(row.value);
     return out;
@@ -2475,7 +2552,7 @@ function personaSet(db, input, options = {}) {
   const values = personaNormalize(input);
   transaction(db, () => {
     if (options.replace !== false) db.exec('DELETE FROM persona');
-    const insert = db.prepare(`
+    const insert = prepareCached(db, `
       INSERT INTO persona(key, value, updated_at) VALUES (?, ?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
     `);
@@ -2490,7 +2567,7 @@ function personaEvidence(db) {
   const facts = [];
   const technical = /(插件|面板|schema|ADR|memory_|测试|路由|接口|迁移|数据库|函数|字段|版本|用例|构建|HTTP)/i;
   try {
-    const rows = db.prepare(`
+    const rows = prepareCached(db, `
       SELECT text FROM notes
       WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0
         AND (scope = 'global' OR scope IS NULL)
@@ -2502,7 +2579,7 @@ function personaEvidence(db) {
     }
   } catch { /* ignore */ }
   try {
-    const rows = db.prepare(`
+    const rows = prepareCached(db, `
       SELECT subject, relation, object FROM facts
       WHERE deleted_at IS NULL AND valid_to IS NULL
         AND (scope = 'global' OR scope IS NULL)
@@ -2512,7 +2589,7 @@ function personaEvidence(db) {
   } catch { /* ignore */ }
   const utterances = [];
   try {
-    const rows = db.prepare(`
+    const rows = prepareCached(db, `
       SELECT text FROM chunks
       WHERE role = 'user' AND deleted_at IS NULL
         AND (scope = 'global' OR scope IS NULL)
@@ -2723,7 +2800,7 @@ function buildProfileText(projectKey) {
   const noteScope = projectKey
     ? "AND (scope = 'global' OR scope IS NULL OR scope = ?)"
     : "AND (scope = 'global' OR scope IS NULL)";
-  const rows = s.db.prepare(
+  const rows = prepareCached(s.db,
     `SELECT id, text, importance, scope FROM notes
      WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0
        AND COALESCE(solution_status, 'unverified') NOT IN ('failed', 'expired') ${noteScope}
@@ -3021,14 +3098,14 @@ function defineTools(ctx) {
           // Re-read under the write lock. Otherwise two hosts can both see "no
           // current value" and insert two active facts for a single-cardinality
           // relation -- a contradiction the store would then have to untangle.
-          const current = s.db.prepare(`
+          const current = prepareCached(s.db, `
             SELECT id, object, scope FROM facts
             WHERE subject = ? AND relation = ? AND valid_to IS NULL AND deleted_at IS NULL
               AND ${scopeFilter}
           `).all(subject, relation, ...(factScope === SCOPE_GLOBAL ? [] : [factScope]));
           if (requested) setRelationCardinality(s.db, relation, requested);
           const insertFact = () => {
-            const info = s.db.prepare(`
+            const info = prepareCached(s.db, `
               INSERT INTO facts(subject, relation, object, text, valid_from, valid_to, recorded_at, confidence, source, scope, cardinality)
               VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
             `).run(
@@ -3038,15 +3115,15 @@ function defineTools(ctx) {
             const factId = Number(info.lastInsertRowid);
             if (s.fts.facts) {
               try {
-                s.db.prepare('INSERT INTO facts_fts(rowid, text) VALUES (?, ?)')
+                prepareCached(s.db, 'INSERT INTO facts_fts(rowid, text) VALUES (?, ?)')
                   .run(factId, text || `${subject} ${relation} ${object}`);
               } catch { /* index write is best effort */ }
             }
             indexBigrams(s.db, 'fact', factId, text || `${subject} ${relation} ${object}`);
             upsertVector(s, 'fact', factId, text || `${subject} ${relation} ${object}`);
-            s.db.prepare('INSERT OR IGNORE INTO entities(name) VALUES (?)').run(subject);
-            if (object && object.length <= 80) s.db.prepare('INSERT OR IGNORE INTO entities(name) VALUES (?)').run(object);
-            s.db.prepare('INSERT INTO edges(src, rel, dst, valid_from, scope, source) VALUES (?, ?, ?, ?, ?, ?)')
+            prepareCached(s.db, 'INSERT OR IGNORE INTO entities(name) VALUES (?)').run(subject);
+            if (object && object.length <= 80) prepareCached(s.db, 'INSERT OR IGNORE INTO entities(name) VALUES (?)').run(object);
+            prepareCached(s.db, 'INSERT INTO edges(src, rel, dst, valid_from, scope, source) VALUES (?, ?, ?, ?, ?, ?)')
               .run(subject, relation, object, ts, factScope, args.source ?? null);
             return factId;
           };
@@ -3055,17 +3132,17 @@ function defineTools(ctx) {
             // a repeated identical value as the same fact rather than a new one.
             const same = current.find(row => String(row.object ?? '') === object);
             if (same) {
-              s.db.prepare('UPDATE facts SET recorded_at = ?, source = COALESCE(?, source) WHERE id = ?')
+              prepareCached(s.db, 'UPDATE facts SET recorded_at = ?, source = COALESCE(?, source) WHERE id = ?')
                 .run(ts, args.source ?? null, Number(same.id));
               return { factId: Number(same.id), deduped: true, invalidated: 0 };
             }
             return { factId: insertFact(), deduped: false, invalidated: 0 };
           }
           for (const row of current) {
-            s.db.prepare('UPDATE facts SET valid_to = ? WHERE id = ?').run(ts, Number(row.id));
+            prepareCached(s.db, 'UPDATE facts SET valid_to = ? WHERE id = ?').run(ts, Number(row.id));
             // Edges are the graph projection of a fact. If the fact stops being
             // current, the edge must stop being traversable too.
-            s.db.prepare(`
+            prepareCached(s.db, `
               UPDATE edges SET valid_to = ?
               WHERE src = ? AND rel = ? AND dst = ? AND valid_to IS NULL
                 AND (scope = ? OR scope IS NULL)
@@ -3119,12 +3196,12 @@ function defineTools(ctx) {
       for (const value of Array.isArray(args.contradicts) ? args.contradicts : []) {
         const id = Number(value);
         const ok = Number.isFinite(id) && id > 0 && id !== 0
-          && s.db.prepare('SELECT id FROM notes WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL AND scope = ?').get(id, scope);
+          && prepareCached(s.db, 'SELECT id FROM notes WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL AND scope = ?').get(id, scope);
         if (!ok) invalidContradicts.push(value);
       }
       // Scope is part of a note's identity: the same wording in two layers is two
       // deliberate records (a global rule and its project-specific restatement).
-      const prev = s.db.prepare(
+      const prev = prepareCached(s.db,
         'SELECT id, problem_key, solution_status, evidence FROM notes WHERE scope = ? AND text = ? AND deleted_at IS NULL AND superseded_by IS NULL'
       ).get(scope, text);
       if (prev) {
@@ -3146,7 +3223,7 @@ function defineTools(ctx) {
         }
         if (updates.length) {
           transaction(s.db, () => {
-            s.db.prepare(`UPDATE notes SET ${updates.join(', ')} WHERE id = ?`).run(...values, Number(prev.id));
+            prepareCached(s.db, `UPDATE notes SET ${updates.join(', ')} WHERE id = ?`).run(...values, Number(prev.id));
           });
           invalidateProfile();
         }
@@ -3160,18 +3237,18 @@ function defineTools(ctx) {
           ...(scopeNew ? { scopeNew: true } : {}),
           problemKey: problemKey || prev.problem_key || null,
           solutionStatus: solutionStatusOf(requestedStatus ?? prev.solution_status),
-          reuseCount: Number(s.db.prepare('SELECT reuse_count FROM notes WHERE id = ?').get(Number(prev.id))?.reuse_count ?? 0),
+          reuseCount: Number(prepareCached(s.db, 'SELECT reuse_count FROM notes WHERE id = ?').get(Number(prev.id))?.reuse_count ?? 0),
         };
       }
       const result = transaction(s.db, () => {
         // Re-check inside the write transaction. Two hosts can both miss the
         // earlier lookup and then queue up here; the loser of the race would
         // otherwise insert a second identical note.
-        const raced = s.db.prepare(
+        const raced = prepareCached(s.db,
           'SELECT id FROM notes WHERE scope = ? AND text = ? AND deleted_at IS NULL AND superseded_by IS NULL'
         ).get(scope, text);
         if (raced) return { noteId: Number(raced.id), raced: true, contestedWith: [] };
-        const info = s.db.prepare(`
+        const info = prepareCached(s.db, `
           INSERT INTO notes(
             ts, scope, text, importance, source, problem_key, solution_status,
             solution_verified_at, reuse_count, last_used_at, evidence
@@ -3185,7 +3262,7 @@ function defineTools(ctx) {
         const noteId = Number(info.lastInsertRowid);
         if (s.fts.notes) {
           try {
-            s.db.prepare('INSERT INTO notes_fts(rowid, text) VALUES (?, ?)')
+            prepareCached(s.db, 'INSERT INTO notes_fts(rowid, text) VALUES (?, ?)')
               .run(noteId, text);
           } catch { /* index write is best effort */ }
         }
@@ -3207,7 +3284,7 @@ function defineTools(ctx) {
         if (evidence) { updates.push('evidence = ?'); values.push(evidence); }
         if (updates.length) {
           transaction(s.db, () => {
-            s.db.prepare(`UPDATE notes SET ${updates.join(', ')} WHERE id = ?`).run(...values, result.noteId);
+            prepareCached(s.db, `UPDATE notes SET ${updates.join(', ')} WHERE id = ?`).run(...values, result.noteId);
           });
         }
         invalidateProfile();
@@ -3386,7 +3463,7 @@ function defineTools(ctx) {
         throw new Error('outcome must be success, failed, or expired');
       }
       const s = openStore();
-      const note = s.db.prepare(`
+      const note = prepareCached(s.db, `
         SELECT id, solution_status, reuse_count, problem_key
         FROM notes WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL
       `).get(id);
@@ -3394,7 +3471,7 @@ function defineTools(ctx) {
       const ts = now();
       const status = outcome === 'success' ? 'verified' : outcome === 'failed' ? 'failed' : 'expired';
       transaction(s.db, () => {
-        s.db.prepare(`
+        prepareCached(s.db, `
           UPDATE notes
           SET solution_status = ?, reuse_count = reuse_count + 1,
             last_used_at = ?, solution_verified_at = ?, evidence = COALESCE(?, evidence)
@@ -3402,7 +3479,7 @@ function defineTools(ctx) {
         `).run(status, ts, outcome === 'success' ? ts : null, String(args.evidence ?? '').trim() || null, id);
       });
       invalidateProfile();
-      const updated = s.db.prepare(`
+      const updated = prepareCached(s.db, `
         SELECT solution_status, reuse_count, last_used_at, solution_verified_at
         FROM notes WHERE id = ?
       `).get(id);
@@ -3441,9 +3518,9 @@ function defineTools(ctx) {
         return { processed: 0, queued: 0, backend: config.kind, bigrams };
       }
       if (config.kind === 'hashed') {
-        const before = Number(s.db.prepare('SELECT COUNT(*) AS n FROM vectors').get().n);
+        const before = Number(prepareCached(s.db, 'SELECT COUNT(*) AS n FROM vectors').get().n);
         backfillVectors(s.db, { limit });
-        const after = Number(s.db.prepare('SELECT COUNT(*) AS n FROM vectors').get().n);
+        const after = Number(prepareCached(s.db, 'SELECT COUNT(*) AS n FROM vectors').get().n);
         return { processed: Math.max(0, after - before), queued: 0, backend: 'hashed', ...(bigrams ? { bigrams } : {}) };
       }
       const dim = await ensureRemoteDim(s);
@@ -3675,7 +3752,7 @@ function defineTools(ctx) {
       const requested = String(args.scope ?? '').trim();
       const scope = requested === 'all' ? null : (requested || currentProject(toolContext) || SCOPE_GLOBAL);
       const filter = scope ? scopeClause('scope', scope) : { sql: '', params: [] };
-      const rows = s.db.prepare(`
+      const rows = prepareCached(s.db, `
         SELECT id, text, importance, source, scope FROM notes
         WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0
           AND COALESCE(solution_status, 'unverified') NOT IN ('failed', 'expired') ${filter.sql}
@@ -3693,10 +3770,10 @@ function defineTools(ctx) {
         used += line.length;
         picked.push({ id: null, text: line === '相关事实：' ? line : line, scope: 'facts' });
       }
-      const count = table => Number(s.db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE deleted_at IS NULL`).get().n);
+      const count = table => Number(prepareCached(s.db, `SELECT COUNT(*) AS n FROM ${table} WHERE deleted_at IS NULL`).get().n);
       const stats = {
         notes: count('notes'),
-        facts: Number(s.db.prepare('SELECT COUNT(*) AS n FROM facts WHERE deleted_at IS NULL AND valid_to IS NULL').get().n),
+        facts: Number(prepareCached(s.db, 'SELECT COUNT(*) AS n FROM facts WHERE deleted_at IS NULL AND valid_to IS NULL').get().n),
         chunks: count('chunks'),
         db: path.basename(DB_FILE),
         fts: s.ftsMode,
@@ -3751,7 +3828,7 @@ function defineTools(ctx) {
       const scope = requested === 'all' ? null : (requested || currentProject(toolContext) || SCOPE_GLOBAL);
       const factFilter = scope ? scopeClause('scope', scope) : { sql: '', params: [] };
       const noteFilter = scope ? scopeClause('scope', scope, false) : { sql: '', params: [] };
-      const facts = s.db.prepare(`
+      const facts = prepareCached(s.db, `
         SELECT * FROM facts
         WHERE (subject = ? OR object LIKE ? OR object LIKE ?) AND deleted_at IS NULL ${factFilter.sql}
         ORDER BY valid_from ASC LIMIT 50
@@ -3763,7 +3840,7 @@ function defineTools(ctx) {
         validFrom: Number(row.valid_from),
         validTo: row.valid_to === null ? null : Number(row.valid_to),
       }));
-      const notes = s.db.prepare(`
+      const notes = prepareCached(s.db, `
         SELECT id, ts, text, scope FROM notes
         WHERE deleted_at IS NULL AND text LIKE ? ${noteFilter.sql}
         ORDER BY ts ASC LIMIT 30
@@ -3877,15 +3954,15 @@ function defineTools(ctx) {
       const s = openStore();
       const keep = Math.max(50, Number(args.keepChunks ?? 5000) || 5000);
       const apply = args.apply === true;
-      const total = Number(s.db.prepare('SELECT COUNT(*) AS n FROM chunks WHERE deleted_at IS NULL').get().n);
+      const total = Number(prepareCached(s.db, 'SELECT COUNT(*) AS n FROM chunks WHERE deleted_at IS NULL').get().n);
       const excess = Math.max(0, total - keep);
       let tombstoned = 0;
       if (apply && excess > 0) {
         transaction(s.db, () => {
-          const rows = s.db.prepare(
+          const rows = prepareCached(s.db,
             'SELECT id FROM chunks WHERE deleted_at IS NULL ORDER BY ts ASC, id ASC LIMIT ?'
           ).all(excess);
-          const stmt = s.db.prepare('UPDATE chunks SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL');
+          const stmt = prepareCached(s.db, 'UPDATE chunks SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL');
           for (const row of rows) tombstoned += Number(stmt.run(now(), Number(row.id)).changes);
         });
       }
@@ -3999,20 +4076,20 @@ function registerRoutes(ctx) {
         scopeSql = "AND (scope = ? OR scope = 'global' OR scope IS NULL)";
         scopeParams = [scopeFilter];
       }
-      const notes = s.db.prepare(`
+      const notes = prepareCached(s.db, `
         SELECT id, ts, scope, text, importance, source, revision, contested,
                superseded_by, verification, verified_at, evidence, deleted_at,
                problem_key, solution_status, solution_verified_at, reuse_count, last_used_at
         FROM notes WHERE 1 = 1 ${deletedActive} ${noteActive} ${scopeSql}
         ORDER BY importance DESC, ts DESC LIMIT ? OFFSET ?
       `).all(...scopeParams, limit, offset);
-      const facts = s.db.prepare(`
+      const facts = prepareCached(s.db, `
         SELECT id, subject, relation, object, text, confidence, source,
                valid_from, valid_to, contested, scope, deleted_at
         FROM facts WHERE 1 = 1 ${deletedActive} ${factActive} ${scopeSql}
         ORDER BY valid_from DESC LIMIT ? OFFSET ?
       `).all(...scopeParams, limit, offset);
-      const count = (table, extra = '', params = []) => Number(s.db.prepare(
+      const count = (table, extra = '', params = []) => Number(prepareCached(s.db,
         `SELECT COUNT(*) AS n FROM ${table} WHERE deleted_at IS NULL ${extra}`
       ).get(...params).n);
       const totalNotes = count('notes', `${noteActive} ${scopeSql}`, scopeParams);
@@ -4030,13 +4107,13 @@ function registerRoutes(ctx) {
         entry.lastAt = Math.max(entry.lastAt, Number(lastAt ?? 0));
         projects.set(scope, entry);
       };
-      for (const row of s.db.prepare(
+      for (const row of prepareCached(s.db,
         "SELECT scope, COUNT(*) AS n, MAX(ts) AS last FROM notes WHERE deleted_at IS NULL AND superseded_by IS NULL AND scope LIKE 'proj:%' GROUP BY scope"
       ).all()) bump(row.scope, 'notes', row.n, row.last);
-      for (const row of s.db.prepare(
+      for (const row of prepareCached(s.db,
         "SELECT scope, COUNT(*) AS n, MAX(valid_from) AS last FROM facts WHERE deleted_at IS NULL AND valid_to IS NULL AND scope LIKE 'proj:%' GROUP BY scope"
       ).all()) bump(row.scope, 'facts', row.n, row.last);
-      for (const row of s.db.prepare(
+      for (const row of prepareCached(s.db,
         "SELECT scope, COUNT(*) AS n, MAX(ts) AS last FROM chunks WHERE deleted_at IS NULL AND scope LIKE 'proj:%' GROUP BY scope"
       ).all()) bump(row.scope, 'chunks', row.n, row.last);
 
@@ -4044,7 +4121,7 @@ function registerRoutes(ctx) {
       // summarized work is visible instead of an empty list.
       let chunks = [];
       if (scopeFilter !== 'all' && scopeFilter !== 'global' && scopeFilter !== 'project') {
-        chunks = s.db.prepare(`
+        chunks = prepareCached(s.db, `
           SELECT id, ts, role, source, text, deleted_at FROM chunks
           WHERE deleted_at IS NULL AND scope = ?
           ORDER BY ts DESC LIMIT 20
@@ -4143,7 +4220,7 @@ function registerRoutes(ctx) {
 
       // Facts become stars joined by their relation; scoped so a project map only
       // ever shows its own constellation.
-      const facts = s.db.prepare(`
+      const facts = prepareCached(s.db, `
         SELECT subject, relation, object, scope FROM facts
         WHERE deleted_at IS NULL AND valid_to IS NULL ${clause.sql}
         ORDER BY confidence DESC, valid_from DESC LIMIT 500
@@ -4170,7 +4247,7 @@ function registerRoutes(ctx) {
       }
 
       // Notes are bright stars attached to the entities they mention.
-      const notes = s.db.prepare(`
+      const notes = prepareCached(s.db, `
         SELECT id, text, scope, importance FROM notes
         WHERE deleted_at IS NULL AND superseded_by IS NULL ${clause.sql}
         ORDER BY importance DESC, ts DESC LIMIT 120
@@ -4190,10 +4267,10 @@ function registerRoutes(ctx) {
         entry[field] = Number(count);
         scopes.set(key, entry);
       };
-      for (const row of s.db.prepare(
+      for (const row of prepareCached(s.db,
         "SELECT COALESCE(scope, 'global') AS scope, COUNT(*) AS n FROM facts WHERE deleted_at IS NULL AND valid_to IS NULL GROUP BY COALESCE(scope, 'global')"
       ).all()) bump(row.scope, 'facts', row.n);
-      for (const row of s.db.prepare(
+      for (const row of prepareCached(s.db,
         "SELECT COALESCE(scope, 'global') AS scope, COUNT(*) AS n FROM notes WHERE deleted_at IS NULL AND superseded_by IS NULL GROUP BY COALESCE(scope, 'global')"
       ).all()) bump(row.scope, 'notes', row.n);
 
@@ -4232,7 +4309,7 @@ function registerRoutes(ctx) {
       if (node.startsWith('n:')) {
         const id = Number(node.slice(2));
         if (!Number.isFinite(id)) return json(res, 400, { ok: false });
-        const row = s.db.prepare(`
+        const row = prepareCached(s.db, `
           SELECT * FROM notes
           WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL ${noteFilter.sql}
         `).get(id, ...noteFilter.params);
@@ -4262,7 +4339,7 @@ function registerRoutes(ctx) {
       if (node.startsWith('e:')) {
         const name = node.slice(2).trim();
         if (!name) return json(res, 400, { ok: false });
-        const facts = s.db.prepare(`
+        const facts = prepareCached(s.db, `
           SELECT subject, relation, object, scope, confidence, valid_from FROM facts
           WHERE deleted_at IS NULL AND valid_to IS NULL AND (subject = ? OR object = ?)
           ${factFilter.sql}
@@ -4404,7 +4481,7 @@ function registerRoutes(ctx) {
     handler: async (req, res) => {
       if (!isLoopback(req)) return json(res, 403, { ok: false });
       const s = openStore();
-      const count = table => Number(s.db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE deleted_at IS NULL`).get().n);
+      const count = table => Number(prepareCached(s.db, `SELECT COUNT(*) AS n FROM ${table} WHERE deleted_at IS NULL`).get().n);
       return json(res, 200, {
         ok: true,
         autoRecall: autoRecallEnabled(),
@@ -4418,10 +4495,10 @@ function registerRoutes(ctx) {
         },
         stats: {
           notes: count('notes'),
-          facts: Number(s.db.prepare('SELECT COUNT(*) AS n FROM facts WHERE deleted_at IS NULL AND valid_to IS NULL').get().n),
+          facts: Number(prepareCached(s.db, 'SELECT COUNT(*) AS n FROM facts WHERE deleted_at IS NULL AND valid_to IS NULL').get().n),
           chunks: count('chunks'),
-          contested: Number(s.db.prepare('SELECT COUNT(*) AS n FROM notes WHERE deleted_at IS NULL AND contested = 1').get().n),
-          verified: Number(s.db.prepare('SELECT COUNT(*) AS n FROM notes WHERE deleted_at IS NULL AND verification IS NOT NULL').get().n),
+          contested: Number(prepareCached(s.db, 'SELECT COUNT(*) AS n FROM notes WHERE deleted_at IS NULL AND contested = 1').get().n),
+          verified: Number(prepareCached(s.db, 'SELECT COUNT(*) AS n FROM notes WHERE deleted_at IS NULL AND verification IS NOT NULL').get().n),
         },
       });
     },

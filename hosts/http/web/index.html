@@ -35,11 +35,9 @@
   </section>
 
   <section class="panel" id="panel-map">
-    <div class="toolbar">
-      <select id="mapScope"><option value="all">全部层级</option></select>
-      <span class="hint" id="mapHint">拖拽平移，滚轮缩放，点击节点查看详情</span>
+    <div class="canvas-wrap map-wrap">
+      <iframe id="starFrame" data-src="/star-map.html?embed=1" title="记忆星图" allow="fullscreen"></iframe>
     </div>
-    <div class="canvas-wrap"><canvas id="map"></canvas></div>
   </section>
 
   <section class="panel" id="panel-rules">
