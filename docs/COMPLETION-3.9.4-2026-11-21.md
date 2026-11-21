@@ -64,6 +64,8 @@ CREATE INDEX scope_aliases_canonical ON scope_aliases(canonical);
 
 - `npm test`：**288/288**（新增 3 个 scope alias 用例）。
 - `npm run check`：`288 tests, 23 tools, 20 routes, 31 ADRs, version 3.9.4`；`semantic assets OK: 11 files, 37.5 MiB`。
+- `npm run bench:golden`：词面 0.776 / hashed 混合 0.927 / 四路完整 0.979，`pass:true`（与 3.9.3 一致，P1 不改检索路线）。
+- `npm pack --dry-run`：`@local/omni-memory@3.9.4`，87 entries，18.4 MB 压缩、41.0 MB 解包；复核报告与 `GAP-REVIEW`/`INTEGRATION-PROBE` 已从包内排除。
 - `node --check index.js` 通过。
 - 副本迁移与重开幂等通过。
 
@@ -75,5 +77,6 @@ CREATE INDEX scope_aliases_canonical ON scope_aliases(canonical);
 
 ## 发布
 
-- 功能提交与文档提交按仓库惯例提交到 `main`；GitHub smart protocol 在本机不可达时继续使用 Git Data API。
-- 7788 服务由隐藏计划任务 `OmniMemory7788` 静默拉起；部署后重新做 health 与 `--scope project` 验证。
+- 功能提交 `97c81a8`（`feat: normalize project keys across platforms (3.9.4)`），已推送 `origin/main`；本次文档状态修订随后提交。
+- 7788 服务由隐藏计划任务 `OmniMemory7788` 静默拉起，当前 `health` 返回 `version:"3.9.4"`、`project:"proj:全息记忆#30534c"`、`tools:25`；node 与 PowerShell 宿主 `MainWindowTitle` 均为空。
+- 真实库已迁移：旧键 `deff23` → `30534c`，`notes` 40 行、`facts` 12 行、`edges` 12 行保留；`--scope project` 命中。
