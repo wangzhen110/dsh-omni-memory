@@ -55,15 +55,17 @@ omni scope-alias --list
 - `npm run bench:golden`：`pass:true`；检索链路未改，指标与 3.9.4 基线一致。
 - `npm pack --dry-run`：`local-omni-memory-3.9.5.tgz`，90 entries，18.4 MB 压缩 / 41.0 MB 解包；GAP/INTEGRATION-PROBE/RECHECK-3.9.2/3.9.3 未入包。
 
-## 后续测试加固（同日）
+## 后续测试加固（同日，至 335 用例）
 
-3.9.5 发布后补了一层属性测试防护网，不改运行时、不改检索逻辑：
+3.9.5 发布后补了两层测试防护网，不改运行时、不改检索逻辑：
 
-- 新增 `test/property.test.mjs`、`test/property-reliability.test.mjs`、`test/fuzz-inputs.test.mjs`、`test/property-ranking.test.mjs`、`test/property-concurrency.test.mjs`、`test/property-scope-alias.test.mjs`，共 24 条不变量/模糊属性。
-- `fast-check` 只进入 `devDependencies`（`^4.10.3`），运行时 `dependencies` 仍为空；新增 `package-lock.json` 固化测试依赖。
-- 完整 `npm test` **313/313**；`npm run check` 同步为 313 / 23 内核工具 / 25 MCP 工具 / 20 路由 / 31 ADR / 3.9.5；`bench:golden` 仍 `pass:true`。
-- 5 组变异测试验证属性有效：禁用 scope 隔离、跳过 amend 派生清理、去掉拆句去重、反转 exact 排序、去掉平台大小写归一，均能命中对应属性；源码变异已还原。
+- 属性层：新增 `test/property.test.mjs`、`test/property-reliability.test.mjs`、`test/fuzz-inputs.test.mjs`、`test/property-ranking.test.mjs`、`test/property-concurrency.test.mjs`、`test/property-scope-alias.test.mjs`，共 24 条不变量/模糊属性。
+- 回归层：新增 `test/fault-injection.test.mjs`（FTS/bigram/vector/edge 缺失或损坏、写锁、semantic 降级）、`test/semantic-reliability-regression.test.mjs`（GC 错误字段、队列丢弃、scope-alias CLI、冷却期早退后回填）、`test/http-security.test.mjs`（路径穿越、非 loopback、Origin/CSRF、超大 body）；`test/rerank.test.mjs` +5、`test/embed-provider.test.mjs` +3。合计新增 22 条，总数 313 → 335。
+- `fast-check` 只进入 `devDependencies`（`^4.10.3`），运行时 `dependencies` 仍为空；`package-lock.json` 固化测试依赖。
+- 完整 `npm test` **335/335**；`npm run check` 同步为 335 / 23 内核工具 / 25 MCP 工具 / 20 路由 / 31 ADR / 3.9.5；`bench:golden` 仍 `pass:true`。
+- 6 组变异测试验证属性有效：禁用 scope 隔离、跳过 amend 派生清理、去掉拆句去重、反转 exact 排序、去掉平台大小写归一、把冷却期早退改回旧 bug，均能命中对应测试；源码变异已还原。
 - 跨进程验证：两个独立 node 进程共享隔离库，进程 A 写/墓碑后退出，进程 B 冷启动清扫，死行派生索引为 0、活行不受损、GC marker=15 且无错误。
+- 本轮实测边界：HTTP 超大 body 走断连而非显式 413；MCP over HTTP 无 Origin 时的 CSRF 放行比 REST 宽；`vectorDropped` 阈值未导出，队列满字段只做存在性/初值断言；启用语义模型后的故障降级仍未自动化。以上均未改运行时源码，未指向生产库。
 
 ## 未纳入
 

@@ -136,3 +136,70 @@ test('inputs are split into provider-sized batches', async () => {
     await provider.close();
   }
 });
+
+// --- failure matrix: previously verified only by hand ---
+
+test('embedRemote stops after the retry limit on persistent 5xx and calls fetch retries+1 times', async () => {
+  const retries = 2;
+  let calls = 0;
+  const fakeFetch = async () => {
+    calls += 1;
+    return { ok: false, status: 503, async json() { return {}; } };
+  };
+  await assert.rejects(
+    () => embedRemote(['a'], {
+      url: 'http://x', model: 'm', key: '', timeoutMs: 1000, batch: 64, retries,
+    }, fakeFetch),
+    /embeddings responded 503/,
+  );
+  assert.equal(calls, retries + 1, 'a permanent 5xx must be retried exactly `retries` times, then give up');
+});
+
+test('embedRemote aborts the whole call when one batch fails (no partial results)', async () => {
+  // Implementation detail (per lib/embed-provider.mjs): batches are processed
+  // sequentially and the function returns only after every batch succeeds. A
+  // permanently failed batch throws out of embedRemote, discarding vectors
+  // already produced by earlier batches — there is no partial-result mode.
+  let calls = 0;
+  const fakeFetch = async (url, init) => {
+    calls += 1;
+    const { input } = JSON.parse(init.body);
+    if (input[0] === 'bad') return { ok: false, status: 400, async json() { return {}; } };
+    return {
+      ok: true,
+      status: 200,
+      async json() { return { data: input.map(() => ({ embedding: [1, 0] })) }; },
+    };
+  };
+  await assert.rejects(
+    () => embedRemote(['ok1', 'bad', 'never-reached'], {
+      url: 'http://x', model: 'm', key: '', timeoutMs: 1000, batch: 1, retries: 2,
+    }, fakeFetch),
+    /embeddings responded 400/,
+  );
+  assert.equal(calls, 2, 'first batch succeeds, second fails permanently, third is never attempted');
+});
+
+test('embedRemote surfaces an AbortError from a real AbortSignal timeout', async () => {
+  let calls = 0;
+  let seenSignal;
+  const fakeFetch = (url, init) => {
+    calls += 1;
+    seenSignal = init.signal;
+    return new Promise((resolve, reject) => {
+      init.signal.addEventListener('abort', () => {
+        const error = new Error('The operation was aborted');
+        error.name = 'AbortError';
+        reject(error);
+      });
+    });
+  };
+  await assert.rejects(
+    () => embedRemote(['a'], {
+      url: 'http://x', model: 'm', key: '', timeoutMs: 20, batch: 64, retries: 0,
+    }, fakeFetch),
+    error => error?.name === 'AbortError',
+  );
+  assert.equal(seenSignal.aborted, true, 'the real AbortSignal must be aborted by the timeout');
+  assert.equal(calls, 1, 'with retries=0 the AbortError is surfaced on the first attempt');
+});

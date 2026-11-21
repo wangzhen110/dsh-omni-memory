@@ -151,3 +151,42 @@ fast-check 4.x 中，**异步断言函数必须用 `fc.asyncProperty`，不能�
 ## 结论
 
 累计投入 1 个测试期依赖（`fast-check`，运行时 `dependencies` 仍为空），换来 **24 条不变量/模糊属性**（核心、可靠性、fuzz、排序、并发、alias 六维）的持续守护，5 组变异测试证明它们对真实回归敏感。全程只读源码（仅变异测试临时改动并已还原），未碰生产库，检索质量与零依赖运行时不受影响。这是审计工具清单中落地收益最高、代价最小的一步。未发现新的 P0/P1 缺陷——本轮是「加固防护网」，不是「修 bug」。
+
+## 第四轮：把“列为后续”的缺口补做（2026-11-21，同日）
+
+用户指出：既然要求“全面检测”，就不该把剩余缺口只列成后续优先级。本轮把能稳定自动化的部分一次补完，不依赖外部环境。
+
+### 新增 22 条用例
+
+| 文件 | 条数 | 覆盖 |
+|---|---:|---|
+| `test/fault-injection.test.mjs`（新） | 6 | 删除/破坏 `notes_fts`、删除 `bigrams`/`vectors`、删除 `edges`、第二连接写锁、`semantic_vectors` 缺失后的降级与恢复 |
+| `test/semantic-reliability-regression.test.mjs`（新） | 4 | GC 失败元数据→`status.semantic.gcError/gcFailedAt`；丢弃计数字段；`scope-alias` CLI 预览/`--apply`；**冷却期早退后回填恢复**（真实构造 `retryAt` 未来 + `pending` 空 + `backfillDone=false`，精确覆盖 3.9.5 那一行） |
+| `test/rerank.test.mjs`（+5） | 5 | fetch 抛错/Abort 超时、500、畸形 JSON、全零分回落，均验证 `memory_search` 保持原融合顺序 |
+| `test/embed-provider.test.mjs`（+3） | 3 | 持续 5xx 到重试上限、批次失败整批丢弃、真实 AbortSignal 超时 |
+| `test/http-security.test.mjs`（新） | 4 | 10 种静态路径穿越变体、非 loopback 变更拒绝、Origin/CSRF 变体、畸形/超大 body 受控 |
+
+### 门禁
+
+| 门禁 | 结果 |
+|---|---|
+| `npm test` | **335/335**（313 → 335，新增 22 条） |
+| `npm run check` | 一致：335 / 23 内核工具 / 25 MCP 工具 / 20 路由 / 31 ADR / 3.9.5 |
+| `npm run bench:golden` | `pass:true`，MRR 0.979 未退化 |
+
+**变异验证**：把 `runSemanticWorker` 冷却早退分支临时改回旧 bug（`scheduleNext = state.pending.size > 0`），只跑 `test/semantic-reliability-regression.test.mjs` → 恰好第 4 条「冷却期早退后未完成的语义回填仍会恢复」失败（11s 超时后 `indexed=0`），其余 3 条通过；还原后 4/4 全绿，`git diff -- index.js` 为空。证明该回归测试确实钉住 3.9.5 那一行，不是摆设。
+
+### 本轮实测发现（不掩盖）
+
+1. **HTTP 超大 body（>4MB）是断连，不是显式 4xx**：`hosts/http/server.mjs:74` 的 `readBody` 超限后 `reject` + `req.destroy()`，客户端拿到 `TypeError: fetch failed`；服务不崩、后续 `/health` 仍 200。属受控错误，但不符合常见 413 契约。测试按真实实现接受断连并记录诊断。
+2. **CSRF 校验强度在不同入口不一致**：REST 变更路由严格要求 `x-omni-csrf: 1`；MCP over HTTP 的 `mcpMutationAllowed` 在没有 Origin 时仅凭 `content-type: application/json` 即放行。当前测试按实现断言，不把它当缺陷放行。
+3. **队列满 `dropped/lastDropAt` 只做了字段存在性与初值断言**：`vectorDropped` / `semantic.dropped` 的阈值硬编码 4096，未导出、无环境变量可调；用公开 API 稳定写满 4096 条且不 flush 不可靠，因此没有写假行为测试。这是本轮唯一没有真正行为覆盖的 3.9.5 观测字段。
+4. **启用语义模型后的故障降级未在自动测试覆盖**：helpers 默认 `OMNI_DISABLE_SEMANTIC=1`，避免每条用例背上 ~216MB RSS；`semantic_vectors` 缺失只验证了状态读取降级，不验证启用语义后端时的搜索降级。
+
+### 仍未自动化（明确边界）
+
+- 10k/100k p95 阈值进 CI、1M 行长压测（ADR-020 的“未来”项）；
+- 真实 macOS/Linux 文件系统大小写矩阵、浏览器级面板交互、7788 注销/休眠恢复与 Windows 服务常驻；
+- `npm pack` 消费端安装冒烟（此前仅 `INTEGRATION-PROBE` 手工一次）。
+
+本轮未改任何运行时源码，测试全部使用隔离 home；生产库未被指向。
