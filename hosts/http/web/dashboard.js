@@ -220,6 +220,7 @@ function renderProjects(data) {
   }
   const globalRow = rows.find(project => project.scope === 'global');
   const projectRows = rows.filter(project => project.scope !== 'global');
+  const orderedRows = globalRow ? [globalRow, ...projectRows] : projectRows;
   const memoryOf = project => project.notes + project.facts;
   const projectMax = Math.max(...projectRows.map(memoryOf), 1);
   const globalCount = globalRow ? memoryOf(globalRow) : 0;
@@ -229,7 +230,7 @@ function renderProjects(data) {
   const summary = globalRow
     ? `全局 <b>${fmt(globalCount)}</b> · 项目层 <b>${fmt(projectCount)}</b>${memoryTotal ? `（${(projectCount / memoryTotal * 100).toFixed(1)}%）` : ''}${chunksTotal ? ` · 另有 ${fmt(chunksTotal)} 个会话块不计入` : ''}`
     : `项目层 <b>${fmt(projectCount)}</b>${chunksTotal ? ` · 另有 ${fmt(chunksTotal)} 个会话块` : ''}`;
-  $('#projectBars').innerHTML = `<div class="project-summary">${summary}</div>` + rows.map(project => {
+  $('#projectBars').innerHTML = `<div class="project-summary">${summary}</div>` + orderedRows.map(project => {
     const count = memoryOf(project);
     const status = project.status || (count ? 'quiet' : project.chunks ? 'transcript' : 'quiet');
     const isGlobal = project.scope === 'global';
