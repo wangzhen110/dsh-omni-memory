@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LicenseRef-Omni-Memory-Personal-Use-1.1
-// © 2026 wangzhen110 · https://github.com/wangzhen110/dsh-omni-memory
+// © 2026 wangzhen110 · https://github.com/wangzhen110/omni-memory
 // NonCommercial use only; attribution required. See LICENSE and ATTRIBUTION.md.
 window.__ModuleLoader__.load({
-  id: '@local/dsh-memory',
+  id: '@local/omni-memory',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
@@ -97,7 +97,7 @@ const EMPTY_HIGHLIGHT = [];
         tailTitle: '每次装配注入的长时记忆；绿色表示本轮已生效',
       },
       en: {
-        title: 'Omni memory',
+        title: 'Omni Memory',
         search: 'Search',
         reset: 'Reset',
         refresh: 'Refresh',
@@ -177,7 +177,7 @@ const EMPTY_HIGHLIGHT = [];
         tailInjected: 'injected {chars} chars',
         tailRecall: 'recall {n}',
         tailTotal: '{notes} stored',
-        tailHover: 'Omni memory: {chars} chars injected, {recall} recalled, {notes} stored',
+        tailHover: 'Omni Memory: {chars} chars injected, {recall} recalled, {notes} stored',
         tailTitle: 'Long-term memory injected on each assembly; green means this turn used it',
       },
     };

@@ -2,6 +2,14 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.8.0] — 2026-11-21
+
+### 变更 · 项目更名与跨宿主定位
+- GitHub 仓库由 `wangzhen110/dsh-omni-memory` 更名为 `wangzhen110/omni-memory`；包名由 `@local/dsh-memory` 改为 `@local/omni-memory`。
+- 定位从「DSH 长期记忆插件」改为「任意 AI 宿主的长期记忆库」：DSH 仍是原生插件入口，MCP / HTTP / OpenAPI / CLI 是第一等接入方式，不再把 DSH 写进项目名。
+- 数据目录、`omni.db` 文件名、`/omni-memory/*` 路由、工具名与协议面全部不变；已有记忆无需迁移。
+- DSH 旧安装需要移除 `@local/dsh-memory` 后安装 `@local/omni-memory`，两者不要同时启用；共用同一份数据库。
+
 ## [3.7.2] — 2026-11-21
 
 ### 新增 · 宿主适配层

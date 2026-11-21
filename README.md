@@ -1,6 +1,6 @@
-# 全息记忆（Omni memory）
+# 全息记忆（Omni Memory）
 
-> 给 DeepSeek Harness 的长期记忆内核：**只增不改的原文留底 + 会自我校验的结论 + 按项目分层 + 三路混合召回 + 可复用的故障经验沉淀**。
+> 给任意 AI 宿主的长期记忆内核：DSH 原生插件，MCP / HTTP / OpenAPI / CLI 通用接入；**只增不改的原文留底 + 会自我校验的结论 + 按项目分层 + 三路混合召回 + 可复用的故障经验沉淀**。
 
 > ⚠️ **许可提醒**：本项目采用 **全息记忆个人使用许可 1.1** —— 仅允许个人、非商业使用；
 > **禁止任何形式的商业使用**，包括直接商用、修改后商用，以及复制、改写或提取本软件
@@ -39,18 +39,20 @@
 - **活跃视图**：列表/搜索默认只显示活跃记忆；历史（被替代、已删除、已失效）通过面板「审计」查看并可单条**恢复**
 - **备份/导出/导入**：`memory_export` 导出可移植 JSON（含墓碑），`memory_import` 合并导入（默认 dry-run），`memory_restore` 复活单条
 - **多客户端并发**：同一台机器上多个 AI 客户端各起一个服务进程，共用一个 `omni.db`；写入等待而不是报锁错，去重与事实失效在写锁内完成，迁移/索引重建/做梦由全机唯一的租约持有者执行（见 [ADR-028](docs/ADR/028-multi-process-concurrency.md)）
-- **隐私**：全部数据在本地 SQLite（`$DSH_HOME/memory/omni.db`），HTTP 只监听 loopback；写操作只接受 POST 并校验 Origin/CSRF 头
+- **隐私**：全部数据在本地 SQLite（`$OMNI_HOME/memory/omni.db`，未设置时回退 `$DSH_HOME`），HTTP 只监听 loopback；写操作只接受 POST 并校验 Origin/CSRF 头
 
 ## 安装
 
 ### 插件市场
 
-在 DSH 插件市场搜索「全息记忆 / Omni memory」安装，重启或刷新后左栏出现「全息记忆」入口。
+在 DSH 插件市场搜索「全息记忆 / Omni Memory」安装，重启或刷新后左栏出现「全息记忆」入口。
+
+> 项目已由 `dsh-omni-memory` 更名 `omni-memory`。旧安装请移除 `@local/dsh-memory`，再安装 `@local/omni-memory`；两者共用同一份 `omni.db`，数据不受影响。
 
 ### 本地安装（开发者）
 
 ```bash
-cd memory-core
+cd /path/to/omni-memory
 npm test          # 257 个用例
 npm run check     # 语法与 JSON 校验
 ```
@@ -87,7 +89,7 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 
 ## 配置
 
-所有开关通过环境变量控制，**修改后需重启 DSH**。
+所有开关通过环境变量控制，**修改后需重启宿主进程**（DSH 或 MCP/HTTP 进程）。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
@@ -187,7 +189,7 @@ npm run bench:golden   # 黄金集
 
 ```markdown
 基于「全息记忆 (Omni Memory)」by wangzhen110
-https://github.com/wangzhen110/dsh-omni-memory · 全息记忆个人使用许可 1.1
+https://github.com/wangzhen110/omni-memory · 全息记忆个人使用许可 1.1
 已修改
 ```
 
@@ -199,7 +201,7 @@ https://github.com/wangzhen110/dsh-omni-memory · 全息记忆个人使用许可
 请先取得作者书面许可。
 
 **优先渠道（推荐）**：在仓库开 Issue，公开可追踪、回复更快
-https://github.com/wangzhen110/dsh-omni-memory/issues
+https://github.com/wangzhen110/omni-memory/issues
 
 **备用渠道**：64271785@qq.com（标题请注明「商业授权 + 用途」）
 

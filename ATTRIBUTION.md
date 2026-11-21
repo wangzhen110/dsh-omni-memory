@@ -11,7 +11,7 @@
 只要你的项目**使用了**本项目的代码、文案、设计或算法，就必须同时满足：
 
 1. **写明作者与项目名**：全息记忆 (Omni Memory) · wangzhen110
-2. **给出项目链接**：https://github.com/wangzhen110/dsh-omni-memory
+2. **给出项目链接**：https://github.com/wangzhen110/omni-memory
 3. **写明许可协议**：全息记忆个人使用许可 1.1，并附 `LICENSE` 链接
 4. **保留版权声明**：转载源码时不得删除本文件、`LICENSE` 及源码中的版权头
 5. **说明是否修改**：改过就写「已修改 / Modified」
@@ -26,7 +26,7 @@
 ```markdown
 本项目部分代码/设计参考或基于「全息记忆 (Omni Memory)」：
 - 作者：wangzhen110
-- 项目：https://github.com/wangzhen110/dsh-omni-memory
+- 项目：https://github.com/wangzhen110/omni-memory
 - 许可：全息记忆个人使用许可 1.1（见项目 LICENSE）
 - 说明：本项目对其进行了修改
 ```
@@ -35,7 +35,7 @@
 
 ```markdown
 This project is based on / borrows from "Omni Memory" by wangzhen110:
-- Source: https://github.com/wangzhen110/dsh-omni-memory
+- Source: https://github.com/wangzhen110/omni-memory
 - License: Omni Memory Personal Use License 1.1 (see LICENSE)
 - Changes: modified
 ```
@@ -44,7 +44,7 @@ This project is based on / borrows from "Omni Memory" by wangzhen110:
 
 ```js
 // Portions of this file are based on Omni Memory by wangzhen110
-// https://github.com/wangzhen110/dsh-omni-memory
+// https://github.com/wangzhen110/omni-memory
 // Licensed under the Omni Memory Personal Use License 1.1 — personal,
 // non-commercial use only; commercial use of modified versions and commercial
 // reimplementation based on the source or architecture are prohibited.
@@ -56,7 +56,7 @@ This project is based on / borrows from "Omni Memory" by wangzhen110:
 ```text
 本软件的部分功能基于「全息记忆 (Omni Memory)」
 作者 wangzhen110 · 全息记忆个人使用许可 1.1
-https://github.com/wangzhen110/dsh-omni-memory
+https://github.com/wangzhen110/omni-memory
 ```
 
 ---
@@ -84,7 +84,7 @@ https://github.com/wangzhen110/dsh-omni-memory
 
 **Q：商业授权怎么拿？**
 优先在 GitHub 仓库开 Issue（公开可追踪）：
-https://github.com/wangzhen110/dsh-omni-memory/issues
+https://github.com/wangzhen110/omni-memory/issues
 也可发邮件到 **64271785@qq.com**（标题写「商业授权 + 用途」）。作者会回复授权范围与费用。
 
 ---

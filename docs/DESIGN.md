@@ -1,11 +1,11 @@
-# 全息记忆（`@local/dsh-memory`）设计规格
+# 全息记忆（`@local/omni-memory`）设计规格
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | 3.7.2 |
-| 插件版本 | 3.7.2 |
+| 文档版本 | 3.8.0 |
+| 插件版本 | 3.8.0 |
 | 状态 | 已评审（本文为开发与验收的**唯一依据**） |
-| 目标平台 | DeepSeek Harness 0.2.2-rc.3（Desktop，Windows 11，Node 24.17） |
+| 目标平台 | DSH 0.2.2-rc.3 原生插件（Desktop，Windows 11，Node 24.17）；MCP / HTTP / OpenAPI / CLI 宿主通用 |
 | 最后更新 | 2026-11-21 |
 | 变更规则 | 任何行为变更必须先改本文并升版本，再改代码 |
 
@@ -102,7 +102,7 @@
 | CON-03 | 只依赖公开 Service（`tools` / `systemPrompt` / `webServer` / `slots`） | 内部 API 随版本变动（mnemon 崩溃案例） |
 | CON-04 | HTTP 路由必须校验来源为 loopback；写操作只接受 POST 并校验 `Origin` 与 `x-omni-csrf` | 阻止网络来源读取与浏览器跨站写；**不构成进程级认证**（同用户本机进程仍可读写，见 ADR-017） |
 | CON-05 | 不得在 `systemPrompt.section` 内做网络/模型调用 | 该函数在每次装配同步执行 |
-| CON-06 | 数据目录固定 `$DSH_HOME/memory` | 便于备份与迁移 |
+| CON-06 | 数据目录固定 `$OMNI_HOME/memory`（默认回退 `$DSH_HOME`） | 便于备份与迁移 |
 
 ---
 

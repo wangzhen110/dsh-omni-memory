@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LicenseRef-Omni-Memory-Personal-Use-1.1
-// © 2026 wangzhen110 · https://github.com/wangzhen110/dsh-omni-memory
+// © 2026 wangzhen110 · https://github.com/wangzhen110/omni-memory
 
 /**
  * Sync the reference manual into the store as searchable notes.
@@ -171,7 +171,7 @@ if (!dryRun) {
 
   const facts = [
     { subject: '全息记忆', relation: '代码位置', object: ROOT },
-    { subject: '全息记忆', relation: '仓库', object: 'https://github.com/wangzhen110/dsh-omni-memory' },
+    { subject: '全息记忆', relation: '仓库', object: 'https://github.com/wangzhen110/omni-memory' },
     { subject: '全息记忆', relation: '接口手册', object: 'docs/REFERENCE.md' },
   ];
 

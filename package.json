@@ -1,17 +1,22 @@
 {
-  "name": "@local/dsh-memory",
-  "version": "3.7.2",
+  "name": "@local/omni-memory",
+  "version": "3.8.0",
   "private": true,
   "type": "module",
-  "description": "Omni memory for DeepSeek Harness: append-only transcripts, bi-temporal facts, self-verifying notes, hybrid retrieval, project scoping and an interactive star map.",
+  "description": "Omni Memory for any AI host: append-only transcripts, bi-temporal facts, self-verifying notes, hybrid retrieval, project scoping and an interactive star map. Native DSH plugin, with MCP, HTTP, OpenAPI and CLI adapters.",
   "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "node": ">=24"
   },
   "keywords": [
+    "omni-memory",
+    "ai-memory",
     "deepseek-harness",
     "dsh",
     "dsh-plugin",
+    "mcp",
+    "openapi",
+    "cli",
     "memory",
     "knowledge-base",
     "sqlite",

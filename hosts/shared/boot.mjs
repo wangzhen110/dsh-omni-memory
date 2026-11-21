@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LicenseRef-Omni-Memory-Personal-Use-1.1
-// © 2026 wangzhen110 · https://github.com/wangzhen110/dsh-omni-memory
+// © 2026 wangzhen110 · https://github.com/wangzhen110/omni-memory
 
 /**
  * Shared boot for every non-DSH adapter.
