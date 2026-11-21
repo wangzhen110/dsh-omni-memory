@@ -15,7 +15,7 @@
 
 ## 2026-11-21
 
-- 20:02:30 `d8441237` — fix(security): close P0 audit findings and release 3.10.1 — [提交](https://github.com/wangzhen110/omni-memory/commit/bf8d3eda84b7c023975eef16791618b691545830)
+- 20:02:30 `bf8d3eda` — fix(security): close P0 audit findings and release 3.10.1 — [提交](https://github.com/wangzhen110/omni-memory/commit/bf8d3eda84b7c023975eef16791618b691545830)
 - 18:35:10 `4e6c2131` — fix: order global memory first in project distribution — [提交](https://github.com/wangzhen110/omni-memory/commit/4e6c2131a96352870f0d85c8b2a473a76265b0d2)
 - 18:26:21 `cb621f6e` — feat: real-data memory overview dashboard (3.10.0) — [提交](https://github.com/wangzhen110/omni-memory/commit/cb621f6ea0da13e79c19bc55f129d19a8a930e2d)
 - 16:05:00 `a93221c0` — test: add install and lifecycle coverage — [提交](https://github.com/wangzhen110/omni-memory/commit/a93221c0937f598998383eaa4fa55f435967e228)
