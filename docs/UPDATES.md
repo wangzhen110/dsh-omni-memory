@@ -2,7 +2,7 @@
 
 > 本文件由 `npm run update-log` 从 git 历史自动生成，按时间倒序记录每一次提交。
 > 版本摘要见 [CHANGELOG](CHANGELOG.md)，版本报告见下方“版本报告”。
-> 共 63 次提交；更新记录自身的提交不计入列表。
+> 共 64 次提交；更新记录自身的提交不计入列表。
 
 ## 版本报告
 
@@ -15,6 +15,7 @@
 
 ## 2026-11-21
 
+- 22:02:49 `91cdac64` — docs: make Doubao integration zero-config by default — [提交](https://github.com/wangzhen110/omni-memory/commit/91cdac64914aacf547bda9d87163799f025d3c3d)
 - 20:32:35 `69c8d6cf` — docs: document Doubao Work MCP connector and HTTP fallback — [提交](https://github.com/wangzhen110/omni-memory/commit/69c8d6cf420db77afcf074ee3b88161f72d86cb2)
 - 20:15:14 `89faea4b` — test: make npm-pack and scope-alias checks platform-correct — [提交](https://github.com/wangzhen110/omni-memory/commit/89faea4b0d885b5190f272ad5d47ee3f8a436745)
 - 20:02:30 `bf8d3eda` — fix(security): close P0 audit findings and release 3.10.1 — [提交](https://github.com/wangzhen110/omni-memory/commit/bf8d3eda84b7c023975eef16791618b691545830)
