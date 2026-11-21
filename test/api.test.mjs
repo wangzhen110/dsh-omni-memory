@@ -2,16 +2,20 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { boot, fakeReq, fakePost, fakePostConsumed, fakeRes } from './helpers.mjs';
 
-test('sixteen loopback routes are registered', async () => {
+test('twenty loopback routes are registered', async () => {
   const app = await boot();
   const paths = app.routes.map(route => route.path).sort();
   assert.deepEqual(paths, [
+    '/omni-memory/candidate',
+    '/omni-memory/candidates',
+    '/omni-memory/consolidate',
     '/omni-memory/dream/proposals',
     '/omni-memory/dream/replace',
     '/omni-memory/dream/rollback',
     '/omni-memory/export',
     '/omni-memory/forget',
     '/omni-memory/graph',
+    '/omni-memory/ingest',
     '/omni-memory/list',
     '/omni-memory/node',
     '/omni-memory/openapi.json',

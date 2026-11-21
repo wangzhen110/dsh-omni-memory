@@ -57,6 +57,10 @@ test('GET /omni-memory/openapi.json publishes the adapter surface', async () => 
   assert.ok(spec.paths['/omni-memory/search']);
   assert.ok(spec.paths['/omni-memory/tool']);
   assert.ok(spec.paths['/omni-memory/tool'].post);
+  assert.ok(spec.paths['/omni-memory/ingest']);
+  assert.ok(spec.paths['/omni-memory/candidates']);
+  assert.ok(spec.paths['/omni-memory/candidate']);
+  assert.ok(spec.paths['/omni-memory/consolidate']);
 });
 
 test('POST /omni-memory/tool bridges writes and reads, but rejects maintenance tools', async () => {

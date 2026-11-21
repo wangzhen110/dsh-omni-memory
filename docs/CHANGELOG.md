@@ -2,6 +2,18 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.9.0] — 2026-11-21
+
+### 新增 · 自动捕获、经验巩固与检索重排
+- **会话自动捕获闭环（P0）**：schema v13 新增 `note_candidates`；`memory_ingest` 把任意宿主的 user/assistant 轮次写入转录，并按确定性规则抽取最多 3 条 pending 候选（不调用模型、不直接写正式笔记）。`memory_candidate` 提供 list/accept/reject，接受后才落为 note，拒绝保留 `reason`。`scope=all` 拒写，单条上限 4000 字，默认候选范围当前项目 + global。新增 3 条 loopback HTTP 路由与 `omni ingest/candidates/candidate` CLI；`omni ingest --stdin` 可直接解析 Claude Code hook JSON。
+- **经验巩固（P1）**：`memory_consolidate` 按同一 `problemKey` 与精确 scope 合并活跃笔记。默认 dry-run；`apply` 生成 `source: consolidate:<ids>` 摘要，按 `[已验证]/[未验证]/[失败尝试]/[已过期]` 分组，汇总来源反馈计数，旧行只写 `superseded_by`，不删除。新增 `/omni-memory/consolidate` 与 `omni consolidate`。
+- **分层画像（P1）**：注入画像与 `memory_profile` 统一为 `## 全局` → `## 当前项目`（跨项目视图为 `## 其他项目`）→ `相关事实：`，不再把全局规则和项目规则混成无边界列表；仍受 1200 字预算与 `capProfileLines` 兜底。
+- **可选 cross-encoder rerank（P1）**：新增 `lib/rerank-provider.mjs`，支持 Cohere / Jina / SiliconFlow / 自建兼容端点；`OMNI_RERANK_*` 配置后对融合结果重排，未配置时零额外延迟，失败时静默回落。`memory_search` 增加 `rerank` 开关。
+- **本地语义嵌入入口**：`OMNI_EMBED_PROVIDER` 新增 `ollama`、`lmstudio` 预设，仍不内置模型；默认 hashed 向量保持零配置可运行。
+- **核心拆分**：候选抽取规则移入 `lib/capture-rules.mjs`，新增 `test/capture-rules.test.mjs`；重排提供方独立为 `lib/rerank-provider.mjs`。
+- **检索去重优先级**：同一段文本同时命中转录 chunk 与已接受 note 时，最终结果优先保留 note/fact，不再让原始 chunk 把结论遮住；补回归断言。
+- 测试：新增 ingest 6 项、consolidation 4 项、rerank 3 项、capture rules 4 项；完整 `npm test` **275/275** 通过；`npm run check` 文档计数同步为 23 工具、20 路由、schema v13、3.9.0。
+
 ## [3.8.0] — 2026-11-21
 
 ### 变更 · 项目更名与跨宿主定位

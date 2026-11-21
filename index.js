@@ -25,6 +25,8 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { DIM, embedText, dot, toBlob, fromBlob, tokenize } from './lib/embed.mjs';
 import { backendConfig, embedRemote } from './lib/embed-provider.mjs';
+import { extractCandidateTexts } from './lib/capture-rules.mjs';
+import { rerankConfig, rerankRemote } from './lib/rerank-provider.mjs';
 
 // Data home resolution, in priority order:
 //   1. OMNI_HOME   — set by non-DSH adapters (MCP, CLI, HTTP) to point at a shared store
@@ -519,7 +521,7 @@ function openStore() {
   return store;
 }
 
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 let hostCtx = null;
 
 function columnExists(db, table, column) {
@@ -685,6 +687,30 @@ const MIGRATIONS = [
       addColumn(db, table, 'misleading_count', 'INTEGER NOT NULL DEFAULT 0');
     }
   },
+  // v13: host-agnostic transcript candidates. Extraction never writes a note
+  // directly; it parks the proposal until a human or agent accepts it.
+  db => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS note_candidates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        scope TEXT NOT NULL DEFAULT 'global',
+        text TEXT NOT NULL,
+        hash TEXT NOT NULL,
+        source TEXT,
+        chunk_id INTEGER,
+        confidence REAL NOT NULL DEFAULT 0.5,
+        status TEXT NOT NULL DEFAULT 'pending',
+        reviewed_at INTEGER,
+        note_id INTEGER,
+        reason TEXT
+      );
+      CREATE INDEX IF NOT EXISTS note_candidates_status
+        ON note_candidates(status, scope, ts);
+      CREATE INDEX IF NOT EXISTS note_candidates_hash
+        ON note_candidates(hash, scope, status);
+    `);
+  },
 ];
 
 function migrate(db) {
@@ -749,6 +775,28 @@ function migrate(db) {
       addColumn(db, table, 'useful_count', 'INTEGER NOT NULL DEFAULT 0');
       addColumn(db, table, 'misleading_count', 'INTEGER NOT NULL DEFAULT 0');
     }
+  }
+  if (SCHEMA_VERSION >= 13) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS note_candidates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        scope TEXT NOT NULL DEFAULT 'global',
+        text TEXT NOT NULL,
+        hash TEXT NOT NULL,
+        source TEXT,
+        chunk_id INTEGER,
+        confidence REAL NOT NULL DEFAULT 0.5,
+        status TEXT NOT NULL DEFAULT 'pending',
+        reviewed_at INTEGER,
+        note_id INTEGER,
+        reason TEXT
+      );
+      CREATE INDEX IF NOT EXISTS note_candidates_status
+        ON note_candidates(status, scope, ts);
+      CREATE INDEX IF NOT EXISTS note_candidates_hash
+        ON note_candidates(hash, scope, status);
+    `);
   }
   prepareCached(db, "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)")
     .run(String(SCHEMA_VERSION));
@@ -1490,6 +1538,313 @@ function insertChunk(s, input) {
     upsertVector(s, 'chunk', id, text);
     return { id, deduped: false };
   });
+}
+
+
+const CANDIDATE_ROLES = new Set(['user', 'assistant', 'system', 'tool', 'note']);
+function resolveTranscriptScope(input, toolContext) {
+  const requested = String(input.scope ?? '').trim();
+  if (requested === 'all') throw new Error('transcripts cannot be written to scope=all');
+  if (requested === 'project') return currentProject(toolContext) ?? SCOPE_GLOBAL;
+  if (requested) return requested;
+  const cwd = String(input.cwd ?? '').trim();
+  if (cwd) return projectKeyFromCwd(cwd);
+  return currentProject(toolContext) ?? SCOPE_GLOBAL;
+}
+
+function insertNoteCandidate(s, input) {
+  const scope = String(input.scope ?? SCOPE_GLOBAL);
+  const text = String(input.text ?? '').trim();
+  if (!text) return null;
+  const digest = hash(`${scope}\n${text}`);
+  const existing = prepareCached(s.db, `
+    SELECT id FROM note_candidates
+    WHERE hash = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global') AND status = 'pending'
+  `).get(digest, scope);
+  if (existing) return { id: Number(existing.id), deduped: true };
+  const info = prepareCached(s.db, `
+    INSERT INTO note_candidates(ts, scope, text, hash, source, chunk_id, confidence)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    Number(input.ts ?? now()), scope, text, digest,
+    input.source ?? null, input.chunkId ?? null, Number(input.confidence ?? 0.5),
+  );
+  return { id: Number(info.lastInsertRowid), deduped: false };
+}
+
+/**
+ * Ingest one transcript turn from any host. This is the non-DSH counterpart of
+ * `captureEvent`: it never creates a note directly, only chunks and pending
+ * candidates. Callers can disable extraction with extract=false.
+ */
+export function ingestTranscript(input = {}, toolContext = {}) {
+  const s = openStore();
+  const text = String(input.text ?? '').trim();
+  if (!text) throw new Error('text is required');
+  const role = String(input.role ?? 'user').trim().toLowerCase();
+  if (!CANDIDATE_ROLES.has(role)) throw new Error('role must be user, assistant, system, tool or note');
+  let importance = role === 'user' ? 0.6 : role === 'assistant' ? 0.4 : 0.5;
+  if (input.importance != null) {
+    importance = Number(input.importance);
+    if (!Number.isFinite(importance) || importance < 0 || importance > 1) {
+      throw new Error('importance must be a number between 0 and 1');
+    }
+  }
+  const sessionId = String(input.sessionId ?? toolContext?.session?.id ?? '').trim() || null;
+  const scope = resolveTranscriptScope(input, toolContext);
+  const truncated = text.length > MAX_CAPTURE_CHARS;
+  const storedText = truncated ? text.slice(0, MAX_CAPTURE_CHARS) : text;
+  if (sessionId && scope !== SCOPE_GLOBAL) {
+    try { metaSet(openStore().db, `agent_project:${sessionId}`, scope); } catch { /* best effort */ }
+  }
+  const chunk = insertChunk(s, {
+    text: storedText,
+    role,
+    sessionId,
+    source: input.source ?? `ingest:${sessionId ?? 'anonymous'}`,
+    importance,
+    scope,
+    ts: input.ts,
+  });
+  if (!chunk) throw new Error('text is required');
+  const candidates = [];
+  const extract = input.extract !== false && input.extract !== '0';
+  if (!chunk.deduped && extract) {
+    for (const item of extractCandidateTexts(storedText, role)) {
+      const candidate = insertNoteCandidate(s, {
+        text: item.text,
+        confidence: item.confidence,
+        scope,
+        source: `chunk:${chunk.id}`,
+        chunkId: chunk.id,
+      });
+      if (candidate) candidates.push({ ...candidate, text: item.text, confidence: item.confidence });
+    }
+  }
+  return {
+    id: Number(chunk.id),
+    deduped: Boolean(chunk.deduped),
+    scope,
+    sessionId,
+    chars: storedText.length,
+    truncated,
+    candidates,
+  };
+}
+
+function candidateScope(options = {}, toolContext = {}) {
+  const requested = String(options.scope ?? '').trim();
+  if (requested === 'all') return null;
+  if (requested === 'project') return 'project';
+  if (requested) return requested;
+  const cwd = String(options.cwd ?? '').trim();
+  if (cwd) return projectKeyFromCwd(cwd);
+  return currentProject(toolContext) || SCOPE_GLOBAL;
+}
+
+/** List pending candidates. Default visibility is current project + global. */
+export function listNoteCandidates(options = {}, toolContext = {}) {
+  const s = openStore();
+  const status = String(options.status ?? 'pending').trim().toLowerCase();
+  if (!['pending', 'accepted', 'rejected', 'all'].includes(status)) {
+    throw new Error('status must be pending, accepted, rejected or all');
+  }
+  const limit = Math.min(100, Math.max(1, Number(options.limit ?? 20) || 20));
+  const scope = candidateScope(options, toolContext);
+  const clause = scopeClause('scope', scope, true);
+  const parts = [];
+  if (status !== 'all') parts.push('status = ?');
+  if (clause.sql) parts.push(clause.sql.replace(/^AND\s*/, ''));
+  const where = parts.join(' AND ') || '1=1';
+  const params = status === 'all' ? [] : [status];
+  const total = Number(prepareCached(s.db, `SELECT COUNT(*) AS n FROM note_candidates WHERE ${where}`)
+    .get(...params, ...clause.params)?.n ?? 0);
+  const rows = prepareCached(s.db, `
+    SELECT id, ts, scope, text, source, chunk_id, confidence, status, reviewed_at, note_id, reason
+    FROM note_candidates
+    WHERE ${where}
+    ORDER BY ts DESC, id DESC LIMIT ?
+  `).all(...params, ...clause.params, limit);
+  return {
+    action: 'list',
+    status,
+    scope: scope ?? 'all',
+    total,
+    candidates: rows.map(row => ({
+      id: Number(row.id),
+      ts: Number(row.ts),
+      scope: row.scope ?? SCOPE_GLOBAL,
+      text: String(row.text),
+      source: row.source ?? null,
+      chunkId: row.chunk_id == null ? null : Number(row.chunk_id),
+      confidence: Number(row.confidence ?? 0.5),
+      status: String(row.status ?? 'pending'),
+      reviewedAt: row.reviewed_at == null ? null : Number(row.reviewed_at),
+      noteId: row.note_id == null ? null : Number(row.note_id),
+      reason: row.reason ?? null,
+    })),
+  };
+}
+
+function writeCandidateNote(row) {
+  const s = openStore();
+  const text = String(row.text ?? '').trim();
+  const scope = String(row.scope ?? SCOPE_GLOBAL);
+  if (!text) throw new Error('candidate text is empty');
+  const existing = prepareCached(s.db, `
+    SELECT id FROM notes
+    WHERE scope = ? AND text = ? AND deleted_at IS NULL AND superseded_by IS NULL
+  `).get(scope, text);
+  if (existing) return { id: Number(existing.id), deduped: true };
+  const ts = now();
+  const source = row.source ? `${row.source} · candidate:${row.id}` : `candidate:${row.id}`;
+  const result = transaction(s.db, () => {
+    const raced = prepareCached(s.db, `
+      SELECT id FROM notes
+      WHERE scope = ? AND text = ? AND deleted_at IS NULL AND superseded_by IS NULL
+    `).get(scope, text);
+    if (raced) return { id: Number(raced.id), deduped: true };
+    const info = prepareCached(s.db, `
+      INSERT INTO notes(ts, scope, text, importance, source)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(ts, scope, text, 0.55, source);
+    const noteId = Number(info.lastInsertRowid);
+    if (s.fts.notes) {
+      try { prepareCached(s.db, 'INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(noteId, text); } catch { /* index best effort */ }
+    }
+    indexBigrams(s.db, 'note', noteId, text);
+    upsertVector(s, 'note', noteId, text);
+    return { id: noteId, deduped: false };
+  });
+  invalidateProfile();
+  return result;
+}
+
+/** Accept or reject one pending candidate. Cross-project review requires scope=all. */
+export function reviewNoteCandidate(id, action, options = {}, toolContext = {}) {
+  const s = openStore();
+  const candidateId = Number(id);
+  if (!Number.isFinite(candidateId) || candidateId <= 0) throw new Error('id must be a positive number');
+  const normalized = String(action ?? '').trim().toLowerCase();
+  if (!['accept', 'reject'].includes(normalized)) throw new Error('action must be accept or reject');
+  const scope = candidateScope(options, toolContext);
+  const clause = scopeClause('scope', scope, true);
+  const row = prepareCached(s.db, `
+    SELECT * FROM note_candidates WHERE id = ? ${clause.sql}
+  `).get(candidateId, ...clause.params);
+  if (!row) throw new Error('candidate not found or outside the current project');
+  if (String(row.status) !== 'pending') throw new Error(`candidate is already ${row.status}`);
+  const ts = now();
+  if (normalized === 'reject') {
+    prepareCached(s.db, `
+      UPDATE note_candidates SET status = 'rejected', reviewed_at = ?, reason = ? WHERE id = ?
+    `).run(ts, String(options.reason ?? '').trim().slice(0, 500) || null, candidateId);
+    return { action: 'reject', id: candidateId, status: 'rejected' };
+  }
+  const note = writeCandidateNote(row);
+  prepareCached(s.db, `
+    UPDATE note_candidates SET status = 'accepted', reviewed_at = ?, note_id = ? WHERE id = ?
+  `).run(ts, Number(note.id), candidateId);
+  return {
+    action: 'accept', id: candidateId, status: 'accepted',
+    noteId: Number(note.id), deduped: Boolean(note.deduped), scope: row.scope ?? SCOPE_GLOBAL,
+  };
+}
+
+/**
+ * Consolidate active notes that share one problemKey into a source-linked
+ * summary. Dry-run is the default; apply=true supersedes the inputs, never
+ * deletes them. The summary carries the summed feedback counters so ranking
+ * quality survives the merge.
+ */
+export function consolidateProblemNotes(problemKey, options = {}, toolContext = {}) {
+  const s = openStore();
+  const key = normalizeProblemKey(problemKey);
+  if (!key) throw new Error('problemKey is required');
+  const requested = String(options.scope ?? '').trim();
+  if (requested === 'all' || requested === 'project') {
+    throw new Error('consolidation needs one exact scope; all/project would mix layers');
+  }
+  const scope = requested || currentProject(toolContext) || SCOPE_GLOBAL;
+  const minNotes = Math.min(10, Math.max(2, Number(options.minNotes ?? 2) || 2));
+  const rows = prepareCached(s.db, `
+    SELECT * FROM notes
+    WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0
+      AND problem_key = ? AND scope = ?
+    ORDER BY ts ASC, id ASC
+  `).all(key, scope);
+  if (rows.length < minNotes) {
+    return { problemKey: key, scope, applied: false, reason: 'not enough active notes', notes: rows.length };
+  }
+  const ids = rows.map(row => Number(row.id));
+  const summary = summarizeProblemNotes(key, rows);
+  if (options.apply !== true) {
+    return { problemKey: key, scope, applied: false, notes: rows.length, sourceIds: ids, summary };
+  }
+  const result = transaction(s.db, () => {
+    const active = prepareCached(s.db, `
+      SELECT * FROM notes
+      WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0
+        AND problem_key = ? AND scope = ?
+      ORDER BY ts ASC, id ASC
+    `).all(key, scope);
+    if (active.length < minNotes) return { applied: false, reason: 'not enough active notes' };
+    const activeIds = active.map(row => Number(row.id));
+    const summaryText = summarizeProblemNotes(key, active);
+    const hasVerified = active.some(row => String(row.solution_status ?? '') === 'verified');
+    const allFailed = active.every(row => ['failed', 'expired'].includes(String(row.solution_status ?? '')));
+    const ts = now();
+    const importance = Math.min(1, Math.max(...active.map(row => Number(row.importance ?? 0.35))) + 0.1);
+    const info = prepareCached(s.db, `
+      INSERT INTO notes(
+        ts, scope, text, importance, source, problem_key, solution_status,
+        solution_verified_at, reuse_count, last_used_at, evidence,
+        recall_count, last_recall_at, useful_count, misleading_count
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      ts, scope, summaryText, importance,
+      `consolidate:${activeIds.join(',')}`, key,
+      hasVerified ? 'verified' : allFailed ? 'failed' : 'unverified',
+      hasVerified ? ts : null,
+      active.reduce((sum, row) => sum + Number(row.reuse_count ?? 0), 0),
+      Math.max(...active.map(row => Number(row.last_used_at ?? 0))) || null,
+      `sources: ${activeIds.map(id => `n:${id}`).join(', ')}`,
+      active.reduce((sum, row) => sum + Number(row.recall_count ?? 0), 0),
+      Math.max(...active.map(row => Number(row.last_recall_at ?? 0))) || null,
+      active.reduce((sum, row) => sum + Number(row.useful_count ?? 0), 0),
+      active.reduce((sum, row) => sum + Number(row.misleading_count ?? 0), 0),
+    );
+    const summaryId = Number(info.lastInsertRowid);
+    if (s.fts.notes) {
+      try { prepareCached(s.db, 'INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(summaryId, summaryText); } catch { /* index best effort */ }
+    }
+    indexBigrams(s.db, 'note', summaryId, summaryText);
+    upsertVector(s, 'note', summaryId, summaryText);
+    const update = prepareCached(s.db, 'UPDATE notes SET superseded_by = ? WHERE id = ?');
+    for (const id of activeIds) update.run(summaryId, id);
+    return { applied: true, noteId: summaryId, sourceIds: activeIds, summary: summaryText };
+  });
+  if (result.applied) invalidateProfile();
+  return { problemKey: key, scope, ...result, notes: result.sourceIds?.length ?? rows.length };
+}
+
+function summarizeProblemNotes(problemKey, rows) {
+  const groups = [
+    ['verified', '已验证'],
+    ['unverified', '未验证'],
+    ['failed', '失败尝试'],
+    ['expired', '已过期'],
+  ];
+  const lines = [`问题 ${problemKey}`];
+  for (const [status, label] of groups) {
+    const items = rows.filter(row => String(row.solution_status ?? 'unverified') === status);
+    if (!items.length) continue;
+    lines.push(`[${label}]`);
+    for (const row of items) {
+      lines.push(`- ${String(row.text ?? '').replace(/\s+/g, ' ').slice(0, 220)}`);
+    }
+  }
+  return lines.join('\n').slice(0, 4000);
 }
 
 function recencyScore(ts) {
@@ -2269,10 +2624,20 @@ async function vectorSearch(s, queryText, limit, scope, candidates = []) {
 function finalizeHits(ranked, limit) {
   const seen = new Set();
   const hits = [];
+  // A transcript chunk is evidence, not the conclusion. When an accepted note
+  // and its source chunk collapse to the same text, keep the note visible in
+  // search instead of letting the raw chunk shadow it.
+  const kindPriority = hit => hit.kind === 'note' ? 3 : hit.kind === 'fact' ? 2 : 1;
   for (const hit of ranked) {
     if (hits.length >= limit) break;
     const key = String(hit.text).replace(/\s+/g, '').slice(0, 120);
-    if (seen.has(key)) continue;
+    if (seen.has(key)) {
+      const existing = hits.findIndex(item => String(item.text).replace(/\s+/g, '').slice(0, 120) === key);
+      if (existing >= 0 && kindPriority(hit) > kindPriority(hits[existing])) {
+        hits[existing] = hit;
+      }
+      continue;
+    }
     seen.add(key);
     hits.push(hit);
   }
@@ -2462,6 +2827,30 @@ function graphExpand(s, hits, limit, scope) {
 
 let lastSearchProfile = null;
 
+/**
+ * Optional cross-encoder pass. No endpoint means no extra latency. Scores are
+ * blended with the fused rank so a reranker cannot erase a strong exact hit
+ * (problemKey matches already carry an explicit boost).
+ */
+async function maybeRerank(query, ranked, limit, options = {}) {
+  if (options.rerank === false) return ranked;
+  const config = rerankConfig();
+  if (config.kind !== 'remote' || ranked.length < 2) return ranked;
+  try {
+    const scores = await rerankRemote(query, ranked.map(hit => String(hit.text ?? '')), config);
+    if (!scores || !scores.some(score => score > 0)) return ranked;
+    return ranked
+      .map((hit, index) => ({
+        ...hit,
+        rerankScore: Number((scores[index] ?? 0).toFixed(6)),
+        score: Number(((Number(hit.score ?? 0) * 0.25) + ((scores[index] ?? 0) * 0.75) + (hit.exactProblem ? 0.25 : 0)).toFixed(6)),
+      }))
+      .sort((a, b) => b.score - a.score);
+  } catch {
+    return ranked;
+  }
+}
+
 async function runSearch(s, query, limit, scope, options = {}) {
   const terms = queryTerms(query);
   const status = options.status && options.status !== 'all' ? solutionStatusOf(options.status) : null;
@@ -2509,7 +2898,10 @@ async function runSearch(s, query, limit, scope, options = {}) {
     profile.at = now();
     lastSearchProfile = profile;
   }
-  if (!vector.length && !graph.length) return finalizeHits(lexical, limit);
+  if (!vector.length && !graph.length) {
+    const ranked = await maybeRerank(query, lexical, limit, options);
+    return finalizeHits(ranked, limit);
+  }
 
   const fused = new Map();
   const add = (hit, index) => {
@@ -2548,7 +2940,8 @@ async function runSearch(s, query, limit, scope, options = {}) {
       };
     })
     .sort((a, b) => b.score - a.score);
-  return finalizeHits(ranked, limit);
+  const reranked = await maybeRerank(query, ranked, limit, options);
+  return finalizeHits(reranked, limit);
 }
 
 /**
@@ -2870,14 +3263,17 @@ function capProfileLines(lines) {
 }
 
 /** Read the highest-importance notes that fit the always-injected budget. */
-function buildProfileText(projectKey) {
+function buildProfileText(projectKey, options = {}) {
   const s = openStore();
+  const includeAll = options.includeAll === true;
   // Filter the layer in SQL instead of taking 60 rows from every project and
   // discarding most of them in JS: a busy foreign project could otherwise crowd
   // the global notes out of the profile budget.
-  const noteScope = projectKey
-    ? "AND (scope = 'global' OR scope IS NULL OR scope = ?)"
-    : "AND (scope = 'global' OR scope IS NULL)";
+  const noteScope = includeAll
+    ? ''
+    : projectKey
+      ? "AND (scope = 'global' OR scope IS NULL OR scope = ?)"
+      : "AND (scope = 'global' OR scope IS NULL)";
   const rows = prepareCached(s.db,
     `SELECT id, text, importance, scope FROM notes
      WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0
@@ -2887,24 +3283,48 @@ function buildProfileText(projectKey) {
   // Global notes follow the model everywhere; project notes only in their own
   // project. Unknown project => global only, so one project cannot leak into
   // another through the always-injected block.
-  const visible = rows.filter(row => {
+  const visible = includeAll ? rows : rows.filter(row => {
     const scope = String(row.scope ?? 'global');
     if (scope === 'global' || scope === '') return true;
     return projectKey ? scope === projectKey : false;
   });
   const lines = [];
   let used = 0;
-  for (const row of visible) {
-    const line = `- ${row.text}`;
-    if (used + line.length > PROFILE_BUDGET) continue;
+  const addLine = line => {
+    if (used + line.length > PROFILE_BUDGET) return false;
     used += line.length;
     lines.push(line);
+    return true;
+  };
+  // Layered profile: global rules first, then the current project's rules.
+  // The headings make the budget boundary visible instead of silently mixing
+  // two layers into one undifferentiated bullet list.
+  const globalRows = visible.filter(row => String(row.scope ?? SCOPE_GLOBAL) === SCOPE_GLOBAL);
+  const projectRows = projectKey
+    ? visible.filter(row => String(row.scope ?? SCOPE_GLOBAL) === projectKey)
+    : [];
+  if (globalRows.length) {
+    addLine('## 全局');
+    for (const row of globalRows) addLine(`- ${row.text}`);
+  }
+  if (projectRows.length) {
+    addLine('## 当前项目');
+    for (const row of projectRows) addLine(`- ${row.text}`);
+  }
+  if (includeAll) {
+    const otherRows = visible.filter(row => {
+      const scope = String(row.scope ?? SCOPE_GLOBAL);
+      return scope !== SCOPE_GLOBAL && scope !== projectKey;
+    });
+    if (otherRows.length) {
+      addLine('## 其他项目');
+      for (const row of otherRows) addLine(`- ${row.text}`);
+    }
   }
 
   for (const line of profileFactLines(s.db, projectKey || SCOPE_GLOBAL, PROFILE_BUDGET - used)) {
     const withBullet = line === '相关事实：' ? line : `- ${line}`;
-    used += withBullet.length;
-    lines.push(withBullet);
+    if (addLine(withBullet) === false) break;
   }
   return capProfileLines(lines);
 }
@@ -3012,6 +3432,62 @@ const HOST_OPENAPI = {
     },
     '/omni-memory/status': {
       get: { summary: 'Runtime status', responses: { 200: { description: 'Status' } } },
+    },
+    '/omni-memory/consolidate': {
+      post: {
+        summary: 'Consolidate notes sharing one problemKey',
+        description: 'Requires x-omni-csrf: 1. Dry-run unless apply=1; applying supersedes the source notes, never deletes them.',
+        parameters: [
+          { name: 'problemKey', in: 'query', required: true, schema: { type: 'string' } },
+          { name: 'scope', in: 'query', schema: { type: 'string' }, description: 'One exact global/project key; all and project are rejected.' },
+          { name: 'minNotes', in: 'query', schema: { type: 'integer', minimum: 2, maximum: 10, default: 2 } },
+          { name: 'apply', in: 'query', schema: { type: 'boolean', default: false } },
+        ],
+        responses: { 200: { description: 'Dry-run or applied summary' }, 403: { description: 'Missing CSRF header or non-loopback caller' } },
+      },
+    },
+    '/omni-memory/ingest': {
+      post: {
+        summary: 'Ingest one transcript turn from any host',
+        description: 'Requires x-omni-csrf: 1. Writes a chunk and parks at most three candidates; never writes a note directly.',
+        parameters: [
+          { name: 'text', in: 'query', required: true, schema: { type: 'string' } },
+          { name: 'role', in: 'query', schema: { type: 'string', enum: ['user', 'assistant', 'system', 'tool', 'note'], default: 'user' } },
+          { name: 'sessionId', in: 'query', schema: { type: 'string' } },
+          { name: 'source', in: 'query', schema: { type: 'string' } },
+          { name: 'cwd', in: 'query', schema: { type: 'string' } },
+          { name: 'scope', in: 'query', schema: { type: 'string' } },
+          { name: 'importance', in: 'query', schema: { type: 'number', minimum: 0, maximum: 1 } },
+          { name: 'extract', in: 'query', schema: { type: 'boolean', default: true } },
+        ],
+        responses: { 200: { description: 'Chunk id, scope and pending candidates' }, 403: { description: 'Missing CSRF header or non-loopback caller' } },
+      },
+    },
+    '/omni-memory/candidates': {
+      get: {
+        summary: 'List extracted note candidates',
+        parameters: [
+          { name: 'status', in: 'query', schema: { type: 'string', enum: ['pending', 'accepted', 'rejected', 'all'], default: 'pending' } },
+          { name: 'scope', in: 'query', schema: { type: 'string' } },
+          { name: 'cwd', in: 'query', schema: { type: 'string' } },
+          { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 100, default: 20 } },
+        ],
+        responses: { 200: { description: 'Candidate queue' } },
+      },
+    },
+    '/omni-memory/candidate': {
+      post: {
+        summary: 'Accept or reject one candidate',
+        description: 'Requires x-omni-csrf: 1. Accepting writes a normal note with the chunk source; review is scoped by default.',
+        parameters: [
+          { name: 'id', in: 'query', required: true, schema: { type: 'integer' } },
+          { name: 'action', in: 'query', required: true, schema: { type: 'string', enum: ['accept', 'reject'] } },
+          { name: 'scope', in: 'query', schema: { type: 'string' } },
+          { name: 'cwd', in: 'query', schema: { type: 'string' } },
+          { name: 'reason', in: 'query', schema: { type: 'string' } },
+        ],
+        responses: { 200: { description: 'Review result' }, 403: { description: 'Missing CSRF header or non-loopback caller' } },
+      },
     },
     '/omni-memory/tool': {
       post: {
@@ -3209,6 +3685,88 @@ function defineTools(ctx) {
       if (typeof dispose === 'function') dispose();
     };
   };
+
+  disposers.push(registerLocalTool({
+    name: 'memory_ingest',
+    description: 'Ingest one user/assistant transcript turn from any host. Writes a transcript chunk and, by default, extracts at most three pending note candidates. It never writes a note directly; review candidates with memory_candidate.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        text: { type: 'string', description: 'The transcript turn to store.' },
+        role: { type: 'string', enum: ['user', 'assistant', 'system', 'tool', 'note'], description: 'Speaker role; default user.' },
+        source: { type: 'string', description: 'Optional provenance, e.g. session id plus turn.' },
+        sessionId: { type: 'string', description: 'Optional host session id; also used to remember the project layer.' },
+        cwd: { type: 'string', description: 'Working directory used to derive the project layer when scope is omitted.' },
+        scope: { type: 'string', description: 'Explicit global/project key. scope=project means the current project; scope=all is rejected.' },
+        importance: { type: 'number', description: '0..1 transcript weight (default 0.6 for user, 0.4 for assistant).' },
+        extract: { type: 'boolean', description: 'Set false to store the transcript without creating candidates.' },
+      },
+      required: ['text'],
+    },
+    output: {
+      schema: { type: 'object', properties: { id: { type: 'number' }, deduped: { type: 'boolean' }, scope: { type: 'string' }, sessionId: { type: 'string' }, chars: { type: 'number' }, truncated: { type: 'boolean' }, candidates: { type: 'array', items: {} } } },
+      render: (_args, value) => textBlock(`ingested chunk #${value.id}${value.deduped ? ' (duplicate)' : ''} · ${value.candidates?.length ?? 0} candidate(s)`),
+    },
+    async execute(args, toolContext = {}) {
+      return ingestTranscript(args, toolContext);
+    },
+  }));
+
+  disposers.push(registerLocalTool({
+    name: 'memory_candidate',
+    description: 'Review pending notes extracted from transcripts. action=list shows the queue; action=accept turns one candidate into a note; action=reject dismisses it. Acceptance never bypasses the normal note write path and keeps the chunk source.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['list', 'accept', 'reject'], description: 'Default list.' },
+        id: { type: 'number', description: 'Candidate id for accept/reject.' },
+        status: { type: 'string', enum: ['pending', 'accepted', 'rejected', 'all'], description: 'List filter; default pending.' },
+        scope: { type: 'string', description: 'List/review visibility. Default current project + global; all requires explicit scope=all.' },
+        cwd: { type: 'string', description: 'Derive the project layer from a working directory when scope is omitted.' },
+        limit: { type: 'number', description: 'List size, 1..100 (default 20).' },
+        reason: { type: 'string', description: 'Optional rejection reason.' },
+      },
+    },
+    output: {
+      schema: { type: 'object', properties: { action: { type: 'string' }, total: { type: 'number' }, candidates: { type: 'array', items: {} }, noteId: { type: 'number' }, status: { type: 'string' } } },
+      render: (_args, value) => value.action === 'list'
+        ? textBlock(`${value.total} ${value.status} candidate(s)${value.candidates?.length ? ': ' + value.candidates.map(item => `#${item.id} ${String(item.text).slice(0, 100)}`).join(' | ') : ''}`)
+        : textBlock(`${value.action} candidate #${value.id} -> ${value.status}${value.noteId ? ` (note #${value.noteId})` : ''}`),
+    },
+    async execute(args, toolContext = {}) {
+      const action = String(args.action ?? 'list').trim().toLowerCase();
+      if (action === 'list') return listNoteCandidates(args, toolContext);
+      if (action === 'accept' || action === 'reject') {
+        return reviewNoteCandidate(args.id, action, args, toolContext);
+      }
+      throw new Error('action must be list, accept or reject');
+    },
+  }));
+
+  disposers.push(registerLocalTool({
+    name: 'memory_consolidate',
+    description: 'Consolidate active notes sharing one problemKey into a source-linked summary. Dry-run by default; apply=true supersedes the inputs via superseded_by and preserves summed feedback counters.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        problemKey: { type: 'string', description: 'Stable problem fingerprint; matching is case-insensitive and whitespace-normalized.' },
+        scope: { type: 'string', description: 'One exact scope: global or a project key. Defaults to the current project; all/project are rejected.' },
+        minNotes: { type: 'number', description: 'Minimum active notes to consolidate, 2..10 (default 2).' },
+        apply: { type: 'boolean', description: 'Write the summary and supersede inputs; default false (dry run).' },
+      },
+      required: ['problemKey'],
+    },
+    output: {
+      schema: { type: 'object', properties: { problemKey: { type: 'string' }, scope: { type: 'string' }, applied: { type: 'boolean' }, notes: { type: 'number' }, noteId: { type: 'number' }, sourceIds: { type: 'array', items: { type: 'number' } }, summary: { type: 'string' }, reason: { type: 'string' } } },
+      render: (_args, value) => textBlock(`${value.applied ? 'consolidated' : 'would consolidate'} ${value.notes} note(s)${value.noteId ? ` -> #${value.noteId}` : ''}${value.reason ? ` (${value.reason})` : ''}\n${String(value.summary ?? '').slice(0, 500)}`),
+    },
+    async execute(args, toolContext = {}) {
+      return consolidateProblemNotes(args.problemKey, args, toolContext);
+    },
+  }));
 
   disposers.push(registerLocalTool({
     name: 'memory_write',
@@ -3559,6 +4117,7 @@ function defineTools(ctx) {
           description: 'Optional layer filter: note, fact, chunk, or all (default).',
         },
         limit: { type: 'number', description: 'Maximum hits, default 8, max 30.' },
+        rerank: { type: 'boolean', description: 'Set false to skip the optional cross-encoder reranker (OMNI_RERANK_*); defaults to the configured provider.' },
         scope: {
           type: 'string',
           description: "Optional layer filter: a project scope (returns that project plus global), 'global', or 'all'. Omit to use the current project when one is known.",
@@ -3617,7 +4176,7 @@ function defineTools(ctx) {
         ? searchProblemKey(s, problemKey, limit, scope, { status: requestedStatus })
         : [];
       const result = queryTerms(query).length
-        ? await runSearch(s, query, limit, scope, { status: requestedStatus, kind: requestedKind })
+        ? await runSearch(s, query, limit, scope, { status: requestedStatus, kind: requestedKind, rerank: args.rerank })
         : { hits: [] };
       const merged = [];
       const seen = new Set();
@@ -4220,26 +4779,12 @@ function defineTools(ctx) {
     async execute(args = {}, toolContext = {}) {
       const s = openStore();
       const requested = String(args.scope ?? '').trim();
-      const scope = requested === 'all' ? null : (requested || currentProject(toolContext) || SCOPE_GLOBAL);
-      const filter = scope ? scopeClause('scope', scope) : { sql: '', params: [] };
-      const rows = prepareCached(s.db, `
-        SELECT id, text, importance, source, scope FROM notes
-        WHERE deleted_at IS NULL AND superseded_by IS NULL AND contested = 0
-          AND COALESCE(solution_status, 'unverified') NOT IN ('failed', 'expired') ${filter.sql}
-        ORDER BY importance DESC, ts DESC LIMIT 60
-      `).all(...filter.params);
-      let used = 0;
-      const picked = [];
-      for (const row of rows) {
-        const line = `- ${row.text}`;
-        if (used + line.length > PROFILE_BUDGET) continue;
-        used += line.length;
-        picked.push({ id: Number(row.id), text: row.text, scope: row.scope });
-      }
-      for (const line of profileFactLines(s.db, scope, PROFILE_BUDGET - used)) {
-        used += line.length;
-        picked.push({ id: null, text: line === '相关事实：' ? line : line, scope: 'facts' });
-      }
+      const includeAll = requested === 'all';
+      const projectKey = requested === 'all' || requested === 'global'
+        ? null
+        : (requested === 'project' ? currentProject(toolContext) : (requested || currentProject(toolContext))) || null;
+      const text = buildProfileText(projectKey, { includeAll });
+      const picked = text ? text.split('\n').filter(line => line.startsWith('- ')).length : 0;
       const count = table => Number(prepareCached(s.db, `SELECT COUNT(*) AS n FROM ${table} WHERE deleted_at IS NULL`).get().n);
       const stats = {
         notes: count('notes'),
@@ -4248,10 +4793,7 @@ function defineTools(ctx) {
         db: path.basename(DB_FILE),
         fts: s.ftsMode,
       };
-      const text = picked.length
-        ? capProfileLines(picked.map(item => `- ${item.text}`))
-        : '';
-      return { text, stats, picked: picked.length, budget: PROFILE_BUDGET };
+      return { text, stats, picked, budget: PROFILE_BUDGET };
     },
   }));
 
@@ -4482,7 +5024,7 @@ function json(res, status, body) {
 /** Read a small JSON request body; never trusts its size or shape. */
 function readJsonBody(req, limit = 8192) {
   return new Promise(resolve => {
-    if (!req || typeof req.on !== 'function') {
+    if (!req || typeof req.on !== 'function' || req.complete === true || req.readable === false) {
       resolve({});
       return;
     }
@@ -4554,6 +5096,115 @@ function registerRoutes(ctx) {
         ...packet,
         generatedAt: now(),
       });
+    },
+  });
+
+  add({
+    kind: 'exact',
+    path: '/omni-memory/ingest',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) return json(res, 403, { ok: false });
+      if (String(req.method ?? 'GET').toUpperCase() !== 'POST') {
+        return json(res, 405, { ok: false, error: 'ingest requires POST' });
+      }
+      if (!mutationAllowed(req)) return json(res, 403, { ok: false, error: 'forbidden' });
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      const body = await readJsonBody(req);
+      const text = String(url.searchParams.get('text') ?? body.text ?? '').trim();
+      if (!text) return json(res, 400, { ok: false, error: 'text is required' });
+      const sessionId = String(url.searchParams.get('sessionId') ?? body.sessionId ?? '').trim() || null;
+      try {
+        const result = ingestTranscript({
+          text,
+          role: url.searchParams.get('role') ?? body.role ?? 'user',
+          source: url.searchParams.get('source') ?? body.source ?? undefined,
+          sessionId,
+          cwd: url.searchParams.get('cwd') ?? body.cwd ?? undefined,
+          scope: url.searchParams.get('scope') ?? body.scope ?? undefined,
+          importance: url.searchParams.get('importance') ?? body.importance ?? undefined,
+          extract: url.searchParams.get('extract') ?? body.extract ?? '1',
+        }, { agent: { id: sessionId ?? undefined }, session: { id: sessionId ?? undefined } });
+        return json(res, 200, { ok: true, ...result });
+      } catch (error) {
+        return json(res, 400, { ok: false, error: error?.message ?? String(error) });
+      }
+    },
+  });
+
+  add({
+    kind: 'exact',
+    path: '/omni-memory/consolidate',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) return json(res, 403, { ok: false });
+      if (String(req.method ?? 'GET').toUpperCase() !== 'POST') {
+        return json(res, 405, { ok: false, error: 'consolidate requires POST' });
+      }
+      if (!mutationAllowed(req)) return json(res, 403, { ok: false, error: 'forbidden' });
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      const body = await readJsonBody(req);
+      const problemKey = String(url.searchParams.get('problemKey') ?? body.problemKey ?? '').trim();
+      const sessionId = String(url.searchParams.get('sessionId') ?? body.sessionId ?? '').trim() || null;
+      try {
+        const result = consolidateProblemNotes(problemKey, {
+          scope: url.searchParams.get('scope') ?? body.scope ?? undefined,
+          minNotes: url.searchParams.get('minNotes') ?? body.minNotes ?? 2,
+          apply: url.searchParams.get('apply') === '1' || url.searchParams.get('apply') === 'true' || body.apply === true,
+        }, { agent: { id: sessionId ?? undefined }, session: { id: sessionId ?? undefined } });
+        return json(res, 200, { ok: true, ...result });
+      } catch (error) {
+        return json(res, 400, { ok: false, error: error?.message ?? String(error) });
+      }
+    },
+  });
+
+  add({
+    kind: 'exact',
+    path: '/omni-memory/candidates',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) return json(res, 403, { ok: false });
+      if (String(req.method ?? 'GET').toUpperCase() !== 'GET') {
+        return json(res, 405, { ok: false, error: 'candidates requires GET' });
+      }
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      const sessionId = String(url.searchParams.get('sessionId') ?? '').trim() || null;
+      try {
+        const result = listNoteCandidates({
+          status: url.searchParams.get('status') ?? 'pending',
+          scope: url.searchParams.get('scope') ?? undefined,
+          cwd: url.searchParams.get('cwd') ?? undefined,
+          limit: url.searchParams.get('limit') ?? 20,
+        }, { agent: { id: sessionId ?? undefined }, session: { id: sessionId ?? undefined } });
+        return json(res, 200, { ok: true, ...result });
+      } catch (error) {
+        return json(res, 400, { ok: false, error: error?.message ?? String(error) });
+      }
+    },
+  });
+
+  add({
+    kind: 'exact',
+    path: '/omni-memory/candidate',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) return json(res, 403, { ok: false });
+      if (String(req.method ?? 'GET').toUpperCase() !== 'POST') {
+        return json(res, 405, { ok: false, error: 'candidate requires POST' });
+      }
+      if (!mutationAllowed(req)) return json(res, 403, { ok: false, error: 'forbidden' });
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      const body = await readJsonBody(req);
+      const id = Number(url.searchParams.get('id') ?? body.id ?? 0);
+      const action = String(url.searchParams.get('action') ?? body.action ?? '').trim();
+      const sessionId = String(url.searchParams.get('sessionId') ?? body.sessionId ?? '').trim() || null;
+      try {
+        const result = reviewNoteCandidate(id, action, {
+          scope: url.searchParams.get('scope') ?? body.scope ?? undefined,
+          cwd: url.searchParams.get('cwd') ?? body.cwd ?? undefined,
+          reason: url.searchParams.get('reason') ?? body.reason ?? undefined,
+        }, { agent: { id: sessionId ?? undefined }, session: { id: sessionId ?? undefined } });
+        return json(res, 200, { ok: true, ...result });
+      } catch (error) {
+        return json(res, 400, { ok: false, error: error?.message ?? String(error) });
+      }
     },
   });
 
@@ -5075,7 +5726,8 @@ function registerRoutes(ctx) {
       // A bare HTTP request gets global only. "all" is an explicit audit choice;
       // project keys include that project plus global.
       const scope = requestedScope === 'all' ? null : (requestedScope || SCOPE_GLOBAL);
-      const result = await runSearch(s, query, limit, scope);
+      const rerank = url.searchParams.get('rerank') === '0' ? false : undefined;
+      const result = await runSearch(s, query, limit, scope, { rerank });
       return json(res, 200, { ok: true, scope: requestedScope || SCOPE_GLOBAL, hits: result.hits });
     },
   });

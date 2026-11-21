@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | 3.8.0 |
-| 插件版本 | 3.8.0 |
+| 文档版本 | 3.9.0 |
+| 插件版本 | 3.9.0 |
 | 状态 | 已评审（本文为开发与验收的**唯一依据**） |
 | 目标平台 | DSH 0.2.2-rc.3 原生插件（Desktop，Windows 11，Node 24.17）；MCP / HTTP / OpenAPI / CLI 宿主通用 |
 | 最后更新 | 2026-11-21 |
@@ -75,6 +75,9 @@
 | FR-35 | 笔记修订链 | `memory_amend` 产生新 revision，旧行 `superseded_by` 指向新行；搜索只见新行，旧行保留审计 | ✅ 已实现 |
 | FR-36 | 检索质量门禁 | 黄金集 recall ≥ 0.85、MRR ≥ 0.9；`npm run bench:golden` 失败即退出码 1，CI 强制执行 | ✅ 已实现（当前 MRR 0.927） |
 | FR-37 | 无 MCP 宿主适配 | `GET /packet` 返回可注入的画像+召回包；`POST /tool` 暴露受限工具面；`openapi.json` 可被 function-calling/OpenAPI 客户端导入 | ✅ 已实现（HTTP adapter） |
+| FR-38 | 会话自动捕获 | `memory_ingest` 写转录并抽取 pending 候选；候选必须显式 accept 才成为 note；`scope=all` 拒写；单条上限 4000 字、每 chunk ≤3 候选 | ✅ 已实现（schema v13） |
+| FR-39 | 经验巩固 | `memory_consolidate` 按精确 `problemKey` + 精确 scope 合并；默认 dry-run；应用时写来源链摘要、旧行只 supersede、反馈计数汇总 | ✅ 已实现 |
+| FR-40 | 分层画像与重排 | 画像分 `## 全局` / `## 当前项目`；可选 cross-encoder rerank（未配置端点零延迟，失败回落融合排序）；本地/远程 embedding 预设 | ✅ 已实现 |
 
 ### 1.2 非功能需求
 
@@ -89,9 +92,9 @@
 | NFR-07 | 失败隔离 | 任一子系统（FTS/路由/注入）失效不得导致会话不可用 | 满足（全部 try/catch + 可选降级） |
 | NFR-08 | 隐私 | 所有数据仅存本机 `$DSH_HOME/memory/omni.db`；HTTP 仅 loopback，且浏览器跨站写请求被 Origin 校验拦截 | 部分满足：数据库未加密，loopback HTTP 仍依赖本机进程边界，未做进程级鉴权（ADR-017） |
 | NFR-09 | 可卸载 | 卸载插件后不残留运行中的监听；数据文件保留由用户决定 | 满足 |
-| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 257/257（100%） |
+| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 275/275（100%） |
 | NFR-11 | 界面本地化 | 中英词典注册，切换语言无需重载插件 | 已实现（词典 + 订阅重渲染） |
-| NFR-12 | 多进程并发 | 同机 N 个宿主进程共用一个库，同时读写不丢数据、不报锁错 | 257/257 含 6 进程并发用例；写入等待上限 5s（ADR-028） |
+| NFR-12 | 多进程并发 | 同机 N 个宿主进程共用一个库，同时读写不丢数据、不报锁错 | 275/275 含 6 进程并发用例；写入等待上限 5s（ADR-028） |
 
 ### 1.3 约束
 
@@ -151,15 +154,15 @@
 
 ```
 DSH Host 进程
-├── 本插件 Host 半边（index.js，~2561 行）
+├── 本插件 Host 半边（index.js，~5896 行）
 │   ├── store         SQLite 句柄与 schema/迁移（唯一写入口）
 │   ├── capture       session/event → chunks
 │   ├── recall        agent/inbox/claimed → 异步预取 top-3（TTL 120s）
 │   ├── retrieval     分词 / FTS / bigram / 向量 / 图游走 / RRF
-│   ├── tools         20 个插件工具（write/search/solution_report/profile/timeline/forget/dream/dream_proposals/dream_replace/dream_rollback/compact/reindex/export/import/restore/link_entity/persona/get/feedback/amend）
+│   ├── tools         23 个插件工具（write/ingest/candidate/consolidate/search/solution_report/profile/timeline/forget/dream/dream_proposals/dream_replace/dream_rollback/compact/reindex/export/import/restore/link_entity/persona/get/feedback/amend）
 │   ├── prompt        systemPrompt.section：画像 + 召回段（同步读缓存）
-│   └── routes        16 条 loopback HTTP（list/search/graph/node/forget/restore/export/status/persona/persona/refresh/dream/proposals/dream/replace/dream/rollback/packet/openapi.json/tool）
-├── 本插件 Client 半边（client.js，~1108 行）
+│   └── routes        20 条 loopback HTTP（list/search/graph/node/forget/restore/export/status/persona/persona/refresh/dream/proposals/dream/replace/dream/rollback/packet/openapi.json/tool/ingest/candidates/candidate/consolidate）
+├── 本插件 Client 半边（client.js，~1500 行）
 │   ├── sidebar.panellist[id=omni-memory]   左栏入口图标
 │   ├── main[key=omni-memory]               记忆面板（分页/搜索/状态/遗忘）
 │   └── conversation.composer.dock[memory-tail]  对话结尾状态小尾巴
@@ -211,7 +214,7 @@ chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 ### 4.3 迁移策略
 
 `meta.schema_version` 记录整数版本；启动时按序执行 `MIGRATIONS[n]`。
-**当前版本 12**。v7 移除全局 `chunks.hash` 唯一索引，改为按 `(hash, scope)` 的部分唯一索引；为 `edges` 补 `scope`、为 `facts` 补 `recorded_at`；新增 `bigrams` 索引表；并回填旧数据的 scope 与 bigram。v11 为 notes 增加故障经验字段，旧行保持为空/NULL，按 unverified 读取。v12 为 notes/facts 增加召回反馈计数（`recall_count`、`last_recall_at`、`useful_count`、`misleading_count`），旧行从 0 起算。新增列/索引必须写迁移，禁止直接改 `CREATE TABLE` 语句（新库与老库必须收敛到同一结构）。
+**当前版本 13**。v7 移除全局 `chunks.hash` 唯一索引，改为按 `(hash, scope)` 的部分唯一索引；为 `edges` 补 `scope`、为 `facts` 补 `recorded_at`；新增 `bigrams` 索引表；并回填旧数据的 scope 与 bigram。v11 为 notes 增加故障经验字段，旧行保持为空/NULL，按 unverified 读取。v12 为 notes/facts 增加召回反馈计数（`recall_count`、`last_recall_at`、`useful_count`、`misleading_count`），旧行从 0 起算。v13 新增 `note_candidates`（会话自动捕获的待审候选），带 `status/scope/hash` 索引，旧库补表不丢数据。新增列/索引必须写迁移，禁止直接改 `CREATE TABLE` 语句（新库与老库必须收敛到同一结构）。
 
 | 版本 | 变更 | 迁移动作 |
 |---|---|---|
@@ -240,6 +243,9 @@ chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 |---|---|---|---|
 | `memory_write` | `kind`(note/fact/episode), `text`, 可选 `scope`/`importance`/`source`/`subject`/`relation`/`object`；note 额外可选 `problemKey`/`solutionStatus`/`evidence` | `{id, kind, deduped, invalidated?, problemKey?, solutionStatus?, reuseCount?}` | `subject is required for kind=fact`；`text is required`；`solutionStatus` 仅限 note |
 | `memory_search` | 可选 `query`，可选 `problemKey`/`status`(all\|verified\|unverified\|failed\|expired)/`kind`(all\|note\|fact\|chunk)/`limit`(1..30)/`scope` | `{total, scope, problemKey?, hits[]}` | 空查询且无 problemKey 返回 `{total:0,hits:[]}`；status/kind 非法时报错 |
+| `memory_ingest` | `text`, 可选 `role`(user/assistant/system/tool/note), `scope`/`sessionId`/`source`/`cwd`/`importance`/`extract` | `{id,deduped,scope,sessionId,chars,truncated,candidates[]}` | `scope=all` 拒写；note 候选先 pending |
+| `memory_candidate` | `action`(list/accept/reject), `id`(accept/reject), 可选 `status`/`scope`/`cwd`/`limit`/`reason` | `{action,total,candidates[]}` 或 `{id,action,noteId?,reason?}` | 默认当前项目+global；跨项目需 `scope=all` |
+| `memory_consolidate` | `problemKey`, 可选 `scope`/`minNotes`(2..10)/`apply`(默认 false) | `{problemKey,scope,applied,notes,n sourceIds,summary?,noteId?}` | `scope=all/project` 拒绝；少于 `minNotes` 返回不足 |
 | `memory_solution_report` | `id`, `outcome`(success/failed/expired), 可选 `evidence` | `{id, solutionStatus, reuseCount, lastUsedAt, verifiedAt}` | 笔记不存在或已被替代/墓碑化时报错 |
 | `memory_feedback` | `kind`(note/fact), `id`, `rating`(useful/misleading), 可选 `scope`(all) | `{id, kind, usefulCount, misleadingCount, feedbackCount, lastFeedbackAt, quality}` | 默认仅当前项目+global；跨项目需显式 `scope=all` |
 | `memory_get` | `items[{kind,id}]`（最多 20），可选 `scope` | `{items[], missing[]}` | 超过 20 条报错 |
@@ -261,11 +267,15 @@ chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 |---|---|---|---|
 | `/omni-memory/list` | GET | `limit`(1..200, 默认 40), `offset`(≥0), `scope`(`all`\|`global`\|`project`\|项目键) | `{ok, db, fts, schema, index, page{limit,offset,scope,totalNotes,totalFacts,hasMore*}, stats{notes,facts,chunks,globalNotes,projectNotes,contested,verified}, projects[{scope,notes,facts,chunks,lastAt}], chunks[]（仅精确项目键）, notes[], facts[]}` |
 | `/omni-memory/graph` | GET | 无 | `{ok, nodes[{id,kind,label,weight,scope}], links[{source,target,rel}]}`（节点 ≤300，无悬空边） |
-| `/omni-memory/search` | GET | `q`, `limit`(1..60) | `{ok, hits[]}` |
+| `/omni-memory/search` | GET | `q`, `limit`(1..60), `rerank`(0/1) | `{ok, hits[]}`；配置 rerank 后按 cross-encoder 分数重排 |
 | `/omni-memory/packet` | GET | `q` `scope` `cwd` `limit`(1..10, 默认 5) `budget`(400..4000, 默认 1800) `format`(`json`\|`text`) | `{ok, format, scope, query, text, chars, hits, truncated, memories[], generatedAt}`；`format=text` 直接输出纯文本 |
-| `/omni-memory/openapi.json` | GET | — | OpenAPI 3.0 描述：packet/search/list/node/status/tool |
+| `/omni-memory/openapi.json` | GET | — | OpenAPI 3.0 描述：10 条 path（packet/search/list/node/status/tool/ingest/candidates/candidate/consolidate） |
 | `/omni-memory/tool` | POST | body `name` `arguments`；header `x-omni-csrf: 1` | `{ok, name, value, text}`；仅允许 write/search/solution_report/feedback/get/amend/profile/timeline |
 | `/omni-memory/forget` | **POST**（GET 兼容） | `kind`, `id`（**查询参数**；宿主可能已读空 body） | `{ok, forgotten}` |
+| `/omni-memory/ingest` | POST | `text`（必填）, `role`, `scope`, `cwd`, `sessionId`, `source`, `importance`, `extract` | `{ok,id,deduped,scope,sessionId,chars,truncated,candidates[]}` |
+| `/omni-memory/candidates` | GET | `status`(pending/accepted/rejected/all), `scope`, `cwd`, `limit` | `{ok,action:'list',total,candidates[]}` |
+| `/omni-memory/candidate` | POST | `id`, `action`(accept/reject), `scope`, `cwd`, `reason` | `{ok,id,action,noteId?,reason?}` |
+| `/omni-memory/consolidate` | POST | `problemKey`（必填）, `scope`, `minNotes`, `apply` | `{ok,problemKey,scope,applied,notes,noteId?,sourceIds[],summary?}` |
 
 > 平台约束（实测 2026-11-15）：DSH 在 **`/api` 前缀**上注册了连接鉴权（`connection.admit`），非浏览器会话请求会被 `401 unauthorized` 拦下，且响应不是 JSON。插件自建路由必须避开该前缀，本插件统一使用 **`/omni-memory/*`**。
 
@@ -488,6 +498,9 @@ score = 0.6 × 文本分 + 0.2 × 权重分 + 0.2 × 时效分 + 经验状态分
 | FR-17/21 | `test/semantic.test.mjs`、`test/fixes.test.mjs` | 远程维度重启、旧库回填、词面/混合排序 |
 | FR-23 | `test/fixes.test.mjs`、`test/compact.test.mjs` | 墓碑后同文重捕、compact 事务 |
 | FR-26/27/28 | `test/scope-model-judge.test.mjs`、`test/fixes.test.mjs` | HTTP scope、`scope=all` 拒写、跨 scope 事实隔离 |
+| FR-38 | `test/ingest.test.mjs`、`test/capture-rules.test.mjs` | ingest 候选、接受/拒绝、隔离、去重、hook 解析 |
+| FR-39 | `test/consolidation.test.mjs` | dry-run、apply、supersede、来源链、scope 隔离 |
+| FR-40 | `test/rerank.test.mjs`、`test/prompt.test.mjs` | rerank 开关、远程评分顺序、分层画像预算 |
 | FR-29 | `test/starmap.test.mjs` | 节点/边投影、聚焦与高亮 |
 | NFR-04 | `test/store.test.mjs` | 重开数据库后数据可读 |
 | NFR-07 | `test/resilience.test.mjs` | FTS 缺失降级、注入抛错返回空串 |

@@ -33,7 +33,16 @@ const USAGE = `全息记忆 · omni
                不给 --file 时，自动查找 CLAUDE.md / AGENTS.md / .cursorrules
   omni context [--query <文本>] [--scope <层级>] [--limit <n>]
                输出画像与相关记忆，适合给 hooks 拼接上下文
-  omni search  <关键词> [--scope <层级>] [--limit <n>]
+  omni search  <关键词> [--scope <层级>] [--limit <n>] [--rerank]
+  omni ingest  (--text <文本> | --stdin | --file <路径>) [--role user|assistant|system|tool]
+               [--session <id>] [--source <来源>] [--cwd <目录>] [--scope <层级>]
+               [--no-extract]   把一轮对话写入转录层；默认生成待确认候选 note
+  omni candidates [--status pending|accepted|rejected|all] [--scope <层级>] [--cwd <目录>]
+               查看候选 note 队列
+  omni candidate --id <候选id> --action accept|reject [--reason <原因>] [--scope <层级>]
+               接受或拒绝一条候选 note
+  omni consolidate --problem-key <指纹> [--scope <层级>] [--min-notes <n>] [--apply]
+               把同问题指纹的活跃笔记浓缩成来源链摘要；默认 dry-run
   omni write   --kind note|fact|episode (--text <文本> | --stdin | --file <路径>)
                [--scope <层级>] [--importance <0..1>] [--source <来源>]
                [--problem-key <指纹>] [--status verified|unverified|failed|expired]
@@ -187,6 +196,112 @@ async function commandContext() {
   }
 }
 
+function hookPayloadText(raw) {
+  try {
+    const payload = JSON.parse(raw);
+    const candidates = [
+      payload?.prompt,
+      payload?.user_prompt,
+      payload?.text,
+      payload?.last_assistant_message,
+      payload?.message?.content,
+      payload?.message,
+      payload?.content,
+    ];
+    for (const value of candidates) {
+      if (typeof value === 'string' && value.trim()) return value.trim();
+      if (Array.isArray(value)) {
+        const text = value
+          .filter(block => block?.type === 'text' || typeof block === 'string')
+          .map(block => typeof block === 'string' ? block : block.text ?? '')
+          .join('\n').trim();
+        if (text) return text;
+      }
+    }
+  } catch { /* not JSON; treat as plain text */ }
+  return String(raw ?? '').trim();
+}
+
+async function commandIngest() {
+  let text = String(flags.text ?? '');
+  if (!text && flags.stdin === true) text = hookPayloadText(await readStdin());
+  if (!text && flags.file) text = readFileSync(path.resolve(workdir, String(flags.file)), 'utf8').trim();
+  if (!text) {
+    log('需要内容：--text、--stdin 或 --file');
+    process.exitCode = 2;
+    return;
+  }
+  const args = { text, cwd: String(flags.cwd ?? workdir) };
+  if (flags.role) args.role = String(flags.role);
+  if (flags.session) args.sessionId = String(flags.session);
+  if (flags.source) args.source = String(flags.source);
+  if (flags.scope) args.scope = String(flags.scope);
+  if (flags['no-extract'] === true) args.extract = false;
+  const booted = await boot();
+  try {
+    const value = await callTool(booted, 'memory_ingest', args);
+    process.stdout.write(JSON.stringify(value) + '\n');
+  } finally {
+    booted.host.dispose();
+  }
+}
+
+async function commandCandidates() {
+  const args = { action: 'list' };
+  if (flags.status) args.status = String(flags.status);
+  if (flags.scope) args.scope = String(flags.scope);
+  if (flags.cwd) args.cwd = String(flags.cwd);
+  if (flags.limit) args.limit = Number(flags.limit);
+  const booted = await boot();
+  try {
+    const value = await callTool(booted, 'memory_candidate', args);
+    process.stdout.write(JSON.stringify(value) + '\n');
+  } finally {
+    booted.host.dispose();
+  }
+}
+
+async function commandCandidate() {
+  const id = Number(flags.id);
+  const action = String(flags.action ?? '').trim().toLowerCase();
+  if (!Number.isFinite(id) || id <= 0 || !['accept', 'reject'].includes(action)) {
+    log('需要 --id <正整数> 与 --action accept|reject');
+    process.exitCode = 2;
+    return;
+  }
+  const args = { action, id };
+  if (flags.scope) args.scope = String(flags.scope);
+  if (flags.cwd) args.cwd = String(flags.cwd);
+  if (flags.reason) args.reason = String(flags.reason);
+  const booted = await boot();
+  try {
+    const value = await callTool(booted, 'memory_candidate', args);
+    process.stdout.write(JSON.stringify(value) + '\n');
+  } finally {
+    booted.host.dispose();
+  }
+}
+
+async function commandConsolidate() {
+  const problemKey = String(flags['problem-key'] ?? '').trim();
+  if (!problemKey) {
+    log('需要 --problem-key <指纹>');
+    process.exitCode = 2;
+    return;
+  }
+  const args = { problemKey };
+  if (flags.scope) args.scope = String(flags.scope);
+  if (flags['min-notes']) args.minNotes = Number(flags['min-notes']);
+  if (flags.apply === true) args.apply = true;
+  const booted = await boot();
+  try {
+    const value = await callTool(booted, 'memory_consolidate', args);
+    process.stdout.write(JSON.stringify(value) + '\n');
+  } finally {
+    booted.host.dispose();
+  }
+}
+
 async function commandWrite() {
   const kind = String(flags.kind ?? 'note');
   let text = String(flags.text ?? '');
@@ -273,6 +388,7 @@ async function commandSearch() {
     if (problemKey) args.problemKey = problemKey;
     if (flags.status) args.status = String(flags.status);
     if (flags.kind) args.kind = String(flags.kind);
+    if (flags.rerank) args.rerank = true;
     const value = await callTool(booted, 'memory_search', args);
     const def = booted.host.tools.get('memory_search');
     const blocks = def.output.render(args, value);
@@ -315,6 +431,18 @@ switch (command) {
     break;
   case 'search':
     await commandSearch();
+    break;
+  case 'ingest':
+    await commandIngest();
+    break;
+  case 'candidates':
+    await commandCandidates();
+    break;
+  case 'candidate':
+    await commandCandidate();
+    break;
+  case 'consolidate':
+    await commandConsolidate();
     break;
   case 'write':
     await commandWrite();

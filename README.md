@@ -7,12 +7,12 @@
 > **源码/架构**后做商业替代、竞品或商业服务；且**必须署名作者**。
 > 商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-257%2F257-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-275%2F275-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-Personal%20Use%201.1-lightgrey)](LICENSE)
 
 ---
 
-**完整机理与接口参考**：[`docs/REFERENCE.md`](docs/REFERENCE.md) —— schema、写入与检索机理、20 个工具、16 条路由、MCP 协议面、CLI、环境变量、AI 调用剧本。执行 `npm run memory:sync` 可把整本手册拆成笔记写进记忆库，之后用 `memory_search` 就能直接检索到。
+**完整机理与接口参考**：[`docs/REFERENCE.md`](docs/REFERENCE.md) —— schema、写入与检索机理、23 个工具、20 条路由、MCP 协议面、CLI、环境变量、AI 调用剧本。执行 `npm run memory:sync` 可把整本手册拆成笔记写进记忆库，之后用 `memory_search` 就能直接检索到。
 
 ## 它解决什么问题
 
@@ -28,7 +28,11 @@
 
 ## 核心能力
 
-- **混合检索**：词面（FTS5 trigram + 中文二元索引）+ 向量（512 维字符 n-gram，可选接真语义嵌入）+ 图游走，RRF 融合排序
+- **混合检索**：词面（FTS5 trigram + 中文二元索引）+ 向量（512 维字符 n-gram，可选接真语义嵌入）+ 图游走，RRF 融合排序；可选 cross-encoder rerank（Jina / Cohere / SiliconFlow / 自建兼容端点）
+- **会话自动捕获**：`memory_ingest` 把任意宿主的对话轮次落成转录与待审候选；候选先 pending，`memory_candidate` 接受后才成为正式笔记，不让人写库成为唯一入口
+- **经验巩固**：`memory_consolidate` 按 `problemKey` 把多条活跃笔记压成带来源链的摘要；默认 dry-run，应用时只写 `superseded_by`，不删除原行
+- **分层画像**：注入画像显式分为 `## 全局`、`## 当前项目`，事实段单独保留，项目规则不再和全局规则混在一起
+- **结论优先去重**：同一段文本同时命中 chunk 与已接受 note 时，搜索结果保留 note/fact，不让原始转录遮住结论
 - **故障经验库**：笔记可带 `problemKey` 问题指纹、`solutionStatus`（verified / unverified / failed / expired）和证据；精确指纹优先命中，已验证解法排在失败尝试之前
 - **复用闭环**：`memory_solution_report` 在真实复用后回写成功/失败/过期，成功累计 `reuseCount` 并标记 verified，失败尝试保留下来避免重复走死路
 - **自动召回**：每轮用你的消息预取 top-3 注入上下文（可关）
@@ -53,7 +57,7 @@
 
 ```bash
 cd /path/to/omni-memory
-npm test          # 257 个用例
+npm test          # 275 个用例
 npm run check     # 语法与 JSON 校验
 ```
 
@@ -64,9 +68,10 @@ npm run check     # 语法与 JSON 校验
 同一份内核可以脱离 DSH 运行，三个入口共用一个本地记忆库：
 
 - `hosts/mcp/bin.mjs` — 零依赖 stdio MCP 服务，Claude Code、Cursor、Cline、Codex CLI、Zed 都能接
-- `hosts/http/server.mjs` — 独立面板 + REST（直接挂载插件原有的 16 条路由）+ HTTP 上的 MCP（`POST /mcp`）
+- `hosts/http/server.mjs` — 独立面板 + REST（直接挂载插件原有的 20 条路由）+ HTTP 上的 MCP（`POST /mcp`）
 - `hosts/cli.mjs` — `omni rules / context / search / serve / mcp`
 - `GET /omni-memory/packet` — 面向无 MCP 宿主的可注入记忆包；`openapi.json` 与 `POST /tool` 给 OpenAPI/function-calling 客户端
+- `POST /omni-memory/ingest` / `GET /omni-memory/candidates` / `POST /omni-memory/candidate` — 会话自动捕获与候选审阅；Claude Code 的 `SessionStart`/`Stop` hook 可用 `omni ingest --stdin`
 
 无 MCP 宿主的接入方式与能力边界见 [`docs/HOST-ADAPTERS.md`](docs/HOST-ADAPTERS.md)。
 
@@ -101,10 +106,15 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 | `OMNI_EMBED_URL` | 未设置 | 接 OpenAI 兼容 `/embeddings` 启用真语义 |
 | `OMNI_EMBED_MODEL` | `text-embedding-3-small` | 远程嵌入模型 |
 | `OMNI_EMBED_KEY` | — | 远程嵌入鉴权 |
-| `OMNI_EMBED_PROVIDER` | 未设置 | 预设：openai / dashscope / zhipu / siliconflow（自动填 url/model） |
+| `OMNI_EMBED_PROVIDER` | 未设置 | 预设：openai / dashscope / zhipu / siliconflow / **ollama / lmstudio**（本机 OpenAI 兼容嵌入；不内置模型） |
 | `OMNI_EMBED_BATCH` | `64` | 每请求最大输入条数 |
 | `OMNI_EMBED_RETRIES` | `2` | 429/5xx 重试次数（250ms、750ms 退避） |
 | `OMNI_EMBED_TIMEOUT_MS` | `10000` | 远程嵌入超时 |
+| `OMNI_RERANK_PROVIDER` | 未设置 | `cohere` / `jina` / `siliconflow`，自动填 URL 与模型 |
+| `OMNI_RERANK_URL` | 未设置 | 自建或兼容 rerank 端点；未设置则完全跳过重排、零额外延迟 |
+| `OMNI_RERANK_KEY` / `OMNI_RERANK_API_KEY` | — | rerank 鉴权 |
+| `OMNI_RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | cross-encoder 模型名 |
+| `OMNI_RERANK_TIMEOUT_MS` | `5000` | rerank 超时；失败时回落到融合排序，不影响主结果 |
 | `OMNI_DREAM_INTERVAL_MS` | `0`（关） | 定时做梦校验 |
 | `OMNI_DISABLE_VECTOR` | 未设置 | `1` 关闭向量路线（诊断用） |
 | `OMNI_DISABLE_GRAPH` | 未设置 | `1` 关闭图路线 |
@@ -114,6 +124,9 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 | 工具 | 作用 |
 |---|---|
 | `memory_write` | 写入笔记 / 事实 / 原始观察；笔记可带 `problemKey` / `solutionStatus` / `evidence`（事实可声明 `cardinality: multi` 保留多值） |
+| `memory_ingest` | 接收一条对话轮次：写转录 chunk，并按确定性规则抽取最多 3 条 pending 候选；支持 Claude Code hook JSON（`--stdin`） |
+| `memory_candidate` | `list` / `accept` / `reject` 候选；接受后才写入正式 note，拒绝保留原因与审计 |
+| `memory_consolidate` | 按同一 `problemKey` 巩固活跃笔记：默认 dry-run，`apply` 写来源链摘要并 supersede 原行，反馈计数汇总 |
 | `memory_search` | 混合检索（支持全局 / 项目 / 全部）；可按 `problemKey` 精确查，按 `status` / `kind` 过滤 |
 | `memory_solution_report` | 记录解法真实复用结果：`success` 标记 verified 并累计次数，`failed` / `expired` 更新状态 |
 | `memory_feedback` | 给召回结果投票 `useful` / `misleading`，计入排序信号；错误召回不再反复污染上下文 |
@@ -143,7 +156,7 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 
 ## 测试与指标
 
-- 自动化用例：**257 / 257 通过**
+- 自动化用例：**275 / 275 通过**
 - 检索延迟（本机复核，Node 22.23.2；标准 bench 已改为 global scope 并断言真实命中）：10,000 行 p95 ≈ **2.4ms**；100,000 行 ≈ 2.4ms；1,000,000 行 ≈ 6.0ms；1M + 5 万向量 + 100 万 bigram ≈ **116.8ms**（两段式有界检索，见 ADR-020）
 - 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 混合检索 **0.927**
 
@@ -175,6 +188,7 @@ npm run bench:golden   # 黄金集
 - 多进程并发（多个 AI 客户端共用一个库）见 [ADR-028](docs/ADR/028-multi-process-concurrency.md)
 - 远程 embedding 加固与 ANN 边界见 [ADR-025](docs/ADR/025-remote-embedding-and-ann.md)
 - [更新日志](docs/CHANGELOG.md)
+- [3.9.0 自动捕获与巩固完成报告](docs/COMPLETION-2026-11-21.md)
 - [架构图](docs/architecture.png)
 
 ## 许可证

@@ -2,12 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { boot } from './helpers.mjs';
 
-test('all twenty model tools are registered', async () => {
+test('all twenty-three model tools are registered', async () => {
   const app = await boot();
   const names = [...app.tools.keys()].sort();
   assert.deepEqual(names, [
     'memory_amend',
+    'memory_candidate',
     'memory_compact',
+    'memory_consolidate',
     'memory_dream',
     'memory_dream_proposals',
     'memory_dream_replace',
@@ -17,6 +19,7 @@ test('all twenty model tools are registered', async () => {
     'memory_forget',
     'memory_get',
     'memory_import',
+    'memory_ingest',
     'memory_link_entity',
     'memory_persona',
     'memory_profile',

@@ -1,6 +1,6 @@
 # 全息记忆 · 机理与接口参考
 
-> 版本 3.6.1 · 生成日期 2026-11-18 · 依据源码与真实 schema v11 核对
+> 版本 3.9.0 · 生成日期 2026-11-21 · 依据源码与真实 schema v13 核对
 >
 > **给 AI 的用法**：这份文档按「先原理、后接口、最后剧本」组织。第一次接触时读第 1、2、9 章即可开工；要精确调用某个工具，直接跳到第 9 章对应小节。若这份文档已同步进记忆库（`omni memory:sync`），也可以先用 `memory_search` 搜"全息记忆 接口"定位。
 
@@ -165,7 +165,7 @@ DSH 外（MCP 等）：没有注入点，改为 `memory_context` 显式调用，
 
 ---
 
-## 3. 数据模型（schema v11，实测）
+## 3. 数据模型（schema v13，实测）
 
 共 11 张业务表。字段按真实 `PRAGMA table_info` 导出。
 
@@ -272,7 +272,7 @@ MCP 无法写客户端系统提示，所以同一份 `RULES_TEXT` 铺五条路�
 
 ---
 
-## 5. 工具参考（20 个）
+## 5. 工具参考（23 个）
 
 所有工具都是"失败即报错、成功即返回值"；MCP 侧错误统一转成 `isError: true` 的文本块。
 
@@ -373,9 +373,21 @@ MCP 无法写客户端系统提示，所以同一份 `RULES_TEXT` 铺五条路�
 ### 5.22 memory_amend
 参数：`id`（note）、`text`（新正文），可选 `reason`、`scope`（`all` 用于显式跨项目）。默认仅当前项目 + global。生成新 revision，旧行 `superseded_by` 指向新行并保留；搜索只返回新行，`memory_get` 取不到旧行。修订透传 `contested`、`verification`、反馈计数与原始 `source`；`reason` 以 `[amend]` 追加进 `evidence`。
 
+### 5.23 memory_ingest
+参数：`text` 必填；可选 `role`（user/assistant/system/tool/note）、`scope`、`sessionId`、`source`、`cwd`、`importance`、`extract`（默认 true）。
+作用：把一条对话轮次写入 chunks，并按 `lib/capture-rules.mjs` 的确定性规则抽取最多 3 条 pending 候选。`scope=all` 拒写；正文超过 4000 字截断；候选绝不直接成为 note。返回 `{id,deduped,scope,sessionId,chars,truncated,candidates[]}`。
+
+### 5.24 memory_candidate
+参数：`action`（`list|accept|reject`）、`id`（accept/reject 必填）、`status`（list；默认 pending）、`scope`、`cwd`、`limit`、`reason`。
+作用：候选审阅。`accept` 才写入正式 note（`source: chunk:<id> · candidate:<id>`，自动去重）；`reject` 只标记并保留原因。默认当前项目 + global，跨项目需 `scope=all`。
+
+### 5.25 memory_consolidate
+参数：`problemKey` 必填；`scope`、`minNotes`（2..10，默认 2）、`apply`（默认 false）。
+作用：同一 `problemKey` + 同一精确 scope 的活跃笔记压成一条来源链摘要；默认 dry-run。`apply` 时按 `[已验证]/[未验证]/[失败尝试]/[已过期]` 分组，旧行只写 `superseded_by`，不删除；反馈计数汇总到摘要。`scope=all/project` 被拒绝。
+
 ---
 
-## 6. REST 接口（16 条）
+## 6. REST 接口（20 条）
 
 统一前缀 `/omni-memory`，默认只听回环。写操作要求 `POST` 且同源（有 `Origin` 时必须与 Host 一致）；不带 `Origin` 的本地客户端放行。
 
@@ -398,6 +410,10 @@ MCP 无法写客户端系统提示，所以同一份 `RULES_TEXT` 铺五条路�
 | `/packet` | GET | `q` `scope` `cwd` `limit` `budget` `format` | 无 MCP 宿主的可注入记忆包；`format=text` 直接输出纯文本 |
 | `/openapi.json` | GET | — | HTTP adapter 的 OpenAPI 3.0 描述（packet/search/list/node/status/tool） |
 | `/tool` | POST | body `name` `arguments`；header `x-omni-csrf: 1` | 受限工具桥：write/search/solution_report/feedback/get/amend/profile/timeline |
+| `/ingest` | POST | `text` 必填；`role` `scope` `cwd` `sessionId` `source` `importance` `extract` | 写转录 + 抽取 pending 候选 |
+| `/candidates` | GET | `status` `scope` `cwd` `limit` | 列出候选 |
+| `/candidate` | POST | `id` `action` `scope` `cwd` `reason` | 接受/拒绝候选 |
+| `/consolidate` | POST | `problemKey` `scope` `minNotes` `apply` | 按问题指纹巩固笔记 |
 | `/forget` | POST | `kind` `id`（body 或 query） | 墓碑化 |
 
 响应统一带 `ok`。错误为 `{ ok: false, error }`。

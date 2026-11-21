@@ -32,6 +32,25 @@ node hosts/cli.mjs context --stdin        # Claude Code hook 等从 stdin 读 pr
 
 输出就是可直接拼接的画像 + 相关记忆文本。适合 SessionStart / UserPromptSubmit hook。
 
+### 2.5 会话自动捕获（hook / 任意宿主）
+
+无 MCP 注入点时，至少可以把对话沉淀下来；候选先 pending，不会污染正式记忆：
+
+```bash
+# 任意宿主：一轮对话
+node hosts/cli.mjs ingest --role user --text "以后测试必须先跑 npm run check"
+
+# Claude Code SessionStart / Stop hook：stdin 直接收 JSON
+node hosts/cli.mjs ingest --stdin
+
+# 审阅与接受
+node hosts/cli.mjs candidates --scope proj:my-project
+node hosts/cli.mjs candidate --id 12 --action accept
+node hosts/cli.mjs candidate --id 13 --action reject --reason "临时信息"
+```
+
+对应的 loopback HTTP：`POST /omni-memory/ingest`、`GET /omni-memory/candidates`、`POST /omni-memory/candidate`。写操作要 `x-omni-csrf: 1`；`scope=all` 会被拒绝，避免把一轮私有对话写进全局层。
+
 ### 3. HTTP packet（无 MCP 宿主）
 
 ```bash
@@ -56,7 +75,7 @@ curl "http://127.0.0.1:7788/omni-memory/packet?scope=all&q=星图"
 curl http://127.0.0.1:7788/omni-memory/openapi.json
 ```
 
-工具桥只暴露核心读写工具：`memory_write`、`memory_search`、`memory_solution_report`、`memory_feedback`、`memory_get`、`memory_amend`、`memory_profile`、`memory_timeline`。导出、导入、compact、reindex、dream、persona 等维护面仍留在 MCP/CLI。
+OpenAPI 导出 10 条 path（含 packet、search、list、node、status、tool、ingest、candidates、candidate、consolidate）。工具桥只暴露核心读写工具：`memory_write`、`memory_search`、`memory_solution_report`、`memory_feedback`、`memory_get`、`memory_amend`、`memory_profile`、`memory_timeline`。导出、导入、compact、reindex、dream、persona 等维护面仍留在 MCP/CLI；`consolidate` 走独立 POST 路由，不放进 `/tool`。
 
 ```bash
 curl -X POST http://127.0.0.1:7788/omni-memory/tool \

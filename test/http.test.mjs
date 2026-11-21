@@ -3,7 +3,7 @@
 
 /**
  * The standalone daemon has to prove three things at once:
- *  - the plugin's own 16 routes mount unchanged through the `webServer` shim
+ *  - the plugin's own 20 routes mount unchanged through the `webServer` shim
  *  - MCP over HTTP answers with the same protocol objects as stdio
  *  - the panel is actually served
  *
@@ -35,12 +35,12 @@ test('http adapter: routes mount, MCP over HTTP works, panel is served', async (
   const url = server.url;
 
   try {
-    assert.equal(server.routes, 16, 'all plugin routes should mount through the shim');
+    assert.equal(server.routes, 20, 'all plugin routes should mount through the shim');
 
     const health = await (await fetch(`${url}/health`)).json();
     assert.equal(health.ok, true);
-    assert.equal(health.tools, 22, '20 plugin tools plus memory_context and memory_rules');
-    assert.equal(health.routes ?? server.routes, 16);
+    assert.equal(health.tools, 25, '23 plugin tools plus memory_context and memory_rules');
+    assert.equal(health.routes ?? server.routes, 20);
 
     const panel = await fetch(`${url}/`);
     assert.equal(panel.status, 200);
