@@ -2,7 +2,7 @@
 
 日期：2026-11-21
 版本：3.9.3
-状态：实现、测试、文档、打包完成；已提交并推送 GitHub main（`79a1334`），本机 7788 已由静默计划任务 `OmniMemory7788` 运行 3.9.3。
+状态：实现、测试、文档、打包完成；已提交并推送 GitHub main（功能提交 `935e86e`，发布状态修订见后续 docs 提交），本机 7788 已由静默计划任务 `OmniMemory7788` 运行 3.9.3。
 
 ## 背景
 
@@ -36,8 +36,8 @@
 
 ## 发布
 
-- 提交：`935e86e55f2a3b7663ef14e13e78cbbe3050dc6a`（短 SHA `935e86e`，功能提交）；`47b199d`、`79a1334` 为发布状态修订。
-- 远端：`https://github.com/wangzhen110/omni-memory`，`main` 与本地 `HEAD` 均为 `79a13347cff869d421865a4ddc3262ae40901e07`。
+- 提交：`935e86e55f2a3b7663ef14e13e78cbbe3050dc6a`（短 SHA `935e86e`，功能提交）；发布状态修订为后续 docs 提交。
+- 远端：`https://github.com/wangzhen110/omni-memory`，`main` 已包含功能提交与发布状态修订；为避免报告引用自身提交哈希，不在此记录最新 docs 提交 SHA。
 - 本机 7788：静默计划任务 `OmniMemory7788`（`powershell.exe -WindowStyle Hidden` 启动，无控制台窗口），node PID `23548`；`/health` 返回 `version:"3.9.3"`、`tools:25`。
 - 语义状态：`indexed:1239`、`pending:0`、`dropped:0`、`failureCount:0`、`retryAt:null`、`backfillDone:true`、`lastError:""`；启动清扫标记 `semantic_gc_version=14`。
 - 线上实测：`那个把界面弄没的坑` 命中 3 条，最高 `semanticScore` 0.502，与 3.9.2 基线一致。
