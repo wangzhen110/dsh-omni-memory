@@ -25,6 +25,23 @@ test('opening a legacy cased project merges its rows into the canonical scope', 
   const cwd = path.join(app.home, 'CasedProject');
   const legacy = app.mod.legacyProjectKeyFromCwd(cwd);
   const canonical = app.mod.projectKeyFromCwd(cwd);
+
+  // Linux keeps case significant, so there is no distinct legacy key to migrate
+  // and the same spelling must remain the same layer. Windows/macOS exercise the
+  // case-folded migration below.
+  if (legacy === canonical) {
+    await app.call('memory_write', { kind: 'note', scope: canonical, text: 'P1Alias linux row' });
+    const resolved = app.mod.attachSession('alias-session', cwd);
+    assert.equal(resolved, canonical);
+    const search = await app.call('memory_search', { query: 'P1Alias', scope: 'project' });
+    assert.equal(search.value.hits.length, 1);
+    assert.equal(search.value.hits[0].scope, canonical);
+    const db = new DatabaseSync(path.join(app.home, 'memory', 'omni.db'));
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM scope_aliases WHERE alias = ?').get(legacy).n, 0);
+    db.close();
+    return;
+  }
+
   assert.notEqual(legacy, canonical);
 
   await app.call('memory_write', { kind: 'note', scope: legacy, text: 'P1Alias legacy row' });
@@ -58,6 +75,17 @@ test('a duplicate active chunk is tombstoned at the source, never duplicated', a
 
   const db = new DatabaseSync(dbFile);
   const insert = db.prepare('INSERT INTO chunks(ts, role, text, hash, scope) VALUES (?, ?, ?, ?, ?)');
+  if (legacy === canonical) {
+    // Linux has no distinct legacy spelling; the unique active index itself must
+    // reject the duplicate instead of creating a second live chunk.
+    insert.run(Date.now(), 'user', 'old chunk body', 'same-hash', canonical);
+    assert.throws(
+      () => insert.run(Date.now(), 'user', 'new chunk body', 'same-hash', canonical),
+      /UNIQUE constraint failed/,
+    );
+    db.close();
+    return;
+  }
   insert.run(Date.now(), 'user', 'old chunk body', 'same-hash', legacy);
   insert.run(Date.now(), 'user', 'new chunk body', 'same-hash', canonical);
   db.close();

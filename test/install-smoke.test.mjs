@@ -22,7 +22,17 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const execFileAsync = promisify(execFile);
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // Invoke npm through its JS entry so we never depend on a shell / npm.cmd shim.
-const npmCli = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+// The install layout differs by runtime manager (nvm/fnm put npm under ../lib,
+// Windows keeps it under node_modules); npm_execpath is set whenever this test
+// is run through `npm test` and is the most reliable pointer.
+const npmCli = [
+  process.env.npm_execpath,
+  path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+  path.join(path.dirname(process.execPath), '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+  '/usr/lib/node_modules/npm/bin/npm-cli.js',
+  '/usr/local/lib/node_modules/npm/bin/npm-cli.js',
+].find(candidate => candidate && existsSync(candidate));
+assert.ok(npmCli, 'cannot locate npm-cli.js for the install smoke test');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 /** Windows keeps a SQLite file locked until the connection is fully released. */
