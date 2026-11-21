@@ -134,3 +134,30 @@
 - 命名细节确认：CHANGELOG 写"由 `lastRecallAt` 改为 `lastFeedbackAt`"，而上一版对外字段实为 `lastFeedbackAt`（`feedbackFields` 早已用此名），此处 CHANGELOG 表述略有出入，但不影响功能与契约，属文案瑕疵，可不修。
 
 **二次复核边界**：静态审查 + 隔离临时库实测，未跑生产数据；独立复用了自己构造的字段保真/越权场景，未依赖项目新增测试作为唯一证据。本次仅更新本报告与工作日志，未改动任何源码。
+
+---
+
+## 七、增量复核（3.7.2，2026-11-21 10:04）
+
+提交 `416ce84` 新增"宿主适配层"——这是第二梯队"能力脱离 DSH"方向的一次落地，与上轮建议同向。改动：新增 3 条 HTTP 路由（`/packet`、`/openapi.json`、`/tool`）+ `docs/HOST-ADAPTERS.md`，index.js +269 行。版本 3.7.2。
+
+**结论：纯增量功能，安全边界干净，未发现新缺陷。**
+
+端到端实测（独立临时库 + 独立端口，非项目自带测试）：
+
+| 检查项 | 结果 |
+|---|---|
+| `GET /packet` json | 200，`scope=proj:alpha#2dc7b2`（cwd 推导正确）、含 text / generatedAt |
+| `GET /packet?format=text` | 200，`text/plain; charset=utf-8` |
+| `GET /openapi.json` | 200，声明 6 条路径，与实际路由一致 |
+| `POST /tool` 无 CSRF 头 | **403** ✅ |
+| `GET /tool`（方法错误） | **405** ✅ |
+| `POST /tool` 非白名单 `memory_export` | **400**，被 allowlist 拦下 ✅ |
+| `POST /tool` 白名单 `memory_write` 带 `scope=proj:evil` | 200，写入落到 `proj:evil`——写入按 scope 参数，属本地可信 agent 能力，符合设计 |
+| `/tool` 调 feedback/amend 改 `proj:evil` 笔记（空 toolContext） | **400 拒绝**（`outside the current project`）——上轮 N-2 的隔离修复在新桥上同样生效 ✅ |
+
+- 工具桥白名单 8 个：`write/search/solution_report/feedback/get/amend/profile/timeline`，维护面（export/import/dream/compact/reindex）未暴露——收敛合理。
+- `buildMemoryPacket` 的 `limit`/`budget` 有 clamp（1..10 / 400..4000），`scope=project` 时画像回退 global 并注明语义——边界处理到位。
+- 测试：`npm test` **257/257**（exit=0），新增 `test/host-adapter.test.mjs` 4 项；`npm run check` 全绿（257 tests / 20 tools / **16 routes** / 28 ADRs / v3.7.2），文档闸门已同步更新路由数。
+
+**仍未做**（第二梯队剩余）：自动事实抽取、cross-encoder rerank、宿主无关 ingest 的会话自动捕获（当前 packet 是拉取式 sidecar，非自动捕获）、渐进拆 core。新增适配层解决的是"接入通道"，不是"自动沉淀"。
