@@ -162,9 +162,9 @@ node hosts/cli.mjs serve --port 7788
 ```
 
 - `POST /mcp`：Streamable HTTP 的 JSON 响应模式，方法表与 stdio 完全相同
-- `GET /`：独立面板（记忆列表 / 搜索 / 星图 / 规则）
+- `GET /`：记忆概览仪表盘；`/panel.html` 是记忆列表 / 搜索 / 星图 / 规则旧面板
 - `GET /health`、`GET /rules`
-- `/omni-memory/*`：插件原有的 20 条 REST 路由，原样挂载，没有第二套实现
+- `/omni-memory/*`：插件原有的 21 条 REST 路由，原样挂载，没有第二套实现
 
 客户端里填 MCP 地址 `http://127.0.0.1:7788/mcp` 即可。默认只监听回环地址。
 
@@ -177,7 +177,7 @@ node --test test/mcp.test.mjs test/http.test.mjs test/rules.test.mjs
 ```
 
 - `mcp.test.mjs` 真拉进程走 stdio：握手、工具列表、写入、召回、错误路径、prompts、resources
-- `http.test.mjs` 起真服务：20 条路由挂载、HTTP MCP、面板、REST 与 MCP 共库
+- `http.test.mjs` 起真服务：21 条路由挂载、HTTP MCP、面板、REST 与 MCP 共库
 - `rules.test.mjs` 钉住规则区块的幂等与替换
 
 ---

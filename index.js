@@ -6321,6 +6321,292 @@ function registerRoutes(ctx) {
 
   add({
     kind: 'exact',
+    path: '/omni-memory/overview',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) return json(res, 403, { ok: false });
+      const s = openStore();
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      const scope = normalizeScopeInput(url.searchParams.get('scope') || 'all');
+      const range = ['4w', '6w', '12w', '26w'].includes(url.searchParams.get('range'))
+        ? url.searchParams.get('range') : '12w';
+      const buckets = Number(range.replace('w', ''));
+      const weekMs = 7 * 24 * 60 * 60 * 1000;
+      const now = Date.now();
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const weekStart = new Date(today);
+      weekStart.setDate(weekStart.getDate() - ((weekStart.getDay() + 6) % 7));
+      const start = new Date(weekStart);
+      start.setDate(start.getDate() - (buckets - 1) * 7);
+      const startMs = start.getTime();
+      const dayStart = new Date(today);
+      dayStart.setDate(dayStart.getDate() - 83);
+
+      const scopeFor = column => {
+        if (scope === 'global') return { sql: `AND (${column} = 'global' OR ${column} IS NULL)`, params: [] };
+        if (scope === 'project') return { sql: `AND (${column} LIKE 'proj:%' OR ${column} = 'project')`, params: [] };
+        if (scope !== 'all') return { sql: `AND (${column} = ? OR ${column} = 'global' OR ${column} IS NULL)`, params: [scope] };
+        return { sql: '', params: [] };
+      };
+      const noteScope = scopeFor('scope');
+      const factScope = scopeFor('scope');
+      const chunkScope = scopeFor('scope');
+      const count = (sql, params = []) => Number(prepareCached(s.db, sql).get(...params).n ?? 0);
+      const noteActive = `deleted_at IS NULL AND superseded_by IS NULL ${noteScope.sql}`;
+      const factActive = `deleted_at IS NULL AND valid_to IS NULL ${factScope.sql}`;
+      const chunkActive = `deleted_at IS NULL ${chunkScope.sql}`;
+
+      const notesActive = count(`SELECT COUNT(*) AS n FROM notes WHERE ${noteActive}`, noteScope.params);
+      const notesTotal = count(`SELECT COUNT(*) AS n FROM notes WHERE deleted_at IS NULL ${noteScope.sql}`, noteScope.params);
+      const factsActive = count(`SELECT COUNT(*) AS n FROM facts WHERE ${factActive}`, factScope.params);
+      const factsTotal = count(`SELECT COUNT(*) AS n FROM facts WHERE deleted_at IS NULL ${factScope.sql}`, factScope.params);
+      const chunksActive = count(`SELECT COUNT(*) AS n FROM chunks WHERE ${chunkActive}`, chunkScope.params);
+      const contestedNotes = count(`SELECT COUNT(*) AS n FROM notes WHERE ${noteActive} AND contested = 1`, noteScope.params);
+      const contestedFacts = count(`SELECT COUNT(*) AS n FROM facts WHERE ${factActive} AND contested = 1`, factScope.params);
+      const unverifiedNotes = count(`SELECT COUNT(*) AS n FROM notes WHERE ${noteActive} AND solution_status = 'unverified'`, noteScope.params);
+      const pendingCandidates = count(`SELECT COUNT(*) AS n FROM note_candidates WHERE status = 'pending' ${noteScope.sql}`, noteScope.params);
+      const supersededNotes = notesTotal - notesActive;
+      const expiredFacts = factsTotal - factsActive;
+      const invalid = supersededNotes + expiredFacts;
+      const valid = Math.max(0, notesActive + factsActive - contestedNotes - contestedFacts - unverifiedNotes);
+      const healthTotal = valid + contestedNotes + contestedFacts + unverifiedNotes + invalid;
+      const healthScore = healthTotal ? Math.round(valid / healthTotal * 100) : 0;
+      const pending = contestedNotes + contestedFacts + pendingCandidates + invalid;
+      const globalNotes = count(`SELECT COUNT(*) AS n FROM notes WHERE deleted_at IS NULL AND superseded_by IS NULL AND (scope = 'global' OR scope IS NULL) ${noteScope.sql}`, noteScope.params);
+      const projectNotes = count(`SELECT COUNT(*) AS n FROM notes WHERE deleted_at IS NULL AND superseded_by IS NULL AND (scope LIKE 'proj:%' OR scope = 'project') ${noteScope.sql}`, noteScope.params);
+
+      const feedback = prepareCached(s.db, `
+        SELECT SUM(recall_count) AS recall, SUM(useful_count) AS useful, SUM(misleading_count) AS misleading
+        FROM notes WHERE ${noteActive}
+      `).get(...noteScope.params);
+      const factFeedback = prepareCached(s.db, `
+        SELECT SUM(recall_count) AS recall, SUM(useful_count) AS useful, SUM(misleading_count) AS misleading
+        FROM facts WHERE ${factActive}
+      `).get(...factScope.params);
+      const recallTotal = Number(feedback.recall ?? 0) + Number(factFeedback.recall ?? 0);
+      const usefulCount = Number(feedback.useful ?? 0) + Number(factFeedback.useful ?? 0);
+      const misleadingCount = Number(feedback.misleading ?? 0) + Number(factFeedback.misleading ?? 0);
+
+      // Project overview: global plus every project layer that actually holds rows.
+      const projects = new Map();
+      const bump = (scopeKey, field, n, firstAt, lastAt) => {
+        const key = scopeKey || 'global';
+        const entry = projects.get(key) ?? {
+          scope: key, notes: 0, facts: 0, chunks: 0, firstAt: 0, lastAt: 0, memoryFirstAt: 0, memoryLastAt: 0,
+        };
+        entry[field] = Number(n);
+        const first = Number(firstAt ?? 0);
+        const last = Number(lastAt ?? 0);
+        if (last) entry.lastAt = Math.max(entry.lastAt, last);
+        if (first && (!entry.firstAt || first < entry.firstAt)) entry.firstAt = first;
+        if (field !== 'chunks') {
+          if (last) entry.memoryLastAt = Math.max(entry.memoryLastAt, last);
+          if (first && (!entry.memoryFirstAt || first < entry.memoryFirstAt)) entry.memoryFirstAt = first;
+        }
+        projects.set(key, entry);
+      };
+      for (const row of prepareCached(s.db,
+        "SELECT COALESCE(scope, 'global') AS scope, COUNT(*) AS n, MIN(ts) AS first, MAX(ts) AS last FROM notes WHERE deleted_at IS NULL AND superseded_by IS NULL GROUP BY COALESCE(scope, 'global')"
+      ).all()) bump(row.scope, 'notes', row.n, row.first, row.last);
+      for (const row of prepareCached(s.db,
+        "SELECT COALESCE(scope, 'global') AS scope, COUNT(*) AS n, MIN(valid_from) AS first, MAX(valid_from) AS last FROM facts WHERE deleted_at IS NULL AND valid_to IS NULL GROUP BY COALESCE(scope, 'global')"
+      ).all()) bump(row.scope, 'facts', row.n, row.first, row.last);
+      for (const row of prepareCached(s.db,
+        "SELECT COALESCE(scope, 'global') AS scope, COUNT(*) AS n, MIN(ts) AS first, MAX(ts) AS last FROM chunks WHERE deleted_at IS NULL GROUP BY COALESCE(scope, 'global')"
+      ).all()) bump(row.scope, 'chunks', row.n, row.first, row.last);
+      const projectRows = [...projects.values()].map(entry => {
+        const memory = entry.notes + entry.facts;
+        const label = entry.scope === 'global' ? '全局记忆' : entry.scope === 'project' ? '未命名项目层' : String(entry.scope).replace(/^proj:/, '').split('#')[0];
+        const status = memory === 0 && entry.chunks > 0 ? 'transcript'
+          : entry.memoryLastAt >= now - 7 * 24 * 60 * 60 * 1000 ? 'active'
+            : entry.memoryLastAt >= now - 30 * 24 * 60 * 60 * 1000 ? 'watch' : 'quiet';
+        return { ...entry, memory, label, status };
+      }).sort((a, b) => b.memory - a.memory || b.chunks - a.chunks || b.lastAt - a.lastAt);
+      const projectActive = projectRows.filter(p => p.scope !== 'global' && p.memory > 0).length;
+      const transcriptProjectActive = projectRows.filter(p => p.scope !== 'global' && p.memory === 0 && p.chunks > 0).length;
+      const visibleForScope = p => scope === 'global' ? p.scope === 'global'
+        : scope === 'all' || scope === 'project' ? p.scope !== 'global'
+          : p.scope === scope;
+      const visibleProjectActive = scope === 'global' ? 0 : projectRows.filter(p => visibleForScope(p) && p.memory > 0).length;
+      const visibleTranscriptProjects = scope === 'global' ? 0 : projectRows.filter(p => visibleForScope(p) && p.memory === 0 && p.chunks > 0).length;
+
+      // Weekly series. Counts before the window become the cumulative baseline.
+      const noteTimes = prepareCached(s.db, `SELECT ts FROM notes WHERE ${noteActive}`).all(...noteScope.params);
+      const factTimes = prepareCached(s.db, `SELECT valid_from AS ts FROM facts WHERE ${factActive}`).all(...factScope.params);
+      const chunkTimes = prepareCached(s.db, `SELECT ts FROM chunks WHERE ${chunkActive}`).all(...chunkScope.params);
+      const bucketize = rows => {
+        const out = Array(buckets).fill(0);
+        let base = 0;
+        for (const row of rows) {
+          const ts = Number(row.ts);
+          if (!Number.isFinite(ts)) continue;
+          if (ts < startMs) { base += 1; continue; }
+          const index = Math.floor((ts - startMs) / weekMs);
+          if (index >= 0 && index < buckets) out[index] += 1;
+        }
+        return { values: out, base };
+      };
+      const noteSeries = bucketize(noteTimes);
+      const factSeries = bucketize(factTimes);
+      const chunkSeries = bucketize(chunkTimes);
+      const labels = Array.from({ length: buckets }, (_, i) => {
+        const d = new Date(startMs);
+        d.setDate(d.getDate() + i * 7);
+        return `${d.getMonth() + 1}/${d.getDate()}`;
+      });
+      // Memory growth counts notes and facts only. Transcript chunks are storage
+      // volume, not memories; including them would inflate the curve by orders of
+      // magnitude and bury real note/fact activity.
+      let cumulative = noteSeries.base + factSeries.base;
+      const cumulativeSeries = noteSeries.values.map((n, i) => {
+        cumulative += n + factSeries.values[i];
+        return cumulative;
+      });
+
+      // Daily activity for the last 12 weeks (84 cells), same memory-only rule.
+      const keyOf = d => {
+        const date = new Date(d);
+        return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+      };
+      const dailyCounts = new Map();
+      for (const row of [...noteTimes, ...factTimes]) {
+        const ts = Number(row.ts);
+        if (!Number.isFinite(ts) || ts < dayStart.getTime()) continue;
+        const key = keyOf(ts);
+        dailyCounts.set(key, (dailyCounts.get(key) ?? 0) + 1);
+      }
+      const daily = Array.from({ length: 84 }, (_, i) => {
+        const d = new Date(dayStart);
+        d.setDate(d.getDate() + i);
+        const date = keyOf(d);
+        return { date, count: dailyCounts.get(date) ?? 0 };
+      });
+
+      // Recent activity across notes, facts and pending candidates.
+      const recentNotes = prepareCached(s.db, `
+        SELECT id, ts, scope, source, text FROM notes
+        WHERE ${noteActive} ORDER BY ts DESC LIMIT 8
+      `).all(...noteScope.params).map(row => ({
+        id: Number(row.id), kind: 'note', ts: Number(row.ts), scope: row.scope ?? 'global',
+        source: row.source ?? '', text: String(row.text).slice(0, 120),
+      }));
+      const recentFacts = prepareCached(s.db, `
+        SELECT id, subject, relation, object, scope, valid_from FROM facts
+        WHERE ${factActive} ORDER BY valid_from DESC LIMIT 4
+      `).all(...factScope.params).map(row => ({
+        id: Number(row.id), kind: 'fact', ts: Number(row.valid_from), scope: row.scope ?? 'global',
+        source: '', text: `${row.subject} ${row.relation} ${row.object}`.slice(0, 120),
+      }));
+      const recentCandidates = prepareCached(s.db, `
+        SELECT id, ts, scope, text FROM note_candidates
+        WHERE status = 'pending' ${noteScope.sql} ORDER BY ts DESC LIMIT 4
+      `).all(...noteScope.params).map(row => ({
+        id: Number(row.id), kind: 'candidate', ts: Number(row.ts), scope: row.scope ?? 'global',
+        source: '', text: String(row.text).slice(0, 120),
+      }));
+      const activity = [...recentNotes, ...recentFacts, ...recentCandidates]
+        .sort((a, b) => b.ts - a.ts).slice(0, 8);
+
+      // Persona: explicit key/value profile first, then preference-tagged global notes as signals.
+      const personaRows = prepareCached(s.db,
+        'SELECT key, value, updated_at FROM persona ORDER BY updated_at DESC'
+      ).all();
+      const persona = {};
+      let personaUpdatedAt = 0;
+      for (const row of personaRows) {
+        persona[row.key] = row.value;
+        personaUpdatedAt = Math.max(personaUpdatedAt, Number(row.updated_at ?? 0));
+      }
+      let signals = [];
+      if (!personaRows.length) {
+        signals = prepareCached(s.db, `
+          SELECT id, ts, source, text FROM notes
+          WHERE deleted_at IS NULL AND superseded_by IS NULL AND (scope = 'global' OR scope IS NULL)
+            AND (source LIKE '%preference%' OR text LIKE '%用户偏好%')
+          ORDER BY ts DESC LIMIT 5
+        `).all().map(row => ({
+          id: Number(row.id), ts: Number(row.ts), source: row.source ?? '', text: String(row.text).slice(0, 160),
+        }));
+      }
+
+      // Graph summary: fact subject/relation/object is enough for the overview
+      // constellation; the full graph route still owns the detailed map.
+      const graphFacts = prepareCached(s.db, `
+        SELECT subject, relation, object FROM facts
+        WHERE deleted_at IS NULL AND valid_to IS NULL ${factScope.sql}
+        ORDER BY confidence DESC, valid_from DESC LIMIT 60
+      `).all(...factScope.params);
+      const graphNodes = new Map();
+      const graphLinks = [];
+      for (const fact of graphFacts) {
+        for (const name of [fact.subject, fact.object]) {
+          if (name && !graphNodes.has(name)) graphNodes.set(name, { id: name, label: name, kind: 'entity', weight: 0 });
+        }
+        if (fact.subject && fact.object) {
+          graphLinks.push({ source: fact.subject, target: fact.object, rel: fact.relation });
+          if (graphNodes.has(fact.subject)) graphNodes.get(fact.subject).weight += 1;
+          if (graphNodes.has(fact.object)) graphNodes.get(fact.object).weight += 1;
+        }
+      }
+      const edgeCount = count('SELECT COUNT(*) AS n FROM edges WHERE valid_to IS NULL');
+
+      return json(res, 200, {
+        ok: true,
+        asOf: now,
+        range,
+        scope,
+        stats: {
+          notes: notesActive,
+          facts: factsActive,
+          chunks: chunksActive,
+          projects: visibleProjectActive,
+          transcriptProjects: visibleTranscriptProjects,
+          globalNotes,
+          projectNotes,
+          contested: contestedNotes + contestedFacts,
+          pending,
+          pendingCandidates,
+          supersededNotes,
+          expiredFacts,
+          recallTotal,
+          usefulCount,
+          misleadingCount,
+          usefulRate: recallTotal ? Math.round(usefulCount / recallTotal * 1000) / 10 : null,
+          entities: graphNodes.size,
+          relations: graphLinks.length + edgeCount,
+          connections: graphLinks.length + edgeCount,
+        },
+        health: {
+          valid,
+          contested: contestedNotes + contestedFacts,
+          unverified: unverifiedNotes,
+          invalid,
+          total: healthTotal,
+          score: healthScore,
+        },
+        series: {
+          labels,
+          notes: noteSeries.values,
+          facts: factSeries.values,
+          chunks: chunkSeries.values,
+          base: noteSeries.base + factSeries.base,
+          cumulative: cumulativeSeries,
+        },
+        daily,
+        projects: projectRows,
+        profile: { persona, updatedAt: personaUpdatedAt, signals },
+        activity,
+        graph: {
+          nodes: [...graphNodes.values()],
+          links: graphLinks,
+          edges: edgeCount,
+        },
+      });
+    },
+  });
+
+  add({
+    kind: 'exact',
     path: '/omni-memory/graph',
     handler: async (req, res) => {
       if (!isLoopback(req)) return json(res, 403, { ok: false });

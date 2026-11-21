@@ -1,6 +1,6 @@
 # 全息记忆 · 机理与接口参考
 
-> 版本 3.9.5 · 生成日期 2026-11-21 · 依据源码与真实 schema v15 核对
+> 版本 3.10.0 · 生成日期 2026-11-21 · 依据源码与真实 schema v15 核对
 >
 > **给 AI 的用法**：这份文档按「先原理、后接口、最后剧本」组织。第一次接触时读第 1、2、9 章即可开工；要精确调用某个工具，直接跳到第 9 章对应小节。若这份文档已同步进记忆库（`omni memory:sync`），也可以先用 `memory_search` 搜"全息记忆 接口"定位。
 
@@ -410,7 +410,7 @@ MCP / HTTP 适配器在启动时会额外注册 `memory_context` 与 `memory_rul
 
 ---
 
-## 6. REST 接口（20 条）
+## 6. REST 接口（21 条）
 
 统一前缀 `/omni-memory`，默认只听回环。写操作要求 `POST` 且同源（有 `Origin` 时必须与 Host 一致）；不带 `Origin` 的本地客户端放行。
 
@@ -419,6 +419,7 @@ MCP / HTTP 适配器在启动时会额外注册 `memory_context` 与 `memory_rul
 | 路径 | 方法 | 参数 | 说明 |
 |---|---|---|---|
 | `/list` | GET | `limit` `offset` `scope` `audit` | 记忆列表 + 统计 + 项目目录；`audit=1` 含墓碑与被替代 |
+| `/overview` | GET | `range`（`4w`/`6w`/`12w`/`26w`，默认 `12w`）`scope` | 网页概览用真实聚合：`stats` / `health` / `series` / `daily` / `projects` / `profile` / `activity` / `graph`；不返回全文 |
 | `/graph` | GET | `scope` | 星图：`nodes[]`、`links[]`（`source/target/rel`）、`scopes[]` |
 | `/node` | GET | `node` `scope` | 单实体详情与关联事实 |
 | `/persona` | GET/POST | body `values` | 读/写用户设定 |

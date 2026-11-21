@@ -7,12 +7,12 @@
 > **源码/架构**后做商业替代、竞品或商业服务；且**必须署名作者**。
 > 商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-348%2F348-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-349%2F349-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-Personal%20Use%201.1-lightgrey)](LICENSE)
 
 ---
 
-**完整机理与接口参考**：[`docs/REFERENCE.md`](docs/REFERENCE.md) —— schema、写入与检索机理、25 个 MCP 工具（23 个内核工具 + `memory_context` / `memory_rules` 适配工具）、20 条路由、MCP 协议面、CLI、环境变量、AI 调用剧本。执行 `npm run memory:sync` 可把整本手册拆成笔记写进记忆库，之后用 `memory_search` 就能直接检索到。
+**完整机理与接口参考**：[`docs/REFERENCE.md`](docs/REFERENCE.md) —— schema、写入与检索机理、25 个 MCP 工具（23 个内核工具 + `memory_context` / `memory_rules` 适配工具）、21 条路由、MCP 协议面、CLI、环境变量、AI 调用剧本。执行 `npm run memory:sync` 可把整本手册拆成笔记写进记忆库，之后用 `memory_search` 就能直接检索到。
 
 ## 它解决什么问题
 
@@ -59,7 +59,7 @@
 
 ```bash
 cd /path/to/omni-memory
-npm test          # 348 个用例
+npm test          # 349 个用例
 npm run check     # 语法、文档计数与模型资产完整性校验
 ```
 
@@ -70,7 +70,7 @@ npm run check     # 语法、文档计数与模型资产完整性校验
 同一份内核可以脱离 DSH 运行，三个入口共用一个本地记忆库：
 
 - `hosts/mcp/bin.mjs` — 零依赖 stdio MCP 服务，Claude Code、Cursor、Cline、Codex CLI、Zed 都能接
-- `hosts/http/server.mjs` — 独立面板 + REST（直接挂载插件原有的 20 条路由）+ HTTP 上的 MCP（`POST /mcp`）
+- `hosts/http/server.mjs` — 独立面板 + REST（直接挂载插件原有的 21 条路由）+ HTTP 上的 MCP（`POST /mcp`）
 - `hosts/cli.mjs` — `omni rules / context / search / serve / mcp`
 - `GET /omni-memory/packet` — 面向无 MCP 宿主的可注入记忆包；`openapi.json` 与 `POST /tool` 给 OpenAPI/function-calling 客户端
 - `POST /omni-memory/ingest` / `GET /omni-memory/candidates` / `POST /omni-memory/candidate` — 会话自动捕获与候选审阅；Claude Code 的 `SessionStart`/`Stop` hook 可用 `omni ingest --stdin`
@@ -161,7 +161,7 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 
 ## 测试与指标
 
-- 自动化用例：**348 / 348 通过**
+- 自动化用例：**349 / 349 通过**
 - 检索延迟（本机复核，Node 22.23.2；标准 bench 已改为 global scope 并断言真实命中）：10,000 行 p95 ≈ **2.4ms**；100,000 行 ≈ 2.4ms；1,000,000 行 ≈ 6.0ms；1M + 5 万向量 + 100 万 bigram ≈ **116.8ms**（两段式有界检索，见 ADR-020）
 - 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 旧 hashed 混合 0.927 → 内置本地语义单独 **0.979**；语义冷加载约 208ms，单查询约 9.5ms（20 次 191ms，本机 CPU）
 
@@ -200,6 +200,7 @@ npm run bench:golden   # 黄金集
 - [3.9.3 语义索引治理报告](docs/COMPLETION-3.9.3-2026-11-21.md)
 - [3.9.4 跨平台项目键与 scope 迁移报告](docs/COMPLETION-3.9.4-2026-11-21.md)
 - [3.9.5 语义可靠性收尾报告](docs/COMPLETION-3.9.5-2026-11-21.md)
+- [3.10.0 记忆概览仪表盘](docs/WEB-UI-3.10.0-2026-11-21.md)
 - [属性测试落地记录（348 用例）](docs/PROPERTY-TESTING-ROLLOUT-2026-11-21.md)
 - [项目 scope alias 决策](docs/ADR/031-project-scope-alias.md)
 - [架构图](docs/architecture.png)

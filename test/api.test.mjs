@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { boot, fakeReq, fakePost, fakePostConsumed, fakeRes } from './helpers.mjs';
 
-test('twenty loopback routes are registered', async () => {
+test('twenty one loopback routes are registered', async () => {
   const app = await boot();
   const paths = app.routes.map(route => route.path).sort();
   assert.deepEqual(paths, [
@@ -19,6 +19,7 @@ test('twenty loopback routes are registered', async () => {
     '/omni-memory/list',
     '/omni-memory/node',
     '/omni-memory/openapi.json',
+    '/omni-memory/overview',
     '/omni-memory/packet',
     '/omni-memory/persona',
     '/omni-memory/persona/refresh',
@@ -27,6 +28,37 @@ test('twenty loopback routes are registered', async () => {
     '/omni-memory/status',
     '/omni-memory/tool',
   ]);
+});
+
+test('GET /omni-memory/overview aggregates growth, health and profile signals', async () => {
+  const app = await boot();
+  await app.call('memory_write', { kind: 'note', text: '概览全局笔记', source: 'preference' });
+  await app.call('memory_write', { kind: 'note', text: '概览项目笔记', scope: 'proj:overview#abc' });
+  await app.call('memory_write', {
+    kind: 'fact', text: '概览事实', subject: '全息记忆', relation: '包含', object: '概览',
+  });
+  const { res, state, json } = fakeRes();
+  await app.route('/omni-memory/overview').handler(
+    fakeReq('/omni-memory/overview?range=4w&scope=all'),
+    res,
+  );
+  assert.equal(state.statusCode, 200);
+  const body = json();
+  assert.equal(body.ok, true);
+  assert.ok(body.stats.notes >= 2);
+  assert.equal(body.stats.facts, 1);
+  assert.equal(body.stats.projects, 1);
+  assert.equal(body.stats.transcriptProjects, 0);
+  assert.equal(body.stats.usefulRate, null);
+  assert.equal(body.series.labels.length, 4);
+  assert.equal(body.daily.length, 84);
+  assert.equal(body.series.cumulative.at(-1), body.stats.notes + body.stats.facts);
+  assert.equal(body.daily.reduce((sum, day) => sum + day.count, 0), body.stats.notes + body.stats.facts);
+  assert.ok(body.health.total >= 3);
+  assert.ok(body.projects.some(project => project.scope === 'global'));
+  assert.ok(body.projects.some(project => project.scope === 'proj:overview#abc' && project.memory === 1));
+  assert.ok(body.profile.signals.length >= 1);
+  assert.ok(body.activity.length >= 1);
 });
 
 test('GET /omni-memory/list returns stats and rows', async () => {

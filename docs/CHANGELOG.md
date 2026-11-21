@@ -2,6 +2,20 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.10.0] — 2026-11-21
+
+### 新增 · 记忆概览仪表盘（真实数据）
+- **`GET /omni-memory/overview`**：新增只读聚合端点，默认监听 loopback，非 loopback 返回 403；参数 `range=4w/6w/12w/26w`、`scope=all/global/project/项目键`。返回 `stats`、`health`、`series`、`daily`、`projects`、`profile`、`activity`、`graph`，不返回正文，不把 1,000+ 条笔记一次塞进页面。
+- **真实口径**：活跃笔记只算未删除且未被 `superseded_by` 替代；活跃事实只算未删除且 `valid_to IS NULL`；有争议 = notes + facts 的 `contested` 之和；已失效 = 被替代笔记 + 过期事实；`recall_count=0` 时 `usefulRate=null`，页面显示「暂无反馈」，不伪造 82%。`persona` 表为空时只展示可回原文的偏好信号，不生成推断画像。**增长柱、累积曲线、84 天日历只统计 notes + facts；chunks 只作为会话存储量展示，避免 28 条笔记被 889 个会话块放大成 923 条新增。**
+- **默认入口改版**：`hosts/http/web/index.html` 从旧列表面板改为「记忆概览」：一句话结论、5 个 KPI、记忆增长双轴图（周柱 + 累积曲线，4/6/12 周可切）、健康环、项目分布（全局单列 + 项目层内归一）、84 天活跃日历、项目活跃带、事实关系迷你图、画像/信号和最近动态；`/panel.html` 保留旧列表 / 搜索 / 星图 / 规则面板。
+- **图表边界**：项目活跃带只画项目首次 / 最近写入区间，并明确标注「不是任务甘特」；当前 schema 无 tasks / start_at / due_at / status / depends_on，不伪造甘特。项目分布含全局层，否则 1,000+ 条全局记忆会看起来缺一大块；`global` 与 `proj:*`（含旧 `project` scope）分别统计。项目记忆量只算 notes + facts，只有 chunks 的项目标「仅转写」，不进入活跃项目数。
+- **前端依赖**：`dashboard.css` / `dashboard.js` 单页内联资源，无外部 CDN；`index.html` 默认 `/`，`panel.html` 旧面板，`star-map.html` 星图不变。移动端已验证无横向溢出；范围切换、层级过滤无未捕获异常。
+
+### 测试与发布
+- 路由由 20 条增至 21 条；`test/api.test.mjs` 与 `test/http.test.mjs` 同步为 21，并新增 overview 聚合用例（notes / facts / series / daily / projects / profile / signals / activity）。
+- 测试基线 349 用例；`npm run check` 同步为 23 个内核工具、25 个 MCP 工具、21 路由、31 ADR、3.10.0。
+- 数据探察结论：旧库 `proj:全息记忆#30534c` + `proj:专业知识#967a81` + global；facts 少、chunks 0、persona 空、召回反馈 0，仪表盘必须显示「暂无反馈 / 偏好信号」而不是示例数字。新 Windows 库实测 28 notes / 6 facts / 889 chunks / 3 scopes，暴露并修复 chunks 混入增长的问题；真实库备份不受影响。
+
 ## [3.9.5] — 2026-11-21
 
 ### 修复 · 语义可靠性收尾（复核 P2/P3）

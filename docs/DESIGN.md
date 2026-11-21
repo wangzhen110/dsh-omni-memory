@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | 3.9.5 |
-| 插件版本 | 3.9.5 |
+| 文档版本 | 3.10.0 |
+| 插件版本 | 3.10.0 |
 | 状态 | 已评审（本文为开发与验收的**唯一依据**） |
 | 目标平台 | DSH 0.2.2-rc.3 原生插件（Desktop，Windows 11，Node 22.23.2，`engines >=22.13`）；MCP / HTTP / OpenAPI / CLI 宿主通用 |
 | 最后更新 | 2026-11-21 |
@@ -94,9 +94,9 @@
 | NFR-07 | 失败隔离 | 任一子系统（FTS/路由/注入）失效不得导致会话不可用 | 满足（全部 try/catch + 可选降级） |
 | NFR-08 | 隐私 | 所有数据仅存本机 `$DSH_HOME/memory/omni.db`；HTTP 仅 loopback，且浏览器跨站写请求被 Origin 校验拦截；默认不上传 | 部分满足：数据库未加密，loopback HTTP 仍依赖本机进程边界，未做进程级鉴权（ADR-017）。内置本地语义在进程内推理，不联网；显式配置 `OMNI_EMBED_URL`/远程 `OMNI_EMBED_PROVIDER` 会外发嵌入文本，配置 `OMNI_RERANK_*` 会外发查询与候选正文，均需用户自行选择可信端点 |
 | NFR-09 | 可卸载 | 卸载插件后不残留运行中的监听；数据文件保留由用户决定 | 满足 |
-| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 348/348（100%） |
+| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 349/349（100%） |
 | NFR-11 | 界面本地化 | 中英词典注册，切换语言无需重载插件 | 已实现（词典 + 订阅重渲染） |
-| NFR-12 | 多进程并发 | 同机 N 个宿主进程共用一个库，同时读写不丢数据、不报锁错 | 348/348 含 6 进程并发用例；写入等待上限 5s（ADR-028） |
+| NFR-12 | 多进程并发 | 同机 N 个宿主进程共用一个库，同时读写不丢数据、不报锁错 | 349/349 含 6 进程并发用例；写入等待上限 5s（ADR-028） |
 
 ### 1.3 约束
 
@@ -166,7 +166,7 @@ DSH Host 进程
 │   ├── retrieval     分词 / FTS / bigram / hashed 或远程向量 / 本地语义 / 图游走 / RRF
 │   ├── tools         23 个插件工具（write/ingest/candidate/consolidate/search/solution_report/profile/timeline/forget/dream/dream_proposals/dream_replace/dream_rollback/compact/reindex/export/import/restore/link_entity/persona/get/feedback/amend）
 │   ├── prompt        systemPrompt.section：画像 + 召回段（同步读缓存）
-│   └── routes        20 条 loopback HTTP（list/search/graph/node/forget/restore/export/status/persona/persona/refresh/dream/proposals/dream/replace/dream/rollback/packet/openapi.json/tool/ingest/candidates/candidate/consolidate）
+│   └── routes        21 条 loopback HTTP（list/overview/search/graph/node/forget/restore/export/status/persona/persona/refresh/dream/proposals/dream/replace/dream/rollback/packet/openapi.json/tool/ingest/candidates/candidate/consolidate）
 ├── 本插件 Client 半边（client.js，~1500 行）
 │   ├── sidebar.panellist[id=omni-memory]   左栏入口图标
 │   ├── main[key=omni-memory]               记忆面板（分页/搜索/状态/遗忘）
@@ -274,6 +274,7 @@ chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 | 路由 | 方法 | 参数 | 返回 |
 |---|---|---|---|
 | `/omni-memory/list` | GET | `limit`(1..200, 默认 40), `offset`(≥0), `scope`(`all`\|`global`\|`project`\|项目键) | `{ok, db, fts, schema, index, page{limit,offset,scope,totalNotes,totalFacts,hasMore*}, stats{notes,facts,chunks,globalNotes,projectNotes,contested,verified}, projects[{scope,notes,facts,chunks,lastAt}], chunks[]（仅精确项目键）, notes[], facts[]}` |
+| `/omni-memory/overview` | GET | `range`(`4w`\|`6w`\|`12w`\|`26w`, 默认 `12w`), `scope`(`all`\|`global`\|`project`\|项目键) | `{ok,asOf,range,scope,stats,health,series,daily,projects,profile,activity,graph}`；面向网页概览的真实聚合，不返回全文；非 loopback 403 |
 | `/omni-memory/graph` | GET | 无 | `{ok, nodes[{id,kind,label,weight,scope}], links[{source,target,rel}]}`（节点 ≤300，无悬空边） |
 | `/omni-memory/search` | GET | `q`, `limit`(1..60), `rerank`(0/1) | `{ok, hits[]}`；配置 rerank 后按 cross-encoder 分数重排 |
 | `/omni-memory/packet` | GET | `q` `scope` `cwd` `limit`(1..10, 默认 5) `budget`(400..4000, 默认 1800) `format`(`json`\|`text`) | `{ok, format, scope, query, text, chars, hits, truncated, memories[], generatedAt}`；`format=text` 直接输出纯文本 |
@@ -292,8 +293,10 @@ chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 ### 5.3 界面
 
 - 左栏图标：`sidebar.panellist`，`id=omni-memory`，`order=20`，`label=记忆`，图标为内联 SVG。
-- 面板：`main`，`key=omni-memory`。
-- 面板要素：统计行、搜索框（回车/按钮）、重置、刷新、条目卡片、遗忘按钮。
+- 面板：`main`，`key=omni-memory`；`hosts/http/web/panel.html` 是独立 HTTP 外壳的旧列表视图，含搜索、分页、状态和遗忘。
+- 概览：`hosts/http/web/index.html` 是默认 `/` 的「记忆概览」仪表盘；`dashboard.css` / `dashboard.js` 无外部依赖，读取 `/omni-memory/overview`。它展示 5 个 KPI、记忆增长双轴图、健康环、项目分布、84 天活跃日历、项目活跃带、事实关系迷你图、画像/偏好信号和最近动态。
+- 边界：当前 schema 没有任务起止、状态、依赖字段，所以项目活跃带只画首次/最近写入区间，明确标注「不是任务甘特」；不伪造甘特。`persona` 为空时只展示可回原文的偏好信号，不生成推断画像。
+- 数据口径：活跃笔记 = 未删除且未被 `superseded_by` 替代；活跃事实 = 未删除且 `valid_to` 为空；有争议 = 两类 `contested` 之和；已失效 = 被替代笔记 + 过期事实；召回有用率在 `recall_count=0` 时返回 `null`，页面显示「暂无反馈」。
 
 ---
 
@@ -560,7 +563,7 @@ score = 0.6 × 文本分 + 0.2 × 权重分 + 0.2 × 时效分 + 经验状态分
 | **M3（已完成 v0.9.0）** | 图游走（按边召回）+ 冲突标记 | 96 用例 100%；图测试覆盖跳数/开关/作用域 |
 | **M4（已完成 v1.0.0）** | 做梦校验（覆盖度 + 特征词缺失，dry-run/apply） | 101 用例 100%；「错记 Docker」样例可复现纠正 |
 | **M5（已完成 v1.1.0）** | 面板分页 + 校验状态展示 + 中英 i18n + 转录增长治理 | 107 用例 100%；D-10/11 关闭 |
-| **M6（已完成 v3.9.2）** | 内置 BGE-small-zh int8 + ONNX Runtime WASM；四路 RRF；零配置离线语义 | 348 用例 100%；黄金集 MRR 0.979；冷加载 208ms / RSS 216MB |
+| **M6（已完成 v3.9.2）** | 内置 BGE-small-zh int8 + ONNX Runtime WASM；四路 RRF；零配置离线语义 | 当时 348 用例 100%；黄金集 MRR 0.979；冷加载 208ms / RSS 216MB |
 
 ---
 
