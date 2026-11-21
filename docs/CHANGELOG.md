@@ -2,6 +2,19 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.10.2] — 2026-11-21
+
+### 修复 · DSH 冷启动与项目键分裂
+- **路由和画像不再依赖“启动瞬间恰好就绪”的服务**：`apply()` 改为通过 `ctx.inject([...])` 等待 `webServer` / `systemPrompt` 就绪；没有 `inject` 的轻量宿主仍回退到一次立即注册。`registerRoutes()` 兼容传入 context 或 webServer 服务，回调参数为 prompt 服务时也能正确取到 `.section`。`/omni-memory/status` 新增 `routes.pending/registered/disposed`、`routes.count`、`aliasRepair`、`aliasMigration`，画像注入失败不再完全静默。
+- **项目键只认 canonical**：新增 `resolveProjectKey()`，所有读取/写入入口（转录 scope、候选、agent、session、`/packet`、自动召回）统一先走 `scope_aliases`；旧键写操作不再继续制造分裂行。
+- **迁移按字面旧键执行**：`migrateScopeAlias()` 新增 `literal` 选项，CLI `scope-alias --apply` 和启动自愈都不会把旧键先解析成 canonical 后误判为 “source=target”。
+- **启动自愈**：`repairScopeAliases()` 在 `openStore()` 取得维护租约后扫描 `scope_aliases`，有旧键行的按字面迁移；成功写 `scope_alias_repair_version='1'`，失败写 `scope_alias_repair_last_error` / `scope_alias_repair_failed_at` 供下次重试，并通过 `/status` 暴露。
+- **真实库数据修复**：真实库备份到 `C:\Users\64627\.dsh\memory\backup-3.10.2-pre-repair-20261121-222309` 后，启动自愈把 `proj:全息记忆#767039` 的 10 条转录合并进 canonical `proj:全息记忆#604dba`；修复后旧键 0 行、canonical 17 条、`repairMarker=1`，alias 保留。
+
+### 测试与发布
+- 新增 `test/cold-start.test.mjs`（服务晚到 + 到达顺序无关）、`test/project-key-resolution.test.mjs`（字面迁移、session/HTTP canonical、no-op）、`test/project-key-repair.test.mjs`（启动自愈幂等）；测试基线 362 用例。
+- `npm run check` 同步为 23 个内核工具、25 个 MCP 工具、21 路由、31 ADR、3.10.2。
+
 ## [3.10.1] — 2026-11-21
 
 ### 修复 · 深度审计 P0（安全与数据一致性）

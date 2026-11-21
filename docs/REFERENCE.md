@@ -98,6 +98,8 @@ omni scope-alias --list
 
 默认只预览 `fromHasRows` / `toHasRows` 与将写入的映射；`--apply` 才会在事务内迁移 notes/facts/chunks/note_candidates/edges 与 `agent_project`。不要用它合并同名不同盘的项目。
 
+3.10.2 起，`--apply` 和启动自愈都按**字面旧键**迁移（`migrateScopeAlias(..., { literal: true })`），不会先把旧键解析成 canonical 后误判为 `source === target`。所有入口（转录 scope、候选、agent/session、`/packet`、自动召回）统一走 `resolveProjectKey()`，旧键写操作不会再制造新的分裂行。升级后第一次 `openStore()` 会运行 `repairScopeAliases()`：alias 已记录但行仍在旧键时自动迁移；成功写 `scope_alias_repair_version='1'`，失败留 `scope_alias_repair_last_error` / `scope_alias_repair_failed_at` 并下次重试。
+
 同名目录靠哈希区分，所以两个不同路径的同名项目不会串层。宿主通过"工作目录"推导，DSH 用 `session.header.cwd`，MCP/CLI/HTTP 用 `OMNI_PROJECT_DIR`，落库时同时写入 `meta.agent_project:<sessionId>` 与 `meta.project_path:<scope>`，重启后仍能恢复。
 
 ### 2.4 事实的冲突与时效
@@ -242,8 +244,11 @@ DSH 外（MCP 等）：没有注入点，改为 `memory_context` 显式调用，
 | `ctx.effect(fn)` | 启动副作用，返回释放函数 | 立即执行并记录释放器 |
 | `ctx.on(event, handler)` | 订阅宿主事件 | 无事件流时返回 undefined（内核按 no-op 处理） |
 | `ctx.get(service)` | 取服务：`llm` / `systemPrompt` / `webServer` | 由调用方注入，缺省 undefined 即优雅降级 |
+| `ctx.inject(names, callback)` | 等可选服务就绪后再注册 | DSH 冷启动时 `webServer` / `systemPrompt` 可能晚于插件激活；回调参数可能是宿主 context，也可能是服务对象 |
 
 可选服务：`llm`（模型复核、persona 提炼）、`systemPrompt`（DSH 注入）、`webServer`（挂 REST 路由）。
+
+3.10.2 起路由和画像 section 不再只做一次 `ctx.get()`：有 `ctx.inject` 时等待服务就绪，没有 `inject` 的轻量测试宿主回退到一次立即注册；`/omni-memory/status` 的 `routes` 会显示 `pending/registered/disposed`、注册数量和最后错误，画像注入失败也会记录到 `lastInjection.routes`。
 
 ### 4.2 启动顺序（重要）
 
@@ -429,9 +434,9 @@ MCP / HTTP 适配器在启动时会额外注册 `memory_context` 与 `memory_rul
 | `/dream/rollback` | POST | `noteId` | 撤销替代 |
 | `/export` | GET | `activeOnly` `download` | 备份；`download=1` 走附件下载 |
 | `/restore` | POST | `kind` `id` | 复活墓碑 |
-| `/status` | GET | — | 运行态：注入统计、嵌入后端；`embedding.dropped` / `lastDropAt` 与 `semantic.gcError` / `gcFailedAt` 可观测队列丢弃和启动 GC 失败 |
+| `/status` | GET | — | 运行态：注入统计、嵌入后端、`routes`（pending/registered/disposed、count、lastError）、`aliasRepair`、`aliasMigration`；`embedding.dropped` / `lastDropAt` 与 `semantic.gcError` / `gcFailedAt` 可观测队列丢弃和启动 GC 失败 |
 | `/search` | GET | `q` `limit` `scope` | 混合检索 |
-| `/packet` | GET | `q` `scope` `cwd` `limit` `budget` `format` | 无 MCP 宿主的可注入记忆包；`format=text` 直接输出纯文本 |
+| `/packet` | GET | `q` `scope` `cwd` `limit` `budget` `format` | 无 MCP 宿主的可注入记忆包；`cwd` 先走 `resolveProjectKey()`（3.10.2 起），`format=text` 直接输出纯文本 |
 | `/openapi.json` | GET | — | HTTP adapter 的 OpenAPI 3.0 描述（packet/search/list/node/status/tool） |
 | `/tool` | POST | body `name` `arguments`；header `x-omni-csrf: 1` | 受限工具桥：write/search/solution_report/feedback/get/amend/profile/timeline |
 | `/ingest` | POST | `text` 必填；`role` `scope` `cwd` `sessionId` `source` `importance` `extract` | 写转录 + 抽取 pending 候选 |

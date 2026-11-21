@@ -286,6 +286,21 @@ function resolveScopeAlias(db, scope) {
   return current;
 }
 
+/** Resolve a working directory to the one canonical project key. */
+function resolveProjectKey(db, cwd) {
+  const key = projectKeyFromCwd(cwd);
+  if (key === SCOPE_GLOBAL) return key;
+  return resolveScopeAlias(db, key);
+}
+
+/** Keep the alias's original creation time when its canonical target changes. */
+function upsertScopeAlias(db, alias, canonical) {
+  prepareCached(db, `
+    INSERT INTO scope_aliases(alias, canonical, created_at) VALUES (?, ?, ?)
+    ON CONFLICT(alias) DO UPDATE SET canonical = excluded.canonical
+  `).run(alias, canonical, now());
+}
+
 function scopeHasRows(db, scope) {
   try {
     const row = prepareCached(db, `
@@ -313,7 +328,7 @@ function scopeHasRows(db, scope) {
  * the duplicate source row is tombstoned, never hard-deleted.
  */
 function migrateScopeAlias(db, from, to, options = {}) {
-  const source = resolveScopeAlias(db, from);
+  const source = options.literal ? String(from ?? '').trim() : resolveScopeAlias(db, from);
   const target = resolveScopeAlias(db, to);
   if (!source || !target || source === target) return { migrated: false, from: source, to: target };
   const counts = { notes: 0, facts: 0, chunks: 0, candidates: 0, edges: 0, chunksTombstoned: 0, meta: 0 };
@@ -346,8 +361,7 @@ function migrateScopeAlias(db, from, to, options = {}) {
       metaSet(db, `project_path:${target}`, options.path);
     }
     prepareCached(db, 'DELETE FROM meta WHERE key = ?').run(`project_path:${source}`);
-    prepareCached(db, 'INSERT OR REPLACE INTO scope_aliases(alias, canonical, created_at) VALUES (?, ?, ?)')
-      .run(source, target, now());
+    upsertScopeAlias(db, source, target);
   });
   return { migrated: true, from: source, to: target, ...counts };
 }
@@ -363,31 +377,49 @@ function ensureProjectAlias(db, cwd) {
   const canonical = resolveScopeAlias(db, projectKeyFromCwd(raw));
   if (canonical === SCOPE_GLOBAL) return { migrated: false, canonical };
   const candidates = new Set();
-  const legacy = resolveScopeAlias(db, legacyProjectKeyFromCwd(raw));
-  if (legacy !== canonical) candidates.add(legacy);
+  const addCandidate = value => {
+    const candidate = String(value ?? '').trim();
+    if (!candidate || candidate === SCOPE_GLOBAL || candidate === canonical) return;
+    candidates.add(candidate);
+  };
+
+  // The legacy key must be considered literally. Resolving it first would turn
+  // it into the canonical key whenever an alias already exists, which is exactly
+  // the case where leftover rows still need migration.
+  addCandidate(legacyProjectKeyFromCwd(raw));
 
   // A path remembered on a previous run can recover cased spellings that are
   // no longer the process cwd. Full-path equality prevents same-basename merges.
   try {
     for (const row of prepareCached(db, "SELECT key, value FROM meta WHERE key LIKE 'project_path:%'").all()) {
       if (!projectPathsEqual(row.value, raw)) continue;
-      const scope = resolveScopeAlias(db, String(row.key).slice('project_path:'.length));
-      if (scope !== canonical) candidates.add(scope);
+      addCandidate(String(row.key).slice('project_path:'.length));
     }
   } catch { /* the path map is best effort */ }
 
-  const result = { migrated: false, canonical, merged: [] };
+  // Any alias already pointing at this canonical may still own rows. The old
+  // implementation resolved the alias first, saw it equal the target, and never
+  // inspected its rows -- leaving transcripts invisible to the project view.
+  try {
+    for (const row of prepareCached(db, 'SELECT alias FROM scope_aliases WHERE canonical = ?').all(canonical)) {
+      addCandidate(row.alias);
+    }
+  } catch { /* schema repair is best effort */ }
+
+  const result = { migrated: false, canonical, merged: [], candidates: [...candidates] };
   for (const candidate of candidates) {
     if (!scopeHasRows(db, candidate)) {
       // Still remember the old key, so a later import cannot split the layer.
       try {
-        prepareCached(db, 'INSERT OR REPLACE INTO scope_aliases(alias, canonical, created_at) VALUES (?, ?, ?)')
-          .run(candidate, canonical, now());
+        upsertScopeAlias(db, candidate, canonical);
         result.merged.push({ from: candidate, to: canonical, migrated: false });
       } catch { /* schema repair is best effort */ }
       continue;
     }
-    result.merged.push(migrateScopeAlias(db, candidate, canonical, { path: normalizeProjectPath(raw) }));
+    result.merged.push(migrateScopeAlias(db, candidate, canonical, {
+      literal: true,
+      path: normalizeProjectPath(raw),
+    }));
     if (result.merged.at(-1).migrated) result.migrated = true;
   }
   try {
@@ -397,10 +429,55 @@ function ensureProjectAlias(db, cwd) {
   return result;
 }
 
+const SCOPE_ALIAS_REPAIR_VERSION = '1';
 
 /**
- * Model-based layer judgement.
- *
+ * One-time startup repair for aliases that were recorded before their rows
+ * existed. `ensureProjectAlias` now handles the current cwd, but an old alias
+ * can still own rows from a previous process; moving them once prevents a
+ * permanent split between the exact project view and `scope=all`.
+ */
+function repairScopeAliases(db) {
+  const version = SCOPE_ALIAS_REPAIR_VERSION;
+  if (metaGet(db, 'scope_alias_repair_version') === version) {
+    return { skipped: true, version, checked: 0, migrated: 0, failed: [] };
+  }
+  const report = { skipped: false, version, checked: 0, migrated: 0, failed: [], at: now() };
+  let rows = [];
+  try {
+    rows = prepareCached(db, 'SELECT alias, canonical FROM scope_aliases WHERE alias <> canonical').all();
+  } catch (error) {
+    report.failed.push({ alias: null, error: String(error?.message ?? error) });
+  }
+  for (const row of rows) {
+    const alias = String(row.alias ?? '').trim();
+    const canonical = String(row.canonical ?? '').trim();
+    if (!alias || !canonical || alias === canonical || alias === SCOPE_GLOBAL || canonical === SCOPE_GLOBAL) continue;
+    report.checked += 1;
+    let hasRows = false;
+    try { hasRows = scopeHasRows(db, alias); } catch { hasRows = false; }
+    if (!hasRows) continue;
+    try {
+      const result = migrateScopeAlias(db, alias, canonical, { literal: true });
+      if (result.migrated) report.migrated += 1;
+    } catch (error) {
+      report.failed.push({ alias, canonical, error: String(error?.message ?? error) });
+    }
+  }
+  try {
+    if (report.failed.length) {
+      metaSet(db, 'scope_alias_repair_last_error', JSON.stringify(report.failed.slice(0, 20)).slice(0, 2000));
+      metaSet(db, 'scope_alias_repair_failed_at', now());
+    } else {
+      metaSet(db, 'scope_alias_repair_version', version);
+      metaSet(db, 'scope_alias_repair_last_error', '');
+      metaSet(db, 'scope_alias_repair_last_run_at', now());
+    }
+  } catch { /* repair diagnostics are best effort */ }
+  return report;
+}
+
+/**
  * Rules are cheap but keyword-blind; the host `llm` service can do better. Writes
  * never wait for it: the row lands immediately under the rule's verdict and a
  * background call re-checks ambiguous cases, moving the row when the model
@@ -670,8 +747,21 @@ function openStore() {
   // backfill marker, silently breaking vector recall.
   let schemaVersion = SCHEMA_VERSION;
   let semanticGcReport = null;
+  let aliasRepair = null;
   try {
     schemaVersion = migrate(db);
+    try {
+      aliasRepair = repairScopeAliases(db);
+    } catch (error) {
+      aliasRepair = {
+        skipped: false,
+        version: SCOPE_ALIAS_REPAIR_VERSION,
+        checked: 0,
+        migrated: 0,
+        failed: [{ alias: null, error: String(error?.message ?? error) }],
+        at: now(),
+      };
+    }
     // One-time derived-index repair. Forget/compact now delete semantic rows in
     // the same transaction; this sweep removes rows left behind by older builds.
     if (metaGet(db, 'semantic_gc_version') !== String(SCHEMA_VERSION)) {
@@ -711,6 +801,7 @@ function openStore() {
     ftsMode,
     schemaVersion,
     semanticGc: semanticGcReport,
+    aliasRepair,
     fts: { chunks: Boolean(chunksMode), notes: Boolean(notesMode), facts: Boolean(factsMode) },
   };
   // A host launched from this directory should never silently split its layer
@@ -2366,13 +2457,13 @@ function insertChunk(s, input) {
 
 
 const CANDIDATE_ROLES = new Set(['user', 'assistant', 'system', 'tool', 'note']);
-function resolveTranscriptScope(input, toolContext) {
+function resolveTranscriptScope(input, toolContext, db = openStore().db) {
   const requested = normalizeScopeInput(input.scope);
   if (requested === 'all') throw new Error('transcripts cannot be written to scope=all');
   if (requested === 'project') return currentProject(toolContext) ?? SCOPE_GLOBAL;
   if (requested) return requested;
   const cwd = String(input.cwd ?? '').trim();
-  if (cwd) return projectKeyFromCwd(cwd);
+  if (cwd) return resolveProjectKey(db, cwd);
   return currentProject(toolContext) ?? SCOPE_GLOBAL;
 }
 
@@ -2415,7 +2506,7 @@ export function ingestTranscript(input = {}, toolContext = {}) {
     }
   }
   const sessionId = String(input.sessionId ?? toolContext?.session?.id ?? '').trim() || null;
-  const scope = resolveTranscriptScope(input, toolContext);
+  const scope = resolveTranscriptScope(input, toolContext, s.db);
   const truncated = text.length > MAX_CAPTURE_CHARS;
   const storedText = truncated ? text.slice(0, MAX_CAPTURE_CHARS) : text;
   if (sessionId && scope !== SCOPE_GLOBAL) {
@@ -2456,13 +2547,13 @@ export function ingestTranscript(input = {}, toolContext = {}) {
   };
 }
 
-function candidateScope(options = {}, toolContext = {}) {
+function candidateScope(options = {}, toolContext = {}, db = openStore().db) {
   const requested = normalizeScopeInput(options.scope);
   if (requested === 'all') return null;
   if (requested === 'project') return 'project';
   if (requested) return requested;
   const cwd = String(options.cwd ?? '').trim();
-  if (cwd) return projectKeyFromCwd(cwd);
+  if (cwd) return resolveProjectKey(db, cwd);
   return currentProject(toolContext) || SCOPE_GLOBAL;
 }
 
@@ -2474,7 +2565,7 @@ export function listNoteCandidates(options = {}, toolContext = {}) {
     throw new Error('status must be pending, accepted, rejected or all');
   }
   const limit = Math.min(100, Math.max(1, Number(options.limit ?? 20) || 20));
-  const scope = candidateScope(options, toolContext);
+  const scope = candidateScope(options, toolContext, s.db);
   const clause = scopeClause('scope', scope, true);
   const parts = [];
   if (status !== 'all') parts.push('status = ?');
@@ -2550,7 +2641,7 @@ function writeCandidateNoteInTransaction(s, row) {
   if (!Number.isFinite(candidateId) || candidateId <= 0) throw new Error('id must be a positive number');
   const normalized = String(action ?? '').trim().toLowerCase();
   if (!['accept', 'reject'].includes(normalized)) throw new Error('action must be accept or reject');
-  const scope = candidateScope(options, toolContext);
+  const scope = candidateScope(options, toolContext, s.db);
   const clause = scopeClause('scope', scope, true);
   const row = prepareCached(s.db, `
     SELECT * FROM note_candidates WHERE id = ? ${clause.sql}
@@ -4611,7 +4702,9 @@ function projectForAgentId(agentId) {
   const known = projectByAgent.get(id);
   if (known) return known;
   const cwd = cwdBySession.get(id);
-  if (cwd) return projectKeyFromCwd(cwd);
+  if (cwd) {
+    try { return resolveProjectKey(openStore().db, cwd); } catch { /* fall through to persisted map */ }
+  }
   // Survive a plugin reload: the mapping is persisted when it is learned.
   try {
     const stored = metaGet(openStore().db, `agent_project:${id}`);
@@ -4638,19 +4731,23 @@ function projectForScope(scope) {
   if (known) return known;
   const exact = cwdBySession.get(id);
   if (exact) {
-    const project = projectKeyFromCwd(exact);
-    if (project !== SCOPE_GLOBAL) return project;
+    try {
+      const project = resolveProjectKey(openStore().db, exact);
+      if (project !== SCOPE_GLOBAL) return project;
+    } catch { /* fall through to prefix matching */ }
   }
   // The host may hand over a truncated or opaque id (for example `session-b707`).
   // Match it only when both ids share at least 12 characters AND exactly one
   // captured session matches; an ambiguous prefix must fail closed instead of
   // guessing another project's layer.
   const matches = [];
+  let db;
+  try { db = openStore().db; } catch { db = undefined; }
   for (const [sessionId, cwd] of cwdBySession) {
     const common = Math.min(sessionId.length, id.length);
     if (common < 12) continue;
     if (!sessionId.startsWith(id) && !id.startsWith(sessionId)) continue;
-    const project = projectKeyFromCwd(cwd);
+    const project = db ? resolveProjectKey(db, cwd) : projectKeyFromCwd(cwd);
     if (project !== SCOPE_GLOBAL && !matches.includes(project)) matches.push(project);
   }
   return matches.length === 1 ? matches[0] : null;
@@ -4666,9 +4763,10 @@ function rememberUserMessage(agent, message) {
     lastClaimAt = now();
     const cwd = cwdBySession.get(agentId);
     if (cwd) {
-      const project = projectKeyFromCwd(cwd);
+      const db = openStore().db;
+      const project = resolveProjectKey(db, cwd);
       projectByAgent.set(agentId, project);
-      try { metaSet(openStore().db, `agent_project:${agentId}`, project); } catch { /* best effort */ }
+      try { metaSet(db, `agent_project:${agentId}`, project); } catch { /* best effort */ }
     }
     if (!autoRecallEnabled()) return;
     void precomputeRecall(agentId, text);
@@ -4732,7 +4830,7 @@ function scopeForSession(session) {
   try {
     const db = openStore().db;
     ensureProjectAlias(db, known);
-    return resolveScopeAlias(db, projectKeyFromCwd(known));
+    return resolveProjectKey(db, known);
   } catch {
     return projectKeyFromCwd(known);
   }
@@ -6071,6 +6169,52 @@ function defineTools(ctx) {
 
 export const inject = ['tools'];
 
+/** Whether the optional HTTP route surface has been attached yet. */
+let routeState = { status: 'pending', count: 0, at: 0, error: null };
+
+function serviceFrom(ctx, name) {
+  if (!ctx) return undefined;
+  if (typeof ctx.get === 'function') {
+    try {
+      const value = ctx.get(name);
+      if (value !== undefined) return value;
+    } catch { /* service not ready */ }
+  }
+  return ctx[name];
+}
+
+/**
+ * Register an optional service only when the host can provide it.
+ *
+ * Cordis hosts activate optional services (webServer, systemPrompt) after
+ * plugins, so a one-shot `ctx.get()` races the service and silently drops the
+ * route/profile surface. `ctx.inject([name], cb)` waits for the service. Hosts
+ * without that API (the lightweight test/MCP shims) fall back to the old
+ * immediate lookup.
+ */
+function registerWhenAvailable(ctx, name, register) {
+  if (ctx && typeof ctx.inject === 'function') {
+    let dispose;
+    let off;
+    try {
+      off = ctx.inject([name], inner => {
+        try {
+          if (typeof dispose === 'function') dispose();
+          dispose = register(inner);
+        } catch { /* optional surface must not break apply */ }
+      });
+      return () => {
+        try { off?.(); } catch { /* already gone */ }
+        try { dispose?.(); } catch { /* already gone */ }
+        dispose = undefined;
+      };
+    } catch {
+      /* Fall through to the immediate path below. */
+    }
+  }
+  return register(ctx);
+}
+
 function isLoopback(req) {
   const address = req.socket?.remoteAddress ?? '';
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
@@ -6179,13 +6323,13 @@ function readJsonBody(req, limit = 8192) {
 }
 
 function registerRoutes(ctx) {
-  let web;
-  try {
-    web = typeof ctx.get === 'function' ? ctx.get('webServer') : ctx.webServer;
-  } catch {
-    web = undefined;
+  const web = (ctx && typeof ctx.register === 'function' && typeof ctx.get !== 'function')
+    ? ctx
+    : serviceFrom(ctx, 'webServer');
+  if (!web || typeof web.register !== 'function') {
+    routeState = { status: 'pending', count: 0, at: now(), error: 'webServer not available' };
+    return undefined;
   }
-  if (!web || typeof web.register !== 'function') return undefined;
 
   const disposers = [];
   const add = route => {
@@ -6206,8 +6350,9 @@ function registerRoutes(ctx) {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       const requestedScope = normalizeScopeInput(url.searchParams.get('scope'));
       const cwd = String(url.searchParams.get('cwd') ?? '').trim();
-      const scopeLabel = requestedScope || (cwd ? projectKeyFromCwd(cwd) : SCOPE_GLOBAL);
-      const scope = requestedScope === 'all' ? null : (requestedScope || (cwd ? projectKeyFromCwd(cwd) : SCOPE_GLOBAL));
+      const project = cwd ? resolveProjectKey(openStore().db, cwd) : SCOPE_GLOBAL;
+      const scopeLabel = requestedScope || project;
+      const scope = requestedScope === 'all' ? null : (requestedScope || project);
       const query = String(url.searchParams.get('q') ?? '').trim();
       const packet = await buildMemoryPacket(scope, query, {
         limit: Number(url.searchParams.get('limit') ?? 5),
@@ -7114,6 +7259,9 @@ function registerRoutes(ctx) {
         ok: true,
         autoRecall: autoRecallEnabled(),
         lastInjection,
+        routes: routeState,
+        aliasRepair: s.aliasRepair,
+        aliasMigration: s.aliasMigration,
         lastSearch: lastSearchProfile,
         lastJudge,
         embedding: {
@@ -7184,10 +7332,12 @@ function registerRoutes(ctx) {
     },
   });
 
+  routeState = { status: 'registered', count: disposers.length, at: now(), error: null };
   return () => {
     for (const dispose of disposers) {
       try { dispose(); } catch { /* already gone */ }
     }
+    routeState = { status: 'disposed', count: 0, at: now(), error: null };
   };
 }
 
@@ -7213,7 +7363,7 @@ export function attachSession(sessionId, cwd) {
     const db = openStore().db;
     if (raw) {
       ensureProjectAlias(db, raw);
-      project = resolveScopeAlias(db, project);
+      project = resolveProjectKey(db, raw);
     }
     metaSet(db, `agent_project:${id}`, project);
   } catch { /* best effort */ }
@@ -7233,8 +7383,7 @@ export function apply(ctx) {
   }, 'omni-memory: tools');
 
   ctx.effect(() => {
-    const cleanup = registerRoutes(ctx);
-    return () => { try { cleanup?.(); } catch { /* ignore */ } };
+    return registerWhenAvailable(ctx, 'webServer', inner => registerRoutes(inner));
   }, 'omni-memory: routes');
 
   // Transcript capture: post-commit feed only. Reading a Session projection or
@@ -7258,14 +7407,12 @@ export function apply(ctx) {
   // Always-injected profile: a small, cached block of the strongest notes, plus
   // the precomputed recall for this request when the switch is on.
   ctx.effect(() => {
-    let prompt;
-    try {
-      prompt = typeof ctx.get === 'function' ? ctx.get('systemPrompt') : ctx.systemPrompt;
-    } catch {
-      prompt = undefined;
-    }
-    if (!prompt || typeof prompt.section !== 'function') return undefined;
-    const dispose = prompt.section({
+    return registerWhenAvailable(ctx, 'systemPrompt', inner => {
+      const prompt = (inner && typeof inner.section === 'function')
+        ? inner
+        : serviceFrom(inner, 'systemPrompt');
+      if (!prompt || typeof prompt.section !== 'function') return undefined;
+      const dispose = prompt.section({
       name: 'omni-memory',
       order: 600,
       text: assemblyContext => {
@@ -7303,6 +7450,8 @@ export function apply(ctx) {
           recall: safeHits.length,
           auto: autoRecallEnabled(),
           project: project ?? SCOPE_GLOBAL,
+          // Diagnostics: whether the optional HTTP route surface was attached.
+          routes: routeState.status,
           // Diagnostics: whether the assembly handed us a usable scope id at all.
           scopeId: assemblyContext?.scope?.id ? String(assemblyContext.scope.id).slice(0, 12) : null,
         };
@@ -7310,6 +7459,7 @@ export function apply(ctx) {
       },
     });
     return () => { try { dispose?.(); } catch { /* ignore */ } };
+    });
   }, 'omni-memory: prompt section');
 
   // Optional offline consolidation. Off by default: a background verifier that

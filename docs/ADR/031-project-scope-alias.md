@@ -34,3 +34,16 @@
 - `test/scope-alias.test.mjs`：Windows/macOS 大小写同键、Linux 不同键、旧 scope 迁移与重开幂等、chunk 同 hash 冲突 tombstone。
 - 真实库副本迁移：`proj:全息记忆#deff23` → `proj:全息记忆#30534c`，40 条 notes、12 条 facts、12 条 edges 保留；`--scope project` 命中。
 - 完整 `npm test` 288/288；`npm run check` 通过。
+
+## 3.10.2 补充：旧键残留自愈
+
+3.9.4 的迁移依赖 `ensureProjectAlias`，但旧键一旦已经写过 `scope_aliases`，后续 `resolveScopeAlias(legacy)` 会先把它解析成 canonical，导致 `legacy !== canonical` 不成立，旧键不会进入迁移候选；同时 `migrateScopeAlias` 也把 `from` 解析成 canonical，出现 `source === target` 的假 no-op。结果是 alias 已记录、行仍留在旧键。
+
+3.10.2 的补充决策：
+
+1. `resolveProjectKey(db, cwd)` 成为所有入口的统一解析；`resolveTranscriptScope`、`candidateScope`、`projectForAgentId`、`projectForScope`、`rememberUserMessage`、`/packet`、`attachSession`、`scopeForSession` 都先走 alias。
+2. `migrateScopeAlias(db, from, to, { literal: true })` 不解析 `from`，按字面旧键迁移；target 仍解析。CLI `scope-alias --apply` 显式使用 literal，避免运维命令也掉进同一个假 no-op。
+3. `ensureProjectAlias` 始终把 `legacyProjectKeyFromCwd(raw)` 的原始键、`project_path:*` 路径相等命中的原始键、以及 `scope_aliases` 中 canonical 指向当前键且仍有行的 alias 加入候选；有行则按 literal 迁移，无行只补 alias。
+4. `repairScopeAliases(db)` 在 `openStore()` 拿到维护租约并完成 `migrate()` 后运行：扫描 `scope_aliases` 中 `alias <> canonical` 的记录，有行就迁移；成功后写 `scope_alias_repair_version='1'`，失败写 `scope_alias_repair_last_error` / `scope_alias_repair_failed_at`，下次启动重试。结果通过 `/omni-memory/status` 的 `aliasRepair` 暴露。
+5. 验证：`test/project-key-resolution.test.mjs` 3 例、`test/project-key-repair.test.mjs` 1 例；真实库修复后 `proj:全息记忆#767039` 的 10 条 chunks 并入 `proj:全息记忆#604dba`（7 → 17），旧键 0 行，`repairMarker=1`，alias 保留。
+

@@ -44,7 +44,7 @@ node hosts\cli.mjs write --dir <repo> --kind note --text "..."
 环境变量：OMNI_HOME=<用户目录>\.dsh；OMNI_PROJECT_DIR=<repo>
 ```
 
-实测：`initialize` 返回 `omni-memory 3.10.1`，`tools/list` 25 个工具。连接器只是可选增强，由豆包客户端管理；Agent 不应自动改豆包设置、配置或注册表。
+实测：`initialize` 返回 `omni-memory 3.10.2`，`tools/list` 25 个工具。连接器只是可选增强，由豆包客户端管理；Agent 不应自动改豆包设置、配置或注册表。
 
 #### 宿主瞬断（2026-11-21 实测）
 

@@ -434,7 +434,7 @@ async function commandScopeAlias() {
       process.stdout.write(JSON.stringify({ ...preview, hint: '加 --apply 执行合并；默认只预览' }) + '\n');
       return;
     }
-    const result = migrateScopeAlias(store.db, from, to);
+    const result = migrateScopeAlias(store.db, from, to, { literal: true });
     process.stdout.write(JSON.stringify({ ...preview, ...result }) + '\n');
   } finally {
     booted.host.dispose();
