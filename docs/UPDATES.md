@@ -2,7 +2,7 @@
 
 > 本文件由 `npm run update-log` 从 git 历史自动生成，按时间倒序记录每一次提交。
 > 版本摘要见 [CHANGELOG](CHANGELOG.md)，版本报告见下方“版本报告”。
-> 共 57 次提交；更新记录自身的提交不计入列表。
+> 共 58 次提交；更新记录自身的提交不计入列表。
 
 ## 版本报告
 
@@ -15,6 +15,7 @@
 
 ## 2026-11-21
 
+- 15:50:52 `ae3c52c9` — test: add install and lifecycle coverage — [提交](https://github.com/wangzhen110/omni-memory/commit/ae3c52c95ecfb42fbbb68b3f42734c78fb1ba473)
 - 15:25:33 `ab32760b` — test: close testing gaps with fault and security coverage — [提交](https://github.com/wangzhen110/omni-memory/commit/ab32760becc82c7ff3a2b6d7b238866b522aa3a7)
 - 15:04:44 `81bcfbf7` — test: add property and fuzz coverage — [提交](https://github.com/wangzhen110/omni-memory/commit/81bcfbf714b26dec70d91b1b5e97e32780c0cc43)
 - 14:36:24 `ec7a7824` — docs: correct 3.9.5 package entry count — [提交](https://github.com/wangzhen110/omni-memory/commit/ec7a7824d2f0d4e3f717a43a766cf91bd11677e5)
