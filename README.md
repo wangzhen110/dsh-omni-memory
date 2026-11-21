@@ -193,6 +193,7 @@ npm run bench:golden   # 黄金集
 - 多进程并发（多个 AI 客户端共用一个库）见 [ADR-028](docs/ADR/028-multi-process-concurrency.md)
 - 远程 embedding 加固与 ANN 边界见 [ADR-025](docs/ADR/025-remote-embedding-and-ann.md)
 - [更新日志](docs/CHANGELOG.md)
+- [逐次更新记录](docs/UPDATES.md)
 - [3.9.0 自动捕获与巩固完成报告](docs/COMPLETION-2026-11-21.md)
 - [3.9.1 复核问题修复报告](docs/COMPLETION-3.9.1-2026-11-21.md)
 - [3.9.2 零配置语义整改报告](docs/COMPLETION-3.9.2-2026-11-21.md)

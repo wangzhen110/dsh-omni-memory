@@ -33,7 +33,8 @@
     "bench": "node bench/bench.mjs",
     "bench:golden": "node bench/golden.mjs",
     "check": "node scripts/check-docs.mjs && node scripts/check-client-hooks.mjs && node --check index.js && node --check client.js && node scripts/check-client-load.mjs && node --check lib/embed.mjs && node --check lib/embed-provider.mjs && node --check lib/semantic-embed.mjs && node --check lib/capture-rules.mjs && node --check lib/rerank-provider.mjs && node scripts/check-semantic-assets.mjs && node -e \"['package.json','locale/zh.json','locale/en.json'].forEach(f=>JSON.parse(require('fs').readFileSync(f,'utf8')))\"",
-    "check:docs": "node scripts/check-docs.mjs"
+    "check:docs": "node scripts/check-docs.mjs",
+    "update-log": "node scripts/update-log.mjs"
   },
   "exports": {
     ".": "./index.js",
