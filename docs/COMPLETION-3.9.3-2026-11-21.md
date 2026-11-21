@@ -2,7 +2,7 @@
 
 日期：2026-11-21
 版本：3.9.3
-状态：实现、测试、文档、打包完成；已提交并推送 GitHub main（`935e86e`），本机 7788 已重启为 3.9.3。
+状态：实现、测试、文档、打包完成；已提交并推送 GitHub main（`47b199d`），本机 7788 已由静默计划任务 `OmniMemory7788` 运行 3.9.3。
 
 ## 背景
 
@@ -38,6 +38,6 @@
 
 - 提交：`935e86e55f2a3b7663ef14e13e78cbbe3050dc6a`（短 SHA `935e86e`），提交信息 `feat: govern semantic index lifecycle (3.9.3)`。
 - 远端：`https://github.com/wangzhen110/omni-memory`，`main` 与本地 `HEAD` 均为 `935e86e55f2a3b7663ef14e13e78cbbe3050dc6a`。
-- 本机 7788：PID `10392`，`node hosts/cli.mjs serve --port 7788`；`/health` 返回 `version:"3.9.3"`、`tools:25`。
+- 本机 7788：静默计划任务 `OmniMemory7788`（`powershell.exe -WindowStyle Hidden` 启动，无控制台窗口），node PID `23548`；`/health` 返回 `version:"3.9.3"`、`tools:25`。
 - 语义状态：`indexed:1239`、`pending:0`、`dropped:0`、`failureCount:0`、`retryAt:null`、`backfillDone:true`、`lastError:""`；启动清扫标记 `semantic_gc_version=14`。
 - 线上实测：`那个把界面弄没的坑` 命中 3 条，最高 `semanticScore` 0.502，与 3.9.2 基线一致。
