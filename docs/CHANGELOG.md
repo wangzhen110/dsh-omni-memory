@@ -16,7 +16,7 @@
 - **署名**：`ATTRIBUTION.md` 补充 `Xenova/bge-small-zh-v1.5` ONNX 导出来源。
 - **scope NULL 口径**：明确 `notes` 的 `scope` NOT NULL 不包含 NULL；`facts`/`chunks`/`edges` 的 legacy NULL 继续按 global 可见，仅用于兼容旧库，不改变现有查询。
 - **reindex 计数**：`memory_reindex` 的顶层 `processed` 明确定义为当前向量后端的行数，语义回填数量始终在 `semantic.processed` 子对象中；不把两种计数混成一个数字。
-- **文档计数**：按真实 MCP `tools/list` 修正为 25 个工具（23 个内核 + 2 个适配器），同步修正 HTTP 适配器 README 的 20 条路由与 Node 版本声明。
+- **文档计数**：按真实 MCP `tools/list` 修正为 25 个工具（23 个内核 + 2 个适配器），同步修正 HTTP 适配器 README 的 20 条路由与 Node 版本声明；`check-docs` 增加 MCP 工具数与适配器路由数门禁，防止再次漂移。
 
 ### 测试与发布
 - 新增 `test/scope-alias.test.mjs`：Windows/macOS 同键、Linux 保持大小写、旧 scope 迁移与重开幂等、chunk 冲突 tombstone。

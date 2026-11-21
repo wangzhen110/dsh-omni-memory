@@ -58,7 +58,7 @@ CREATE INDEX scope_aliases_canonical ON scope_aliases(canonical);
 - `nulls` 口径：`notes.scope` NOT NULL 不把 NULL 当 global；`facts/chunks/edges` 的 legacy NULL 仍兼容为 global，并在 REFERENCE 显式写明。
 - `memory_reindex`：顶层 `processed` 明确为当前向量后端写入行数；语义回填数量只在 `semantic.processed`，文档不再暗示两者相加。
 - 文档体积统一标注 MiB；README 写明 22.8 MiB 模型 + 14.2 MiB WASM。
-- 按真实 MCP `tools/list` 修正文档计数：25 个工具（23 个内核 + 2 个适配工具）、20 条 REST 路由；同步修正 `hosts/mcp/README.md` 的 17/19/13 与 `>=24` 陈旧数字。
+- 按真实 MCP `tools/list` 修正文档计数：25 个工具（23 个内核 + 2 个适配工具）、20 条 REST 路由；同步修正 `hosts/mcp/README.md` 的 17/19/13 与 `>=24` 陈旧数字，并给 `scripts/check-docs.mjs` 加上 MCP 工具数/REST 路由数门禁。
 
 ## 验证
 

@@ -17,8 +17,14 @@ const index = read('index.js');
 const readme = read('README.md');
 const design = read('docs/DESIGN.md');
 const changelog = read('docs/CHANGELOG.md');
+const mcpReadme = read('hosts/mcp/README.md');
+const adapterSource = read('hosts/shared/context-tool.mjs') + read('hosts/shared/rules.mjs');
 
 const tools = [...new Set([...index.matchAll(/name:\s*'(memory_[a-z_]+)'/g)].map(match => match[1]))].sort();
+const adapterTools = [...new Set([...adapterSource.matchAll(/name:\s*'(memory_[a-z_]+)'/g)].map(match => match[1]))]
+  .filter(tool => !tools.includes(tool))
+  .sort();
+const mcpTools = tools.length + adapterTools.length;
 const routes = [...new Set([...index.matchAll(/path:\s*'\/omni-memory\/([a-z/.]+)'/g)].map(match => match[1]))].sort();
 const adrCount = readdirSync(path.join(root, 'docs', 'ADR')).filter(file => file.endsWith('.md')).length;
 
@@ -45,9 +51,13 @@ check('DESIGN test reliability', design.includes(`${tests}/${tests}`), `DESIGN N
 check('README ADR count', readme.includes(`（${adrCount} 份）`), `README does not say ${adrCount} 份`);
 check('DESIGN route list', routes.every(route => design.includes(route)) && design.includes(`${routes.length} 条 loopback HTTP`), `DESIGN routes do not match ${routes.join(',')}`);
 check('README tool count', tools.every(tool => readme.includes(tool)), `README misses a tool (${tools.join(',')})`);
+check('README MCP tool count', readme.includes(`${mcpTools} 个 MCP 工具`), `README does not say ${mcpTools} 个 MCP 工具`);
+check('MCP README tool count', mcpReadme.includes(`${mcpTools} 个 MCP 工具`), `hosts/mcp/README.md does not say ${mcpTools} 个 MCP 工具`);
+check('MCP README route count', mcpReadme.includes(`${routes.length} 条 REST 路由`), `hosts/mcp/README.md does not say ${routes.length} 条 REST 路由`);
+check('DESIGN core tool count', design.includes(`${tools.length} 个插件工具`), `DESIGN does not say ${tools.length} 个插件工具`);
 check('CHANGELOG has current version', new RegExp(`## \\[${pkg.version.replaceAll('.', '\\.')}\\]`).test(changelog), `CHANGELOG has no ${pkg.version} entry`);
 
-console.log(`\n${tests} tests, ${tools.length} tools, ${routes.length} routes, ${adrCount} ADRs, version ${pkg.version}`);
+console.log(`\n${tests} tests, ${tools.length} core tools / ${mcpTools} MCP tools, ${routes.length} routes, ${adrCount} ADRs, version ${pkg.version}`);
 if (failures.length) {
   console.error(`\n${failures.length} documentation mismatch(es). Update the docs before shipping.`);
   process.exit(1);
