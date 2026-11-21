@@ -2,11 +2,11 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | 3.6.1 |
-| 插件版本 | 3.6.1 |
+| 文档版本 | 3.7.0 |
+| 插件版本 | 3.7.0 |
 | 状态 | 已评审（本文为开发与验收的**唯一依据**） |
 | 目标平台 | DeepSeek Harness 0.2.2-rc.3（Desktop，Windows 11，Node 24.17） |
-| 最后更新 | 2026-11-18 |
+| 最后更新 | 2026-11-21 |
 | 变更规则 | 任何行为变更必须先改本文并升版本，再改代码 |
 
 **写作原则**：本规格只声明两类内容——① 已实现且被测试覆盖的行为；② 明确标注为「未实现」并有对应 FR 编号的需求。禁止把计划写成现状。
@@ -70,6 +70,10 @@
 | FR-30 | 故障经验写入 | 笔记可写 `problemKey`、`solutionStatus`（verified/unverified/failed/expired）、`evidence`；`problemKey` 做去空白、小写、限长归一化 | ✅ 已实现（ADR-027） |
 | FR-31 | 故障经验检索 | `memory_search` 支持只传 `problemKey` 精确查，支持 `status`/`kind` 过滤；精确指纹命中置顶，verified 排在 failed/expired 之前 | ✅ 已实现（ADR-027） |
 | FR-32 | 解法复用反馈 | `memory_solution_report` 按 success/failed/expired 回写状态；success 累计 `reuseCount` 并记录解法验证时间 | ✅ 已实现（ADR-027） |
+| FR-33 | 召回质量反馈 | `memory_feedback` 对 note/fact 记 `useful` / `misleading`；搜索返回计数与质量，反馈参与 Bayesian 平滑后的排序 | ✅ 已实现（schema v12） |
+| FR-34 | 渐进披露 | `memory_get` 按 kind+id 展开完整正文，最多 20 条；默认当前项目 + global，`all` 需显式 | ✅ 已实现 |
+| FR-35 | 笔记修订链 | `memory_amend` 产生新 revision，旧行 `superseded_by` 指向新行；搜索只见新行，旧行保留审计 | ✅ 已实现 |
+| FR-36 | 检索质量门禁 | 黄金集 recall ≥ 0.85、MRR ≥ 0.9；`npm run bench:golden` 失败即退出码 1，CI 强制执行 | ✅ 已实现（当前 MRR 0.927） |
 
 ### 1.2 非功能需求
 
@@ -84,9 +88,9 @@
 | NFR-07 | 失败隔离 | 任一子系统（FTS/路由/注入）失效不得导致会话不可用 | 满足（全部 try/catch + 可选降级） |
 | NFR-08 | 隐私 | 所有数据仅存本机 `$DSH_HOME/memory/omni.db`；HTTP 仅 loopback，且浏览器跨站写请求被 Origin 校验拦截 | 部分满足：数据库未加密，loopback HTTP 仍依赖本机进程边界，未做进程级鉴权（ADR-017） |
 | NFR-09 | 可卸载 | 卸载插件后不残留运行中的监听；数据文件保留由用户决定 | 满足 |
-| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 246/246（100%） |
+| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 251/251（100%） |
 | NFR-11 | 界面本地化 | 中英词典注册，切换语言无需重载插件 | 已实现（词典 + 订阅重渲染） |
-| NFR-12 | 多进程并发 | 同机 N 个宿主进程共用一个库，同时读写不丢数据、不报锁错 | 246/246 含 6 进程并发用例；写入等待上限 5s（ADR-028） |
+| NFR-12 | 多进程并发 | 同机 N 个宿主进程共用一个库，同时读写不丢数据、不报锁错 | 251/251 含 6 进程并发用例；写入等待上限 5s（ADR-028） |
 
 ### 1.3 约束
 
@@ -151,7 +155,7 @@ DSH Host 进程
 │   ├── capture       session/event → chunks
 │   ├── recall        agent/inbox/claimed → 异步预取 top-3（TTL 120s）
 │   ├── retrieval     分词 / FTS / bigram / 向量 / 图游走 / RRF
-│   ├── tools         17 个模型工具（write/search/solution_report/profile/timeline/forget/dream/dream_proposals/dream_replace/dream_rollback/compact/reindex/export/import/restore/link_entity/persona）
+│   ├── tools         20 个插件工具（write/search/solution_report/profile/timeline/forget/dream/dream_proposals/dream_replace/dream_rollback/compact/reindex/export/import/restore/link_entity/persona/get/feedback/amend）
 │   ├── prompt        systemPrompt.section：画像 + 召回段（同步读缓存）
 │   └── routes        13 条 loopback HTTP（list/search/graph/node/forget/restore/export/status/persona/persona/refresh/dream/proposals/dream/replace/dream/rollback）
 ├── 本插件 Client 半边（client.js，~1108 行）
@@ -206,7 +210,7 @@ chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 ### 4.3 迁移策略
 
 `meta.schema_version` 记录整数版本；启动时按序执行 `MIGRATIONS[n]`。
-**当前版本 11**。v7 移除全局 `chunks.hash` 唯一索引，改为按 `(hash, scope)` 的部分唯一索引；为 `edges` 补 `scope`、为 `facts` 补 `recorded_at`；新增 `bigrams` 索引表；并回填旧数据的 scope 与 bigram。v11 为 notes 增加故障经验字段，旧行保持为空/NULL，按 unverified 读取。新增列/索引必须写迁移，禁止直接改 `CREATE TABLE` 语句（新库与老库必须收敛到同一结构）。
+**当前版本 12**。v7 移除全局 `chunks.hash` 唯一索引，改为按 `(hash, scope)` 的部分唯一索引；为 `edges` 补 `scope`、为 `facts` 补 `recorded_at`；新增 `bigrams` 索引表；并回填旧数据的 scope 与 bigram。v11 为 notes 增加故障经验字段，旧行保持为空/NULL，按 unverified 读取。v12 为 notes/facts 增加召回反馈计数（`recall_count`、`last_recall_at`、`useful_count`、`misleading_count`），旧行从 0 起算。新增列/索引必须写迁移，禁止直接改 `CREATE TABLE` 语句（新库与老库必须收敛到同一结构）。
 
 | 版本 | 变更 | 迁移动作 |
 |---|---|---|
@@ -221,6 +225,7 @@ chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 | 9 | 实体别名 | `entity_aliases(alias, canonical, updated_at)` |
 | 10 | 用户设定 | `persona(key, value, updated_at)`；始终注入，不参与 dream/检索 |
 | 11 | 故障经验库 | `notes.problem_key / solution_status / solution_verified_at / reuse_count / last_used_at`；`problem_key`、`solution_status` 索引 |
+| 12 | 召回质量反馈 | `notes/facts` 增加 `recall_count / last_recall_at / useful_count / misleading_count`；旧行默认 0 |
 
 未带版本的旧库按 v1 处理，自动补齐到当前版本；旧行不受影响（迁移只加列、不删数据）。
 
@@ -235,6 +240,9 @@ chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 | `memory_write` | `kind`(note/fact/episode), `text`, 可选 `scope`/`importance`/`source`/`subject`/`relation`/`object`；note 额外可选 `problemKey`/`solutionStatus`/`evidence` | `{id, kind, deduped, invalidated?, problemKey?, solutionStatus?, reuseCount?}` | `subject is required for kind=fact`；`text is required`；`solutionStatus` 仅限 note |
 | `memory_search` | 可选 `query`，可选 `problemKey`/`status`(all\|verified\|unverified\|failed\|expired)/`kind`(all\|note\|fact\|chunk)/`limit`(1..30)/`scope` | `{total, scope, problemKey?, hits[]}` | 空查询且无 problemKey 返回 `{total:0,hits:[]}`；status/kind 非法时报错 |
 | `memory_solution_report` | `id`, `outcome`(success/failed/expired), 可选 `evidence` | `{id, solutionStatus, reuseCount, lastUsedAt, verifiedAt}` | 笔记不存在或已被替代/墓碑化时报错 |
+| `memory_feedback` | `kind`(note/fact), `id`, `rating`(useful/misleading) | `{id, kind, usefulCount, misleadingCount, quality, recallCount, lastRecallAt}` | 记录不存在或墓碑化时报错 |
+| `memory_get` | `items[{kind,id}]`（最多 20），可选 `scope` | `{items[], missing[]}` | 超过 20 条报错 |
+| `memory_amend` | `id`, `text`, 可选 `reason`/`evidence`/`problemKey`/`solutionStatus` | `{id, previousId, revision}` | 仅支持 note；原文与新文相同会拒绝 |
 | `memory_profile` | 无 | `{text, stats, picked, budget}` | 无 |
 | `memory_timeline` | `entity` | `{entries[]}` | 无 |
 | `memory_forget` | `kind`(note/fact/chunk), `id` | `{forgotten}` | `kind must be note, fact or chunk` |

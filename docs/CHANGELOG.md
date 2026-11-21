@@ -2,6 +2,16 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.7.0] — 2026-11-21
+
+### 新增 · 与竞品对齐的记忆质量闭环
+- **召回质量反馈**：`notes`/`facts` 增加 `recall_count`、`last_recall_at`、`useful_count`、`misleading_count`（schema v12）。新增 `memory_feedback`，搜索命中返回反馈计数与 `quality`，排序使用 Bayesian 平滑后的 `feedbackBoost`——错误召回会被后续投票压下去，不再反复污染上下文。
+- **渐进披露**：新增 `memory_get`，用 `{kind,id}` 一次展开最多 20 条完整记录，默认当前项目 + global，跨全部项目需显式 `scope=all`；补齐 `memory_search` 只给 400 字片段后的读取断点。
+- **笔记修订链**：新增 `memory_amend`，修订生成新 revision，旧行 `superseded_by` 指向新行并保留；搜索只返回新行，旧行留给审计与回滚。
+- **检索质量门禁**：`bench/golden.mjs` 从“只打印”改为断言 `recall ≥ 0.85`、`MRR ≥ 0.9`，CI 增加 `bench:golden`；同时移除 note/fact 文本分的 0.6/0.7 地板，让 `Math.max(textScore, matchRatio)` 真正参与排序。默认后端实测 MRR 0.927、recall 1.0。
+- **导入导出**：`memory_import` 的 notes/facts 合并保留四列反馈计数；`memory_export` 的 `SELECT *` 快照自然包含。
+- 测试：新增 `test/quality-loop.test.mjs` 5 项；完整 `npm test` 251/251 通过。
+
 ## [3.6.1] — 2026-11-18
 
 ### 修复 · 按用户层面功能测试报告（14 项）

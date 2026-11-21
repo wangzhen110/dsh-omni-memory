@@ -17,3 +17,5 @@ jobs:
         run: npm run check
       - name: tests
         run: npm test
+      - name: retrieval quality gate
+        run: npm run bench:golden

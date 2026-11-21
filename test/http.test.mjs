@@ -39,7 +39,7 @@ test('http adapter: routes mount, MCP over HTTP works, panel is served', async (
 
     const health = await (await fetch(`${url}/health`)).json();
     assert.equal(health.ok, true);
-    assert.equal(health.tools, 19, '17 plugin tools plus memory_context and memory_rules');
+    assert.equal(health.tools, 22, '20 plugin tools plus memory_context and memory_rules');
     assert.equal(health.routes ?? server.routes, 13);
 
     const panel = await fetch(`${url}/`);

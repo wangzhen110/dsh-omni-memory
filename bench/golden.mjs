@@ -100,6 +100,9 @@ const lexical = await evaluate('lexical');
 const vector = await evaluate('vector');
 const full = await evaluate('full');
 
+const targets = { recall: 0.85, mrr: 0.9 };
+const pass = full.recall >= targets.recall && full.mrr >= targets.mrr;
+
 console.log(JSON.stringify({
   corpus: CORPUS.length,
   questions: QUESTIONS.length,
@@ -110,6 +113,10 @@ console.log(JSON.stringify({
     vectorVsLexical: Number((vector.mrr - lexical.mrr).toFixed(3)),
     graphVsVector: Number((full.mrr - vector.mrr).toFixed(3)),
   },
-  targets: { recall: 0.85 },
-  pass: full.recall >= 0.85,
+  targets,
+  pass,
 }, null, 2));
+
+// This benchmark is a release gate, not a report. A silent MRR regression is
+// exactly how retrieval quality rots while every unit test stays green.
+if (!pass) process.exitCode = 1;

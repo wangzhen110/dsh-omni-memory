@@ -7,12 +7,12 @@
 > **源码/架构**后做商业替代、竞品或商业服务；且**必须署名作者**。
 > 商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-246%2F246-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-251%2F251-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-Personal%20Use%201.1-lightgrey)](LICENSE)
 
 ---
 
-**完整机理与接口参考**：[`docs/REFERENCE.md`](docs/REFERENCE.md) —— schema、写入与检索机理、19 个工具、13 条路由、MCP 协议面、CLI、环境变量、AI 调用剧本。执行 `npm run memory:sync` 可把整本手册拆成笔记写进记忆库，之后用 `memory_search` 就能直接检索到。
+**完整机理与接口参考**：[`docs/REFERENCE.md`](docs/REFERENCE.md) —— schema、写入与检索机理、20 个工具、13 条路由、MCP 协议面、CLI、环境变量、AI 调用剧本。执行 `npm run memory:sync` 可把整本手册拆成笔记写进记忆库，之后用 `memory_search` 就能直接检索到。
 
 ## 它解决什么问题
 
@@ -51,7 +51,7 @@
 
 ```bash
 cd memory-core
-npm test          # 246 个用例
+npm test          # 251 个用例
 npm run check     # 语法与 JSON 校验
 ```
 
@@ -111,6 +111,9 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 | `memory_write` | 写入笔记 / 事实 / 原始观察；笔记可带 `problemKey` / `solutionStatus` / `evidence`（事实可声明 `cardinality: multi` 保留多值） |
 | `memory_search` | 混合检索（支持全局 / 项目 / 全部）；可按 `problemKey` 精确查，按 `status` / `kind` 过滤 |
 | `memory_solution_report` | 记录解法真实复用结果：`success` 标记 verified 并累计次数，`failed` / `expired` 更新状态 |
+| `memory_feedback` | 给召回结果投票 `useful` / `misleading`，计入排序信号；错误召回不再反复污染上下文 |
+| `memory_get` | 按 `{kind,id}` 展开完整正文，最多 20 条；默认当前项目 + global，`all` 显式跨项目 |
+| `memory_amend` | 修订一条笔记：新 revision 生效，旧行保留并指向新行，审计链不丢 |
 | `memory_profile` | 读取常驻画像 |
 | `memory_timeline` | 某实体的时间线（事实 + 相关笔记） |
 | `memory_forget` | 墓碑化一条记忆 |
@@ -135,7 +138,7 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 
 ## 测试与指标
 
-- 自动化用例：**246 / 246 通过**
+- 自动化用例：**251 / 251 通过**
 - 检索延迟（本机复核，Node 22.23.2；标准 bench 已改为 global scope 并断言真实命中）：10,000 行 p95 ≈ **2.4ms**；100,000 行 ≈ 2.4ms；1,000,000 行 ≈ 6.0ms；1M + 5 万向量 + 100 万 bigram ≈ **116.8ms**（两段式有界检索，见 ADR-020）
 - 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 混合检索 **0.927**
 

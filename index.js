@@ -510,7 +510,7 @@ function openStore() {
   return store;
 }
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 let hostCtx = null;
 
 function columnExists(db, table, column) {
@@ -665,6 +665,17 @@ const MIGRATIONS = [
       CREATE INDEX IF NOT EXISTS notes_solution_status ON notes(solution_status);
     `);
   },
+  // v12: recall quality feedback for notes and facts. Useful/misleading is a
+  // first-class signal rather than a second hand-written note; the counters are
+  // additive and survive revision chains.
+  db => {
+    for (const table of ['notes', 'facts']) {
+      addColumn(db, table, 'recall_count', 'INTEGER NOT NULL DEFAULT 0');
+      addColumn(db, table, 'last_recall_at', 'INTEGER');
+      addColumn(db, table, 'useful_count', 'INTEGER NOT NULL DEFAULT 0');
+      addColumn(db, table, 'misleading_count', 'INTEGER NOT NULL DEFAULT 0');
+    }
+  },
 ];
 
 function migrate(db) {
@@ -721,6 +732,14 @@ function migrate(db) {
       CREATE INDEX IF NOT EXISTS notes_problem_key ON notes(problem_key);
       CREATE INDEX IF NOT EXISTS notes_solution_status ON notes(solution_status);
     `);
+  }
+  if (SCHEMA_VERSION >= 12) {
+    for (const table of ['notes', 'facts']) {
+      addColumn(db, table, 'recall_count', 'INTEGER NOT NULL DEFAULT 0');
+      addColumn(db, table, 'last_recall_at', 'INTEGER');
+      addColumn(db, table, 'useful_count', 'INTEGER NOT NULL DEFAULT 0');
+      addColumn(db, table, 'misleading_count', 'INTEGER NOT NULL DEFAULT 0');
+    }
   }
   prepareCached(db, "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)")
     .run(String(SCHEMA_VERSION));
@@ -1251,8 +1270,9 @@ function mergeSnapshot(s, snapshot, options = {}) {
         INSERT INTO notes(
           ts, scope, text, importance, source, revision, superseded_by, contested, deleted_at,
           verification, verified_at, evidence, problem_key, solution_status,
-          solution_verified_at, reuse_count, last_used_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          solution_verified_at, reuse_count, last_used_at,
+          recall_count, last_recall_at, useful_count, misleading_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         Number(note.ts ?? now()), note.scope ?? SCOPE_GLOBAL, String(note.text),
         Number(note.importance ?? 0.5), note.source ?? null, Number(note.revision ?? 1),
@@ -1263,6 +1283,10 @@ function mergeSnapshot(s, snapshot, options = {}) {
         note.solution_verified_at ?? note.solutionVerifiedAt ?? null,
         Number(note.reuse_count ?? note.reuseCount ?? 0),
         note.last_used_at ?? note.lastUsedAt ?? null,
+        Number(note.recall_count ?? note.recallCount ?? 0),
+        note.last_recall_at ?? note.lastRecallAt ?? null,
+        Number(note.useful_count ?? note.usefulCount ?? 0),
+        Number(note.misleading_count ?? note.misleadingCount ?? 0),
       );
       const newId = Number(info.lastInsertRowid);
       idMap.set(Number(note.id), newId);
@@ -1282,14 +1306,19 @@ function mergeSnapshot(s, snapshot, options = {}) {
     }
     for (const fact of plan.facts) {
       const info = prepareCached(s.db, `
-        INSERT INTO facts(subject, relation, object, text, valid_from, valid_to, recorded_at, confidence, source, contested, scope, deleted_at, cardinality)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO facts(subject, relation, object, text, valid_from, valid_to, recorded_at, confidence, source, contested, scope, deleted_at, cardinality,
+          recall_count, last_recall_at, useful_count, misleading_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         String(fact.subject), String(fact.relation), String(fact.object ?? ''),
         String(fact.text ?? `${fact.subject} ${fact.relation} ${fact.object ?? ''}`),
         Number(fact.valid_from ?? now()), fact.valid_to ?? null, fact.recorded_at ?? null,
         Number(fact.confidence ?? 0.7), fact.source ?? null, Number(fact.contested ?? 0),
         fact.scope ?? SCOPE_GLOBAL, fact.deleted_at ?? null, fact.cardinality === 'multi' ? 'multi' : 'single',
+        Number(fact.recall_count ?? fact.recallCount ?? 0),
+        fact.last_recall_at ?? fact.lastRecallAt ?? null,
+        Number(fact.useful_count ?? fact.usefulCount ?? 0),
+        Number(fact.misleading_count ?? fact.misleadingCount ?? 0),
       );
       const newId = Number(info.lastInsertRowid);
       if (s.fts.facts) {
@@ -1700,6 +1729,28 @@ function solutionFields(row) {
   };
 }
 
+/** Recall-quality counters shared by note and fact hits. */
+function feedbackFields(row) {
+  const useful = Math.max(0, Number(row.useful_count ?? 0));
+  const misleading = Math.max(0, Number(row.misleading_count ?? 0));
+  const recall = Math.max(0, Number(row.recall_count ?? 0));
+  const quality = useful + misleading === 0 ? 0.5 : (useful + 1) / (useful + misleading + 2);
+  return {
+    recallCount: recall,
+    usefulCount: useful,
+    misleadingCount: misleading,
+    lastFeedbackAt: row.last_recall_at ?? null,
+    quality: Number(quality.toFixed(3)),
+  };
+}
+
+/** Bayesian-smoothed quality: a few useful votes lift, misleading votes penalize. */
+function feedbackBoost(row) {
+  const useful = Math.max(0, Number(row.useful_count ?? 0));
+  const misleading = Math.max(0, Number(row.misleading_count ?? 0));
+  return Math.min(0.2, Math.log1p(useful) * 0.05) - Math.min(0.3, Math.log1p(misleading) * 0.08);
+}
+
 /**
  * Two-character CJK lookup through the bigram index. The inner query walks the
  * (gram, layer, owner_id) index backwards and stops after the sample size, so a
@@ -1778,11 +1829,13 @@ function searchNotes(s, terms, limit, scope, options = {}) {
       revision: Number(row.revision ?? 1),
       contested: Number(row.contested ?? 0) === 1,
       ...solutionFields(row),
+      ...feedbackFields(row),
       text: String(row.text).slice(0, 400),
-      score: 0.6 * Math.max(0.6, textScore, matchRatio(row, ['text'], terms))
+      score: 0.6 * Math.max(textScore, matchRatio(row, ['text'], terms))
         + 0.2 * Number(row.importance ?? 0.5)
         + 0.2 * recencyScore(row.ts)
-        + solutionBoost(row.solution_status, row.reuse_count),
+        + solutionBoost(row.solution_status, row.reuse_count)
+        + feedbackBoost(row),
     };
     const previous = found.get(id);
     if (!previous || candidate.score > previous.score) found.set(id, candidate);
@@ -1837,8 +1890,9 @@ function searchProblemKey(s, problemKey, limit, scope, options = {}) {
         revision: Number(row.revision ?? 1),
         contested: Number(row.contested ?? 0) === 1,
         ...solutionFields(row),
+        ...feedbackFields(row),
         text: String(row.text).slice(0, 400),
-        score: 2 + solutionBoost(row.solution_status, row.reuse_count),
+        score: 2 + solutionBoost(row.solution_status, row.reuse_count) + feedbackBoost(row),
         exactProblem: true,
       }));
   } catch {
@@ -1863,10 +1917,12 @@ function searchFacts(s, terms, limit, scope) {
       contested: Number(row.contested ?? 0) === 1,
       source: row.source ?? '',
       scope: row.scope ?? null,
+      ...feedbackFields(row),
       text: String(row.text).slice(0, 400),
-      score: 0.6 * Math.max(0.7, textScore, matchRatio(row, ['text', 'subject', 'object'], terms))
+      score: 0.6 * Math.max(textScore, matchRatio(row, ['text', 'subject', 'object'], terms))
         + 0.2 * Number(row.confidence ?? 0.7)
-        + 0.2 * recencyScore(row.valid_from),
+        + 0.2 * recencyScore(row.valid_from)
+        + feedbackBoost(row),
     };
     const previous = found.get(id);
     if (!previous || candidate.score > previous.score) found.set(id, candidate);
@@ -3378,7 +3434,10 @@ function defineTools(ctx) {
             ? ` · ${hit.solutionStatus}${hit.reuseCount ? ` ×${hit.reuseCount}` : ''}`
             : '';
           const problem = hit.problemKey ? ` · key: ${hit.problemKey}` : '';
-          return `${index + 1}. [${hit.kind}#${hit.id}${layer}${flag}${solution}${problem}] ${hit.text.replace(/\s+/g, ' ')}${pointer}`;
+          const feedback = (hit.usefulCount || hit.misleadingCount)
+            ? ` · feedback +${hit.usefulCount ?? 0}/-${hit.misleadingCount ?? 0}`
+            : '';
+          return `${index + 1}. [${hit.kind}#${hit.id}${layer}${flag}${solution}${problem}${feedback}] ${hit.text.replace(/\s+/g, ' ')}${pointer}`;
         });
         return textBlock(`matched ${value.total} (scope ${value.scope ?? 'all'})\n${lines.join('\n')}`);
       },
@@ -3500,6 +3559,242 @@ function defineTools(ctx) {
         reuseCount: Number(updated?.reuse_count ?? 0),
         lastUsedAt: updated?.last_used_at ?? ts,
         verifiedAt: updated?.solution_verified_at ?? null,
+      };
+    },
+  }));
+
+  disposers.push(ctx.tools.register({
+    name: 'memory_feedback',
+    description: 'Record whether a recalled note or fact was useful or misleading. This is the quality signal for ranking: useful votes lift a memory, misleading votes push it down. Call it after actually using the memory and observing the outcome.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        kind: { type: 'string', enum: ['note', 'fact'], description: 'Which memory type the id belongs to.' },
+        id: { type: 'number', description: 'Id returned by memory_search or memory_get.' },
+        rating: { type: 'string', enum: ['useful', 'misleading'], description: 'useful: it helped solve the task; misleading: it was stale, wrong, or sent you down a dead end.' },
+      },
+      required: ['kind', 'id', 'rating'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          kind: { type: 'string' }, id: { type: 'number' }, rating: { type: 'string' },
+          usefulCount: { type: 'number' }, misleadingCount: { type: 'number' },
+          recallCount: { type: 'number' }, quality: { type: 'number' },
+        },
+      },
+      render: (_args, value) => textBlock(
+        `feedback ${value.kind}#${value.id} -> ${value.rating} (quality ${value.quality}; useful ${value.usefulCount}, misleading ${value.misleadingCount})`,
+      ),
+    },
+    async execute(args = {}) {
+      const kind = String(args.kind ?? '').trim().toLowerCase();
+      if (kind !== 'note' && kind !== 'fact') throw new Error('kind must be note or fact');
+      const id = Number(args.id);
+      if (!Number.isFinite(id) || id <= 0) throw new Error('id is required');
+      const rating = String(args.rating ?? '').trim().toLowerCase();
+      if (rating !== 'useful' && rating !== 'misleading') throw new Error('rating must be useful or misleading');
+      const s = openStore();
+      const table = kind === 'note' ? 'notes' : 'facts';
+      const activeSql = kind === 'fact' ? 'AND valid_to IS NULL' : 'AND superseded_by IS NULL';
+      const row = prepareCached(s.db, `SELECT id FROM ${table} WHERE id = ? AND deleted_at IS NULL ${activeSql}`).get(id);
+      if (!row) throw new Error(`${kind} ${id} not found or is no longer active`);
+      const ts = now();
+      const useful = rating === 'useful' ? 1 : 0;
+      const misleading = rating === 'misleading' ? 1 : 0;
+      transaction(s.db, () => {
+        prepareCached(s.db, `
+          UPDATE ${table}
+          SET recall_count = recall_count + 1, last_recall_at = ?,
+            useful_count = useful_count + ?, misleading_count = misleading_count + ?
+          WHERE id = ?
+        `).run(ts, useful, misleading, id);
+      });
+      const updated = prepareCached(s.db, `
+        SELECT recall_count, useful_count, misleading_count, last_recall_at FROM ${table} WHERE id = ?
+      `).get(id);
+      return {
+        kind, id, rating,
+        recallCount: Number(updated?.recall_count ?? 0),
+        usefulCount: Number(updated?.useful_count ?? 0),
+        misleadingCount: Number(updated?.misleading_count ?? 0),
+        quality: Number(feedbackFields(updated ?? {}).quality),
+      };
+    },
+  }));
+
+  disposers.push(ctx.tools.register({
+    name: 'memory_get',
+    description: 'Progressive disclosure: fetch full records by id after memory_search returned a compact hit. Accepts up to 20 items. Scope defaults to the current project; pass all only when auditing across projects.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        items: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 20,
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              kind: { type: 'string', enum: ['note', 'fact', 'chunk'] },
+              id: { type: 'number' },
+            },
+            required: ['kind', 'id'],
+          },
+        },
+        scope: { type: 'string', description: 'Optional scope filter: a project key, global, project, or all. Defaults to the current project plus global.' },
+      },
+      required: ['items'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          items: { type: 'array', items: { type: 'object' } },
+          missing: { type: 'array', items: { type: 'object' } },
+          scope: { type: 'string' },
+        },
+      },
+      render: (_args, value) => textBlock(
+        `loaded ${value.items.length} item(s)${value.missing.length ? `; missing ${value.missing.length}` : ''}\n`
+        + value.items.map(item => `- [${item.kind}#${item.id}] ${String(item.text ?? '').replace(/\s+/g, ' ').slice(0, 180)}`).join('\n'),
+      ),
+    },
+    async execute(args = {}, toolContext = {}) {
+      const items = Array.isArray(args.items) ? args.items : [];
+      if (!items.length) throw new Error('items must contain at least one item');
+      if (items.length > 20) throw new Error('items may contain at most 20 entries');
+      const requested = String(args.scope ?? '').trim();
+      const scope = requested === 'all' ? null : (requested || currentProject(toolContext) || SCOPE_GLOBAL);
+      const s = openStore();
+      const loaded = [];
+      const missing = [];
+      for (const item of items) {
+        const kind = String(item?.kind ?? '').trim().toLowerCase();
+        const id = Number(item?.id);
+        if (!['note', 'fact', 'chunk'].includes(kind) || !Number.isFinite(id) || id <= 0) {
+          missing.push({ kind, id: Number.isFinite(id) ? id : null, reason: 'invalid item' });
+          continue;
+        }
+        try {
+          if (kind === 'note') {
+            const filter = scopeClause('scope', scope, false);
+            const row = prepareCached(s.db, `
+              SELECT * FROM notes
+              WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL ${filter.sql}
+            `).get(id, ...filter.params);
+            if (!row) { missing.push({ kind, id, reason: 'not active or out of scope' }); continue; }
+            loaded.push({
+              kind, id: Number(row.id), ts: Number(row.ts), scope: row.scope ?? 'global',
+              text: String(row.text ?? ''), importance: Number(row.importance ?? 0.5),
+              source: row.source ?? '', revision: Number(row.revision ?? 1),
+              contested: Number(row.contested ?? 0) === 1,
+              ...solutionFields(row), ...feedbackFields(row),
+            });
+          } else if (kind === 'fact') {
+            const filter = scopeClause('scope', scope);
+            const row = prepareCached(s.db, `
+              SELECT * FROM facts
+              WHERE id = ? AND deleted_at IS NULL AND valid_to IS NULL ${filter.sql}
+            `).get(id, ...filter.params);
+            if (!row) { missing.push({ kind, id, reason: 'not active or out of scope' }); continue; }
+            loaded.push({
+              kind, id: Number(row.id), ts: Number(row.valid_from), scope: row.scope ?? 'global',
+              subject: row.subject, relation: row.relation, object: row.object,
+              text: String(row.text ?? `${row.subject} ${row.relation} ${row.object}`),
+              validFrom: Number(row.valid_from), validTo: row.valid_to === null ? null : Number(row.valid_to),
+              confidence: Number(row.confidence ?? 0.7), source: row.source ?? '',
+              contested: Number(row.contested ?? 0) === 1, ...feedbackFields(row),
+            });
+          } else {
+            const filter = scopeClause('scope', scope);
+            const row = prepareCached(s.db, `
+              SELECT * FROM chunks
+              WHERE id = ? AND deleted_at IS NULL ${filter.sql}
+            `).get(id, ...filter.params);
+            if (!row) { missing.push({ kind, id, reason: 'not active or out of scope' }); continue; }
+            loaded.push({
+              kind, id: Number(row.id), ts: Number(row.ts), scope: row.scope ?? null,
+              role: row.role, sessionId: row.session_id ?? null, source: row.source ?? '',
+              text: String(row.text ?? ''), importance: Number(row.importance ?? 0.5),
+            });
+          }
+        } catch (error) {
+          missing.push({ kind, id, reason: String(error?.message ?? error) });
+        }
+      }
+      return { items: loaded, missing, scope: scope ?? 'all' };
+    },
+  }));
+
+  disposers.push(ctx.tools.register({
+    name: 'memory_amend',
+    description: 'Amend one note by creating a new revision. The old row is superseded, not deleted, so the revision chain remains auditable. Use this instead of write + contradicts + forget for a corrected note.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        id: { type: 'number', description: 'Active note id to revise.' },
+        text: { type: 'string', description: 'The complete corrected note text, max 4000 characters.' },
+        reason: { type: 'string', description: 'Optional short reason for the amendment.' },
+      },
+      required: ['id', 'text'],
+    },
+    output: {
+      schema: { type: 'object', properties: { id: { type: 'number' }, revision: { type: 'number' }, superseded: { type: 'number' }, scope: { type: 'string' } } },
+      render: (_args, value) => textBlock(`amended note #${value.superseded} -> #${value.id} (revision ${value.revision})`),
+    },
+    async execute(args = {}) {
+      const id = Number(args.id);
+      if (!Number.isFinite(id) || id <= 0) throw new Error('id is required');
+      const text = String(args.text ?? '').trim();
+      if (!text) throw new Error('text is required');
+      if (text.length > 4000) throw new Error(`note is ${text.length} characters; split it into smaller notes (max 4000)`);
+      const s = openStore();
+      const old = prepareCached(s.db, `
+        SELECT * FROM notes WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL
+      `).get(id);
+      if (!old) throw new Error(`note ${id} not found or is no longer active`);
+      if (String(old.text ?? '') === text) throw new Error('new text is identical to the current revision');
+      const duplicate = prepareCached(s.db, `
+        SELECT id FROM notes
+        WHERE scope = ? AND text = ? AND deleted_at IS NULL AND superseded_by IS NULL AND id <> ?
+      `).get(old.scope, text, id);
+      if (duplicate) throw new Error(`an active note with the same text already exists: #${duplicate.id}`);
+      const ts = now();
+      const result = transaction(s.db, () => {
+        const info = prepareCached(s.db, `
+          INSERT INTO notes(
+            ts, scope, text, importance, source, revision, contested,
+            problem_key, solution_status, solution_verified_at, reuse_count, last_used_at, evidence
+          ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+        `).run(
+          ts, old.scope, text, Number(old.importance ?? 0.5), args.reason ?? old.source ?? null,
+          Number(old.revision ?? 1) + 1,
+          old.problem_key ?? null, old.solution_status ?? null, old.solution_verified_at ?? null,
+          Number(old.reuse_count ?? 0), old.last_used_at ?? null, old.evidence ?? null,
+        );
+        const newId = Number(info.lastInsertRowid);
+        prepareCached(s.db, 'UPDATE notes SET superseded_by = ? WHERE id = ?').run(newId, id);
+        if (s.fts.notes) {
+          try {
+            prepareCached(s.db, 'INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(newId, text);
+          } catch { /* index write is best effort */ }
+        }
+        indexBigrams(s.db, 'note', newId, text);
+        upsertVector(s, 'note', newId, text);
+        return newId;
+      });
+      invalidateProfile();
+      return {
+        id: Number(result),
+        revision: Number(old.revision ?? 1) + 1,
+        superseded: id,
+        scope: old.scope,
       };
     },
   }));

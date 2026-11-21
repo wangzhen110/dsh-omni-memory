@@ -22,7 +22,7 @@ test('a v9 database upgrades to v11 with the persona table and solution columns'
   const version = migrated.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()?.value;
   migrated.close();
   assert.ok(persona, 'persona table created');
-  assert.equal(version, '11');
+  assert.equal(version, '12');
 });
 
 test('a database whose marker is v10 but lacks persona is repaired', async () => {
