@@ -53,7 +53,7 @@ omni scope-alias --list
 - `node --check index.js` / `node --check hosts/cli.mjs` 通过。
 - CLI 副本验证：`scope-alias --list`、`scope-alias --from ... --to ...` 预览均正常；`--apply` 在事务内执行并返回 `migrated:true`。
 - `npm run bench:golden`：`pass:true`；检索链路未改，指标与 3.9.4 基线一致。
-- `npm pack --dry-run`：`local-omni-memory-3.9.5.tgz`，89 entries，18.4 MB 压缩 / 41.0 MB 解包；GAP/INTEGRATION-PROBE/RECHECK-3.9.2/3.9.3 未入包。
+- `npm pack --dry-run`：`local-omni-memory-3.9.5.tgz`，90 entries，18.4 MB 压缩 / 41.0 MB 解包；GAP/INTEGRATION-PROBE/RECHECK-3.9.2/3.9.3 未入包。
 
 ## 未纳入
 
@@ -64,7 +64,7 @@ omni scope-alias --list
 ## 发布
 
 - 版本号、CHANGELOG、README、DESIGN、REFERENCE、THREAT-MODEL 同步到 3.9.5。
-- 发布提交 `ab5dc99`（`fix: close semantic reliability debt (3.9.5)`），已推送 `origin/main`；远端 `main` 指向 `ab5dc99`。
+- 发布提交 `ab5dc99`（`fix: close semantic reliability debt (3.9.5)`）与发布报告 `3208efe` 均已推送 `origin/main`；后续文档计数修正提交以远端 HEAD 为准。
 - 7788 服务在提交后重启，`health` 返回 `version:"3.9.5"`、`project:"proj:全息记忆#30534c"`、`tools:25`；`/omni-memory/status` 的 `semantic.gcError` 为空、`embedding.dropped:0`、`backfillDone:true`。
 - 计划任务 `OmniMemory7788` 保持 `Running`；node 与父 PowerShell 的 `MainWindowTitle` 均为空，无 cmd 黑框。注销/关机/休眠仍会停服，常驻化未在本版改变。
 - 真实库 `scope-alias --list` 返回既有两条映射：`proj:全息记忆#deff23 → proj:全息记忆#30534c`、`proj:专业知识#cb9453 → proj:专业知识#967a81`；未执行新的手工合并。
