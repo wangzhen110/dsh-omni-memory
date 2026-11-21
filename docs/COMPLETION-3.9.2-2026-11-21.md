@@ -2,7 +2,7 @@
 
 日期：2026-11-21
 版本：3.9.2
-状态：实现、测试、文档、发布闸门完成；待提交并推送 GitHub main。
+状态：实现、测试、文档、发布闸门完成；已提交并推送 GitHub main；线上 3.9.2 已重启并完成语义回填。
 
 ## 问题
 
@@ -67,14 +67,17 @@
 - ADR-029：记录选型、体积、实测、被否方案；ADR-007 标记为部分被取代。
 - ATTRIBUTION：列出 BGE（MIT）、ONNX Runtime（MIT）、tokenizers（Apache-2.0）三项随包组件与许可文件。
 
+## 发布与上线
+
+- 提交：`7a12179 feat: zero-config local semantic search (3.9.2)`。
+- 远端：`https://github.com/wangzhen110/omni-memory.git` 的 `main` 已指向 `7a1217968a22e8f016428168d0b641489690bbfd`。
+- 线上服务：端口 7788，PID 9140；`/health` 返回 `version:"3.9.2"`、`tools:25`。
+- 语义回填：`indexed:1239`、`pending:0`、`backfillDone:true`；覆盖 1235 条 notes 与 4 条 facts。
+- 本机 HTTP 检索实测：`C盘空间不足怎么清理垃圾` 124.8ms / 5 命中；`磁盘满了如何释放系统盘` 89.9ms / 5 命中。
+
 ## 已知边界
 
 - 语义与 hashed 向量一样，对最近 5000 条向量做 JS 余弦扫描，并加入词面候选；十万级以上冷门纯语义命中仍需要 ANN。
 - 每进程常驻约 216MB RSS；测试默认 `OMNI_DISABLE_SEMANTIC=1`，只有 `boot({ semantic: true })` 才加载模型。
 - 模型升级要发版；旧签名向量不会污染新签名，但需要清理或按新签名重建。
 - 模型缺失、WASM 加载失败、内存不足或推理异常时语义路线返回空并写 `lastError`；词面/hashed/图继续工作。
-
-## 待办
-
-- 提交并推送到 GitHub main。
-- 线上服务仍是旧 3.9.1 进程（PID 15436，端口 7788），需要重启后才会加载 3.9.2 与语义 worker。
