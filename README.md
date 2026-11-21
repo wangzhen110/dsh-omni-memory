@@ -7,7 +7,7 @@
 > **源码/架构**后做商业替代、竞品或商业服务；且**必须署名作者**。
 > 商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-283%2F283-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-285%2F285-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-Personal%20Use%201.1-lightgrey)](LICENSE)
 
 ---
@@ -59,7 +59,7 @@
 
 ```bash
 cd /path/to/omni-memory
-npm test          # 283 个用例
+npm test          # 285 个用例
 npm run check     # 语法、文档计数与模型资产完整性校验
 ```
 
@@ -161,7 +161,7 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 
 ## 测试与指标
 
-- 自动化用例：**283 / 283 通过**
+- 自动化用例：**285 / 285 通过**
 - 检索延迟（本机复核，Node 22.23.2；标准 bench 已改为 global scope 并断言真实命中）：10,000 行 p95 ≈ **2.4ms**；100,000 行 ≈ 2.4ms；1,000,000 行 ≈ 6.0ms；1M + 5 万向量 + 100 万 bigram ≈ **116.8ms**（两段式有界检索，见 ADR-020）
 - 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 旧 hashed 混合 0.927 → 内置本地语义单独 **0.979**；语义冷加载约 208ms，单查询约 9.5ms（20 次 191ms，本机 CPU）
 
@@ -180,7 +180,7 @@ npm run bench:golden   # 黄金集
 ## 文档
 
 - [设计规格](docs/DESIGN.md)（需求、架构、数据模型、契约、失败模式、追溯矩阵）
-- [架构决策记录](docs/ADR)（29 份）
+- [架构决策记录](docs/ADR)（30 份）
 - [威胁模型](docs/THREAT-MODEL.md)（信任边界、残余风险、新增路由检查清单）
 - 备份/恢复设计见 [ADR-019](docs/ADR/019-backup-restore.md)
 - 1M 行检索改造见 [ADR-020](docs/ADR/020-bounded-retrieval.md)
@@ -196,6 +196,8 @@ npm run bench:golden   # 黄金集
 - [3.9.0 自动捕获与巩固完成报告](docs/COMPLETION-2026-11-21.md)
 - [3.9.1 复核问题修复报告](docs/COMPLETION-3.9.1-2026-11-21.md)
 - [3.9.2 零配置语义整改报告](docs/COMPLETION-3.9.2-2026-11-21.md)
+- [3.9.3 语义索引治理报告](docs/COMPLETION-3.9.3-2026-11-21.md)
+- [语义索引生命周期决策](docs/ADR/030-semantic-lifecycle.md)
 - [架构图](docs/architecture.png)
 
 ## 许可证

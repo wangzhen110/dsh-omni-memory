@@ -503,6 +503,11 @@ function openStore() {
   let schemaVersion = SCHEMA_VERSION;
   try {
     schemaVersion = migrate(db);
+    // One-time derived-index repair. Forget/compact now delete semantic rows in
+    // the same transaction; this sweep removes rows left behind by older builds.
+    if (metaGet(db, 'semantic_gc_version') !== String(SCHEMA_VERSION) && pruneSemanticVectors(db)) {
+      metaSet(db, 'semantic_gc_version', SCHEMA_VERSION);
+    }
     const ftsMarker = metaGet(db, 'fts_backfill_version');
     if (ftsMarker !== String(SCHEMA_VERSION)) {
       let ftsOk = true;
@@ -1095,6 +1100,9 @@ const SEMANTIC_BATCH = 8;
 const SEMANTIC_BACKFILL_SCAN = 64;
 const SEMANTIC_MAX_PENDING = 4096;
 const SEMANTIC_MIN_COSINE = 0.25;
+const SEMANTIC_LEASE_MS = 120_000;
+const SEMANTIC_RETRY_BASE_MS = 1_000;
+const SEMANTIC_RETRY_MAX_MS = 30_000;
 const semanticStates = new WeakMap();
 
 function semanticState(s) {
@@ -1102,18 +1110,41 @@ function semanticState(s) {
   if (!state) {
     state = {
       pending: new Map(),
+      seq: 0,
       timer: null,
       running: false,
       flushing: null,
       backfillTimer: null,
       backfillLease: null,
+      exitHandler: null,
       indexed: 0,
+      dropped: 0,
+      lastDropAt: 0,
+      failureCount: 0,
+      retryAt: 0,
       lastError: '',
       backfillDone: false,
     };
     semanticStates.set(s.db, state);
   }
   return state;
+}
+
+function semanticBackoffMs(failures) {
+  const exponent = Math.max(0, Number(failures) - 1);
+  return Math.min(SEMANTIC_RETRY_MAX_MS, SEMANTIC_RETRY_BASE_MS * (2 ** Math.min(exponent, 5)));
+}
+
+function noteSemanticFailure(state, error) {
+  state.failureCount += 1;
+  state.lastError = String(error?.message ?? error);
+  state.retryAt = now() + semanticBackoffMs(state.failureCount);
+}
+
+function clearSemanticFailure(state) {
+  state.failureCount = 0;
+  state.retryAt = 0;
+  state.lastError = '';
 }
 
 function scheduleSemanticWorker(s, delay = 0) {
@@ -1133,8 +1164,18 @@ function enqueueSemantic(s, kind, id, text) {
   if (!semanticConfig().enabled) return;
   const state = semanticState(s);
   const key = `${kind}:${id}`;
-  if (!state.pending.has(key) && state.pending.size >= SEMANTIC_MAX_PENDING) return;
-  state.pending.set(key, { kind, id: Number(id), text: String(text ?? '') });
+  if (!state.pending.has(key) && state.pending.size >= SEMANTIC_MAX_PENDING) {
+    state.dropped += 1;
+    state.lastDropAt = now();
+    return;
+  }
+  state.seq += 1;
+  state.pending.set(key, {
+    kind,
+    id: Number(id),
+    text: String(text ?? ''),
+    seq: state.seq,
+  });
   scheduleSemanticWorker(s);
 }
 
@@ -1148,6 +1189,63 @@ function releaseSemanticLease(s) {
     clearTimeout(state.backfillTimer);
     state.backfillTimer = null;
   }
+  if (state.timer) {
+    clearTimeout(state.timer);
+    state.timer = null;
+  }
+  if (state.exitHandler) {
+    process.removeListener('exit', state.exitHandler);
+    state.exitHandler = null;
+  }
+}
+
+/** Remove one derived semantic row and any queued update for it. */
+function dropSemanticIndex(s, kind, id) {
+  const state = semanticState(s);
+  state.pending.delete(`${kind}:${Number(id)}`);
+  try {
+    prepareCached(s.db, 'DELETE FROM semantic_vectors WHERE kind = ? AND owner_id = ?')
+      .run(kind, Number(id));
+  } catch { /* schema may be older than v14 */ }
+}
+
+/** Remove every derived index for a row whose source data is gone or inactive. */
+function dropDerivedIndexes(s, kind, id) {
+  const table = { note: 'notes', fact: 'facts', chunk: 'chunks' }[String(kind)];
+  if (!table) return;
+  dropSemanticIndex(s, kind, id);
+  try { prepareCached(s.db, `DELETE FROM ${table}_fts WHERE rowid = ?`).run(Number(id)); } catch { /* FTS may be absent */ }
+  try { prepareCached(s.db, 'DELETE FROM bigrams WHERE layer = ? AND owner_id = ?').run(kind, Number(id)); } catch { /* bigrams may be absent */ }
+  try { prepareCached(s.db, 'DELETE FROM vectors WHERE kind = ? AND owner_id = ?').run(kind, Number(id)); } catch { /* vectors may be absent */ }
+}
+
+/**
+ * Drop semantic rows whose source row is tombstoned, superseded or expired.
+ * Derived data has no audit value; a stale vector only costs disk and can make
+ * a deleted note compete in ranking if a future query bypasses the JOIN.
+ */
+function pruneSemanticVectors(db) {
+  let ok = true;
+  for (const [kind, table, extra] of [
+    ['note', 'notes', 'AND t.superseded_by IS NULL'],
+    ['fact', 'facts', 'AND t.valid_to IS NULL'],
+    ['chunk', 'chunks', ''],
+  ]) {
+    try {
+      prepareCached(db, `
+        DELETE FROM semantic_vectors
+        WHERE kind = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM ${table} t
+            WHERE t.id = semantic_vectors.owner_id
+              AND t.deleted_at IS NULL ${extra}
+          )
+      `).run(kind);
+    } catch {
+      ok = false;
+    }
+  }
+  return ok;
 }
 
 function semanticHasMissing(s, config) {
@@ -1187,20 +1285,20 @@ function scheduleSemanticBackfill(s, delay = 800) {
     state.backfillDone = true;
     return;
   }
-  const lease = acquireLease(s.db, 'semantic-backfill', 600_000);
+  const lease = acquireLease(s.db, 'semantic-backfill', SEMANTIC_LEASE_MS);
   if (!lease) return;
   state.backfillLease = lease;
-  if (!state.exitHook) {
-    state.exitHook = true;
-    // A host that exits mid-backfill must not leave a 10-minute lease behind
-    // for every other host. The lease TTL is only the crash fallback.
-    process.once('exit', () => {
+  if (!state.exitHandler) {
+    // A host that exits mid-backfill must not leave a long lease behind for
+    // every other host. A short TTL plus per-batch renewal is the crash fallback.
+    state.exitHandler = () => {
       if (!state.backfillLease) return;
       try {
         releaseLease(s.db, 'semantic-backfill', state.backfillLease);
       } catch { /* the process is already leaving; TTL covers a closed db */ }
       state.backfillLease = null;
-    });
+    };
+    process.once('exit', state.exitHandler);
   }
   const timer = setTimeout(() => {
     state.backfillTimer = null;
@@ -1259,19 +1357,42 @@ function writeSemantic(s, config, entries, vectors) {
  */
 async function flushSemanticPending(s, config, limit = SEMANTIC_BATCH) {
   const state = semanticState(s);
-  if (state.flushing) return state.flushing;
+  // A foreground search may arrive while the worker is embedding an older
+  // snapshot. Wait for that batch, then take a fresh snapshot so a note written
+  // during the flight is not hidden behind the worker's promise.
+  if (state.flushing) {
+    try { await state.flushing; } catch { /* the caller below reports its own failure */ }
+  }
   const entries = [...state.pending.values()].slice(0, Math.max(1, limit));
   if (!entries.length) return 0;
   state.flushing = (async () => {
-    const vectors = await embedSemantic(entries.map(entry => entry.text), config);
+    // Snapshot versions, not just keys. An amend/replace can overwrite the same
+    // key while inference is in flight; deleting that key afterwards would
+    // swallow the newer text and leave a permanently stale vector.
+    const active = entries.filter(entry => {
+      const current = state.pending.get(`${entry.kind}:${entry.id}`);
+      return current && current.seq === entry.seq;
+    });
+    if (!active.length) return 0;
+    const vectors = await embedSemantic(active.map(entry => entry.text), config);
     if (vectors.some(vector => vector.length !== config.dim)) {
       throw new Error(`semantic dimension mismatch: expected ${config.dim}, got ${vectors[0]?.length ?? 0}`);
     }
-    writeSemantic(s, config, entries, vectors);
-    for (const entry of entries) state.pending.delete(`${entry.kind}:${entry.id}`);
-    state.indexed += entries.length;
-    state.lastError = '';
-    return entries.length;
+    const stillCurrent = [];
+    for (let index = 0; index < active.length; index += 1) {
+      const entry = active[index];
+      const current = state.pending.get(`${entry.kind}:${entry.id}`);
+      if (!current || current.seq !== entry.seq) continue;
+      stillCurrent.push({ entry, vector: vectors[index] });
+    }
+    if (!stillCurrent.length) return 0;
+    writeSemantic(s, config, stillCurrent.map(item => item.entry), stillCurrent.map(item => item.vector));
+    for (const item of stillCurrent) {
+      state.pending.delete(`${item.entry.kind}:${item.entry.id}`);
+    }
+    state.indexed += stillCurrent.length;
+    clearSemanticFailure(state);
+    return stillCurrent.length;
   })();
   try {
     return await state.flushing;
@@ -1287,7 +1408,18 @@ async function runSemanticWorker(s) {
   if (state.running) return;
   state.running = true;
   let scheduleNext = false;
+  let scheduleDelay = 0;
   try {
+    if (state.retryAt > now()) {
+      scheduleNext = state.pending.size > 0;
+      scheduleDelay = Math.max(0, state.retryAt - now());
+      return;
+    }
+    if (state.backfillLease) {
+      const renewed = renewLease(s.db, 'semantic-backfill', state.backfillLease, SEMANTIC_LEASE_MS);
+      if (renewed) state.backfillLease = renewed;
+      else state.backfillLease = null;
+    }
     if (state.pending.size < SEMANTIC_BATCH) semanticBackfill(s, config);
     if (!state.pending.size) {
       state.backfillDone = true;
@@ -1297,7 +1429,9 @@ async function runSemanticWorker(s) {
     scheduleNext = state.pending.size > 0 || !state.backfillDone;
   } catch (error) {
     // A missing or corrupt model must not spin the worker or break retrieval.
-    state.lastError = String(error?.message ?? error);
+    noteSemanticFailure(state, error);
+    scheduleNext = state.pending.size > 0 || !state.backfillDone;
+    scheduleDelay = Math.max(0, state.retryAt - now());
   } finally {
     state.running = false;
     if (state.backfillDone && state.backfillLease) {
@@ -1307,7 +1441,7 @@ async function runSemanticWorker(s) {
     // Schedule after clearing `running`: scheduleSemanticWorker refuses while a
     // worker is marked active, so scheduling inside the try would silently stop
     // the backfill after the first batch.
-    if (scheduleNext) scheduleSemanticWorker(s);
+    if (scheduleNext) scheduleSemanticWorker(s, scheduleDelay);
   }
 }
 
@@ -1328,25 +1462,37 @@ function semanticStatus(s) {
     signature: config.signature,
     pending: state.pending.size,
     indexed,
+    dropped: state.dropped,
+    lastDropAt: state.lastDropAt || null,
+    failureCount: state.failureCount,
+    retryAt: state.retryAt > now() ? state.retryAt : null,
     running: state.running,
     backfillDone: state.backfillDone,
     lastError: state.lastError,
   };
 }
 
-async function reindexSemantic(s, limit) {
+async function reindexSemantic(s, limit, options = {}) {
   const config = semanticConfig();
   if (!config.enabled) return { enabled: false, reason: config.reason, model: config.model, processed: 0 };
+  const state = semanticState(s);
+  if (options.force === true) {
+    try {
+      prepareCached(s.db, 'DELETE FROM semantic_vectors WHERE model = ?').run(config.signature);
+    } catch { /* schema not migrated yet */ }
+    state.pending.clear();
+    state.backfillDone = false;
+  }
   let processed = 0;
   try {
     while (processed < limit) {
-      const state = semanticState(s);
       if (state.pending.size < SEMANTIC_BATCH) semanticBackfill(s, config);
       const done = await flushSemanticPending(s, config, Math.min(SEMANTIC_BATCH, limit - processed));
       if (!done) break;
       processed += done;
     }
   } catch (error) {
+    noteSemanticFailure(state, error);
     return { enabled: true, model: config.model, dim: config.dim, processed, error: String(error?.message ?? error) };
   }
   return {
@@ -1356,6 +1502,7 @@ async function reindexSemantic(s, limit) {
     processed,
     pending: semanticState(s).pending.size,
     backfillDone: semanticState(s).backfillDone,
+    forced: options.force === true,
   };
 }
 
@@ -1470,6 +1617,20 @@ function releaseLease(db, name, token) {
   } catch { /* a stale lease expires on its own */ }
 }
 
+/** Extend a lease only when the caller still owns the current token. */
+function renewLease(db, name, token, ttlMs) {
+  const key = `lease:${name}`;
+  if (!token) return null;
+  const until = now() + Math.max(1, Number(ttlMs) || 0);
+  try {
+    const info = prepareCached(db, 'UPDATE meta SET value = ? WHERE key = ? AND value = ?')
+      .run(String(until), key, String(token));
+    return Number(info.changes) > 0 ? until : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Tombstone one row and keep its derived graph edges consistent. */
 function forgetMemory(s, kind, id) {
   const table = { note: 'notes', fact: 'facts', chunk: 'chunks' }[String(kind)];
@@ -1481,6 +1642,7 @@ function forgetMemory(s, kind, id) {
     }
     const info = prepareCached(s.db, `UPDATE ${table} SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL`)
       .run(now(), Number(id));
+    if (Number(info.changes) > 0) dropDerivedIndexes(s, kind, id);
     if (fact && Number(info.changes) > 0) {
       prepareCached(s.db, `
         UPDATE edges SET valid_to = ?
@@ -2169,7 +2331,10 @@ export function consolidateProblemNotes(problemKey, options = {}, toolContext = 
     indexBigrams(s.db, 'note', summaryId, summaryText);
     upsertVector(s, 'note', summaryId, summaryText);
     const update = prepareCached(s.db, 'UPDATE notes SET superseded_by = ? WHERE id = ?');
-    for (const id of activeIds) update.run(summaryId, id);
+    for (const id of activeIds) {
+      update.run(summaryId, id);
+      dropSemanticIndex(s, 'note', id);
+    }
     return { applied: true, noteId: summaryId, sourceIds: activeIds, summary: summaryText };
   });
   if (result.applied) invalidateProfile();
@@ -2781,6 +2946,7 @@ function dreamRun(s, apply, options = {}) {
           ).run(now(), note.scope, replacementText, 0.5, `dream:${note.id}`, Number(note.revision ?? 1) + 1);
           const replacementId = Number(info.lastInsertRowid);
           prepareCached(s.db, 'UPDATE notes SET superseded_by = ? WHERE id = ?').run(replacementId, Number(note.id));
+          dropSemanticIndex(s, 'note', note.id);
           if (s.fts.notes) {
             try {
               prepareCached(s.db, 'INSERT INTO notes_fts(rowid, text) VALUES (?, ?)')
@@ -2836,6 +3002,7 @@ function dreamReplace(s, noteId) {
     ).run(now(), note.scope, replacementText, 0.5, `dream:${note.id}`, Number(note.revision ?? 1) + 1);
     const replacementId = Number(info.lastInsertRowid);
     prepareCached(s.db, 'UPDATE notes SET superseded_by = ?, contested = 1 WHERE id = ?').run(replacementId, Number(note.id));
+    dropSemanticIndex(s, 'note', note.id);
     if (s.fts.notes) {
       try { prepareCached(s.db, 'INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(replacementId, replacementText); } catch { /* best effort */ }
     }
@@ -2854,7 +3021,7 @@ function dreamReplace(s, noteId) {
 /** Undo a dream replacement: revive the original, tombstone the generated note. */
 function dreamRollback(s, noteId) {
   const result = transaction(s.db, () => {
-    const note = prepareCached(s.db, 'SELECT id, superseded_by FROM notes WHERE id = ?').get(Number(noteId));
+    const note = prepareCached(s.db, 'SELECT id, superseded_by, text FROM notes WHERE id = ?').get(Number(noteId));
     if (!note || !note.superseded_by) return { restored: false, reason: 'not superseded' };
     const replacement = prepareCached(s.db, 'SELECT id, source, deleted_at FROM notes WHERE id = ?').get(Number(note.superseded_by));
     if (!replacement || !String(replacement.source ?? '').startsWith('dream:')) {
@@ -2863,6 +3030,10 @@ function dreamRollback(s, noteId) {
     prepareCached(s.db, 'UPDATE notes SET superseded_by = NULL, contested = 0 WHERE id = ?').run(Number(note.id));
     prepareCached(s.db, 'UPDATE notes SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL')
       .run(now(), Number(replacement.id));
+    dropDerivedIndexes(s, 'note', replacement.id);
+    // The original vector was removed when the note was superseded; restore it
+    // so a rollback does not leave a live note without a semantic entry.
+    if (note.text) upsertVector(s, 'note', note.id, note.text);
     return { restored: true, replacementId: Number(replacement.id) };
   });
   if (result.restored) invalidateProfile();
@@ -2883,19 +3054,23 @@ const VECTOR_SAMPLE = Math.max(1000, Number(process.env.OMNI_VECTOR_SAMPLE ?? 50
 async function semanticSearch(s, queryText, limit, scope, candidates = []) {
   const config = semanticConfig();
   if (!config.enabled) return [];
+  const state = semanticState(s);
+  if (state.retryAt > now()) return [];
   // A note written in this same turn is still queued. Index one batch before
   // querying so "write a note, then ask about it" never depends on a timer.
   try {
     await flushSemanticPending(s, config, SEMANTIC_BATCH);
   } catch (error) {
     // Keep the failure visible in status without breaking the other routes.
-    semanticState(s).lastError = String(error?.message ?? error);
+    noteSemanticFailure(state, error);
+    return [];
   }
   let queryVector;
   try {
     [queryVector] = await embedSemantic([queryText], config, { query: true });
+    clearSemanticFailure(state);
   } catch (error) {
-    semanticState(s).lastError = String(error?.message ?? error);
+    noteSemanticFailure(state, error);
     return [];
   }
   if (!queryVector || queryVector.length !== config.dim) return [];
@@ -4988,6 +5163,7 @@ function defineTools(ctx) {
         );
         const newId = Number(info.lastInsertRowid);
         prepareCached(s.db, 'UPDATE notes SET superseded_by = ? WHERE id = ?').run(newId, id);
+        dropSemanticIndex(s, 'note', id);
         if (s.fts.notes) {
           try {
             prepareCached(s.db, 'INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(newId, text);
@@ -5018,6 +5194,7 @@ function defineTools(ctx) {
         bigrams: { type: 'boolean', description: 'true rebuilds the entire CJK bigram index (explicit, can take a while on large stores).' },
         vectors: { type: 'boolean', description: 'Also run the active hashed/remote vector backfill.' },
         semantic: { type: 'boolean', description: 'true backfills the bundled local semantic index (BGE-small-zh int8, no model download).' },
+        semanticForce: { type: 'boolean', description: 'With semantic: true, delete the current model signature first and rebuild it from source text (repairs stale vectors).' },
       },
     },
     output: {
@@ -5030,8 +5207,10 @@ function defineTools(ctx) {
       const config = backendConfig();
       const limit = Math.min(1000, Math.max(1, Number(args.limit ?? 200)));
       const wantSemantic = args.semantic === true;
+      const wantSemanticForce = args.semanticForce === true;
+      if (wantSemanticForce && !wantSemantic) throw new Error('semanticForce requires semantic: true');
       const wantVectors = args.vectors === true || (args.semantic !== true && args.bigrams !== true);
-      const semantic = wantSemantic ? await reindexSemantic(s, limit) : null;
+      const semantic = wantSemantic ? await reindexSemantic(s, limit, { force: wantSemanticForce }) : null;
       if (!wantVectors) {
         return {
           processed: semantic?.processed ?? 0,
@@ -5470,7 +5649,11 @@ function defineTools(ctx) {
             'SELECT id FROM chunks WHERE deleted_at IS NULL ORDER BY ts ASC, id ASC LIMIT ?'
           ).all(excess);
           const stmt = prepareCached(s.db, 'UPDATE chunks SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL');
-          for (const row of rows) tombstoned += Number(stmt.run(now(), Number(row.id)).changes);
+          for (const row of rows) {
+            const changed = Number(stmt.run(now(), Number(row.id)).changes);
+            tombstoned += changed;
+            if (changed > 0) dropDerivedIndexes(s, 'chunk', row.id);
+          }
         });
       }
       return { total, excess, tombstoned, applied: apply };

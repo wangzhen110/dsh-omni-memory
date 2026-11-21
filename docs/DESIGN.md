@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | 3.9.2 |
-| 插件版本 | 3.9.2 |
+| 文档版本 | 3.9.3 |
+| 插件版本 | 3.9.3 |
 | 状态 | 已评审（本文为开发与验收的**唯一依据**） |
 | 目标平台 | DSH 0.2.2-rc.3 原生插件（Desktop，Windows 11，Node 22.23.2，`engines >=22.13`）；MCP / HTTP / OpenAPI / CLI 宿主通用 |
 | 最后更新 | 2026-11-21 |
@@ -93,9 +93,9 @@
 | NFR-07 | 失败隔离 | 任一子系统（FTS/路由/注入）失效不得导致会话不可用 | 满足（全部 try/catch + 可选降级） |
 | NFR-08 | 隐私 | 所有数据仅存本机 `$DSH_HOME/memory/omni.db`；HTTP 仅 loopback，且浏览器跨站写请求被 Origin 校验拦截；默认不上传 | 部分满足：数据库未加密，loopback HTTP 仍依赖本机进程边界，未做进程级鉴权（ADR-017）。内置本地语义在进程内推理，不联网；显式配置 `OMNI_EMBED_URL`/远程 `OMNI_EMBED_PROVIDER` 会外发嵌入文本，配置 `OMNI_RERANK_*` 会外发查询与候选正文，均需用户自行选择可信端点 |
 | NFR-09 | 可卸载 | 卸载插件后不残留运行中的监听；数据文件保留由用户决定 | 满足 |
-| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 283/283（100%） |
+| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 285/285（100%） |
 | NFR-11 | 界面本地化 | 中英词典注册，切换语言无需重载插件 | 已实现（词典 + 订阅重渲染） |
-| NFR-12 | 多进程并发 | 同机 N 个宿主进程共用一个库，同时读写不丢数据、不报锁错 | 283/283 含 6 进程并发用例；写入等待上限 5s（ADR-028） |
+| NFR-12 | 多进程并发 | 同机 N 个宿主进程共用一个库，同时读写不丢数据、不报锁错 | 285/285 含 6 进程并发用例；写入等待上限 5s（ADR-028） |
 
 ### 1.3 约束
 
@@ -133,6 +133,7 @@
 | ADR-017 | HTTP 写入安全与默认隐私 | 写操作只接受 POST；Origin/CSRF 校验；模型复核默认关闭；队列有界 | [ADR/017-http-security.md](ADR/017-http-security.md) |
 | ADR-028 | 多进程并发 | busy_timeout + BEGIN IMMEDIATE + 事务内去重 + meta 租约 | [ADR/028-multi-process-concurrency.md](ADR/028-multi-process-concurrency.md) |
 | ADR-029 | 零配置本地语义 | BGE-small-zh int8 + ONNX Runtime WASM 随包；独立 `semantic_vectors`；后台回填 | [ADR/029-bundled-semantic.md](ADR/029-bundled-semantic.md) |
+| ADR-030 | 语义索引生命周期 | 版本化待处理项、遗忘/替代 GC、队列丢弃计数、失败退避、短租约续期与强制重算 | [ADR/030-semantic-lifecycle.md](ADR/030-semantic-lifecycle.md) |
 
 ### 2.1 参考实现对照（可移植部分）
 
@@ -335,14 +336,15 @@ score = 0.6 × 文本分 + 0.2 × 权重分 + 0.2 × 时效分 + 经验状态分
 - 融合：RRF，`1/(60+rank)` 叠加四路排名（词面 / hashed 或远程向量 / 本地语义 / 图）；权重为词面 1、hashed/远程 1、本地语义 2、图 0.5，避免哈希碰撞压过明确的语义改写命中。命中项暴露 `lexicalScore` / `vectorScore` / `semanticScore` / `rrf`。
 - 诊断开关：`OMNI_DISABLE_VECTOR=1` 同时关闭 hashed/远程向量与本地语义，只跑词面路线（基线与回归对比）。
 
-### 6.5.1 本地语义路线（v3.9.2）
+### 6.5.1 本地语义路线（v3.9.2 / v3.9.3）
 
 - 模型与运行时随包：`models/bge-small-zh-v1.5/` + `lib/vendor/`，约 39MB；不需要用户安装 Ollama、LM Studio 或配置 key（ADR-029）。
 - 推理：`lib/semantic-embed.mjs`，BGE int8 ONNX + onnxruntime-web WASM，进程内 CPU，CLS pooling + L2 归一化；查询加 BGE 指令前缀，文档不加。
 - 存储：`semantic_vectors(kind, owner_id, model, dim, vec)`，`model` 为签名 `local:bge-small-zh-v1.5:int8:512`；不覆盖旧 `vectors`，hashed 512 维与本地 512 维不会混算。
 - 召回：对最近 5000 条语义向量 + 词面候选做余弦，阈值 **0.25**；命中暴露 `semanticScore`，`via:'semantic'`。
-- 索引：新写入进入内存队列，后台 worker 每批 8 条；检索前先冲刷一批待处理项，保证同轮写入后立即可召回；旧库后台回填（每轮扫描上限 64 条），带 `semantic-backfill` 跨进程租约，进程退出即释放；已索引库不会在启动时加载模型。
-- 状态：`memory_status` / `/omni-memory/status` 的 `semantic` 暴露 `enabled/model/dim/pending/indexed/running/backfillDone/lastError`；`memory_reindex({semantic:true})` 强制回填。
+- 索引：新写入进入内存队列，待处理项带版本号；后台 worker 每批 8 条，推理期间同一 key 被改写时旧快照不会写入或吞掉新条目；检索前先冲刷一批待处理项，保证同轮写入后立即可召回；旧库后台回填（每轮扫描上限 64 条），`semantic-backfill` 租约 TTL 120 秒并按批续租；已索引库不会在启动时加载模型。
+- 生命周期：遗忘 / compact / amend / dream replace / consolidate / rollback 在事务内清理 `semantic_vectors`；启动按 `semantic_gc_version` 清扫一次孤儿向量。队列满记 `dropped` 不静默；失败按 1s→30s 指数退避。
+- 状态：`memory_status` / `/omni-memory/status` 的 `semantic` 暴露 `enabled/model/dim/pending/indexed/dropped/failureCount/retryAt/running/backfillDone/lastError`；`memory_reindex({semantic:true})` 回填缺行，`semanticForce:true` 清当前签名后按源文本重建。
 - 开关：`OMNI_DISABLE_SEMANTIC=1` 单独关闭；`OMNI_DISABLE_VECTOR=1` 同时关闭；`OMNI_SEMANTIC_MODEL_DIR` 可替换同结构模型；`OMNI_SEMANTIC_BATCH` 默认 8（1–64）。
 - 降级：模型缺失、损坏、WASM 加载失败或内存不足时返回空，词面/hashed/图路线继续工作；`lastError` 留痕。
 - 实测：冷加载 208ms，RSS 216MB，512 维；20 次查询 191ms（约 9.5ms/query）；黄金集 recall 1.000、MRR 0.979。
@@ -555,7 +557,7 @@ score = 0.6 × 文本分 + 0.2 × 权重分 + 0.2 × 时效分 + 经验状态分
 | **M3（已完成 v0.9.0）** | 图游走（按边召回）+ 冲突标记 | 96 用例 100%；图测试覆盖跳数/开关/作用域 |
 | **M4（已完成 v1.0.0）** | 做梦校验（覆盖度 + 特征词缺失，dry-run/apply） | 101 用例 100%；「错记 Docker」样例可复现纠正 |
 | **M5（已完成 v1.1.0）** | 面板分页 + 校验状态展示 + 中英 i18n + 转录增长治理 | 107 用例 100%；D-10/11 关闭 |
-| **M6（已完成 v3.9.2）** | 内置 BGE-small-zh int8 + ONNX Runtime WASM；四路 RRF；零配置离线语义 | 283 用例 100%；黄金集 MRR 0.979；冷加载 208ms / RSS 216MB |
+| **M6（已完成 v3.9.2）** | 内置 BGE-small-zh int8 + ONNX Runtime WASM；四路 RRF；零配置离线语义 | 285 用例 100%；黄金集 MRR 0.979；冷加载 208ms / RSS 216MB |
 
 ---
 

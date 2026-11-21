@@ -177,3 +177,63 @@ test('FR-21 the remote backend still answers when the endpoint is down', async (
     else process.env.OMNI_EMBED_URL = previous;
   }
 });
+
+async function semanticStatus(app) {
+  const { res, json } = fakeRes();
+  await app.route('/omni-memory/status').handler(fakeReq('/omni-memory/status'), res);
+  return json().semantic;
+}
+
+test('FR-41 forgetting and amending remove stale semantic rows', async () => {
+  const app = await boot({ semantic: true });
+  const old = await app.call('memory_write', {
+    kind: 'note',
+    text: '语义 GC 旧文本：磁盘满了如何释放系统盘',
+    importance: 0.8,
+  });
+  await app.call('memory_search', { query: '磁盘释放' });
+  assert.equal((await semanticStatus(app)).indexed, 1, 'one active note should have one semantic row');
+
+  await app.call('memory_forget', { kind: 'note', id: old.value.id });
+  assert.equal((await semanticStatus(app)).indexed, 0, 'forget must delete the derived semantic row');
+
+  const live = await app.call('memory_write', {
+    kind: 'note',
+    text: '语义 GC 修订前：实时投影被顶掉导致聊天区空白',
+    importance: 0.8,
+  });
+  await app.call('memory_search', { query: '投影顶掉' });
+  assert.equal((await semanticStatus(app)).indexed, 1, 'live note should have one semantic row');
+
+  await app.call('memory_amend', {
+    id: live.value.id,
+    text: '语义 GC 修订后：调用 inspectSession 会让聊天区变空白',
+    reason: 'semantic GC test',
+  });
+  await app.call('memory_search', { query: 'inspectSession' });
+  const status = await semanticStatus(app);
+  assert.equal(status.indexed, 1, 'amend must not leave the superseded row behind');
+  assert.equal(status.pending, 0, 'the replacement should be indexed, not just queued');
+});
+
+test('FR-41 an amend during the first flush is not swallowed by the old snapshot', async () => {
+  const app = await boot({ semantic: true });
+  const old = await app.call('memory_write', {
+    kind: 'note',
+    text: '并发写入旧文本：磁盘满了如何释放系统盘',
+    importance: 0.8,
+  });
+  // The first semantic search loads the model, which gives the amend enough
+  // time to enqueue a newer revision while the old snapshot is in flight.
+  const inFlight = app.call('memory_search', { query: '触发首次模型加载' });
+  await app.call('memory_amend', {
+    id: old.value.id,
+    text: '调用 inspectSession 会把实时投影顶掉，聊天区变空白',
+    reason: 'race test',
+  });
+  await inFlight;
+
+  const hit = await app.call('memory_search', { query: '那个把界面弄没的坑' });
+  assert.ok(hit.value.hits.length >= 1, 'the newer revision must be searchable after the race');
+  assert.ok(hit.value.hits[0].semanticScore > 0, 'the hit must come from the semantic route');
+});

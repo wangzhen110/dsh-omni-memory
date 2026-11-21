@@ -52,9 +52,9 @@
 ## 闸门
 
 - `npm test`：**283/283 通过**。
-- `npm run check`：283 tests / 23 tools / 20 routes / 29 ADRs / 3.9.2；`semantic assets OK: 11 files, 37.5 MB`。
+- `npm run check`：283 tests / 23 tools / 20 routes / 29 ADRs / 3.9.2；`semantic assets OK: 11 files, 37.5 MiB`。
 - `npm run bench:golden`：pass=true，完整检索 MRR 0.979。
-- `npm pack --dry-run`：包名 `@local/omni-memory@3.9.2`，83 个文件，解包 41.0MB，压缩 18.4MB；模型与 WASM 均在包内。
+- `npm pack --dry-run`：包名 `@local/omni-memory@3.9.2`，84 个文件，解包 41.0MB（十进制），压缩 18.4MB（十进制）；模型与 WASM 均在包内。
 - `scripts/check-semantic-assets.mjs` 校验模型、tokenizer、WASM、许可证的存在和精确字节数，缺文件或截断会让 `npm run check` 失败。
 
 ## 文档与许可

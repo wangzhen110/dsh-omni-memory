@@ -2,6 +2,18 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.9.3] — 2026-11-21
+
+### 修复 · 语义索引生命周期（复核 RECHECK-3.9.2）
+- **陈旧向量**：`flushSemanticPending` 的待处理项增加版本号；amend / replace 在推理飞行中覆盖同一 key 时，旧快照不再写入或删除新条目，避免“旧文本向量永久保留、新文本永不入索引”。
+- **派生 GC**：`memory_forget`、`memory_compact` 与 `memory_amend` / dream replace / consolidate / rollback 同步清理 `semantic_vectors`；启动时按 schema 版本执行一次孤儿向量清扫。删除/替代后的向量不再占磁盘。
+- **队列可观测**：语义队列满时不再静默丢弃；`semantic.dropped`、`lastDropAt` 进入 `memory_status` 与 `/omni-memory/status`。
+- **失败退避**：语义写入/查询失败按 1s→30s 指数退避，状态暴露 `failureCount` 与 `retryAt`；冷却期内搜索直接走词面/hashed/图，不再反复加载损坏模型。
+- **回填租约**：TTL 从 600s 缩短为 120s，并在每批 worker 处理前续租；崩溃后最多 2 分钟即可被其他宿主接管，长回填不会被误抢。
+- **强制重算**：`memory_reindex({semantic:true, semanticForce:true})` 会先清当前签名再按源文本重建，修复历史陈旧向量；`semantic` 状态新增 `forced` 结果字段。
+- **清理**：`dispose` 释放 worker timer 与 exit listener；`semantic_vectors` 启动清扫使用 `semantic_gc_version` 标记，避免每次启动重复全表删除。
+- **测试**：新增“遗忘/修订清理陈旧向量”和“首次 flush 期间 amend 不被旧快照吞掉”用例；完整 `npm test` **285/285** 通过；`npm run check` 同步为 23 工具、20 路由、30 ADR、schema v14、3.9.3。
+
 ## [3.9.2] — 2026-11-21
 
 ### 新增 · 默认零配置真语义检索

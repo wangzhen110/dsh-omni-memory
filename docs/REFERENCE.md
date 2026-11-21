@@ -1,6 +1,6 @@
 # 全息记忆 · 机理与接口参考
 
-> 版本 3.9.2 · 生成日期 2026-11-21 · 依据源码与真实 schema v14 核对
+> 版本 3.9.3 · 生成日期 2026-11-21 · 依据源码与真实 schema v14 核对
 >
 > **给 AI 的用法**：这份文档按「先原理、后接口、最后剧本」组织。第一次接触时读第 1、2、9 章即可开工；要精确调用某个工具，直接跳到第 9 章对应小节。若这份文档已同步进记忆库（`omni memory:sync`），也可以先用 `memory_search` 搜"全息记忆 接口"定位。
 
@@ -136,7 +136,7 @@ evidence: npm test → 242/242 passed
 
 1. **词面**：SQLite FTS5（trigram）＋中文二元索引（`bigrams` 表，逐字切 2 字组合）。
 2. **向量**：默认 512 维字符 n-gram 哈希向量（零依赖、离线可用）；配置 `OMNI_EMBED_URL` 后这一路改走远程真语义嵌入，维度持久化在 `meta`，换模型会触发回填。
-3. **本地语义**：包内 `BAAI/bge-small-zh-v1.5` int8 ONNX + ONNX Runtime WASM，512 维，进程内 CPU；查询加 BGE 指令前缀，阈值 0.25；与 hashed 向量分表存放，互不混算。旧库按 `semantic-backfill` 跨进程租约分批回填，进程退出释放；已索引库启动时不加载模型。
+3. **本地语义**：包内 `BAAI/bge-small-zh-v1.5` int8 ONNX + ONNX Runtime WASM，512 维，进程内 CPU；查询加 BGE 指令前缀，阈值 0.25；与 hashed 向量分表存放，互不混算。旧库按 `semantic-backfill` 跨进程租约分批回填，租约 TTL 120 秒并按批续租；已索引库启动时不加载模型。
 4. **图**：从 `facts` 生成的 `entities` + `edges`，做 2 跳关联召回。
 四路排名用 RRF 融合（词面 1 / hashed 或远程 1 / 本地语义 2 / 图 0.5）；命中项分别带 `lexicalScore`、`vectorScore`、`semanticScore`、`rrf`。
 
@@ -367,7 +367,7 @@ MCP 无法写客户端系统提示，所以同一份 `RULES_TEXT` 铺五条路�
 参数：`path` 必填、`dryRun` boolean（默认 true）。按内容去重合并。
 
 ### 5.19 memory_reindex
-参数：`limit` number（默认 200，最大 1000）、`bigrams` boolean、`vectors` boolean、`semantic` boolean。换嵌入模型、恢复旧库或模型升级后使用。`semantic=true` 只跑本地语义回填（`backend:"local"`，返回 `{processed,pending,backfillDone,...}`）；`semantic=true, vectors=true` 同时跑两套向量；`bigrams=true` 单独触发中文二元索引全量重建。
+参数：`limit` number（默认 200，最大 1000）、`bigrams` boolean、`vectors` boolean、`semantic` boolean、`semanticForce` boolean。换嵌入模型、恢复旧库或模型升级后使用。`semantic=true` 只跑本地语义回填（`backend:"local"`，返回 `{processed,pending,backfillDone,forced,...}`）；`semanticForce=true` 需与 `semantic=true` 同用，先删除当前模型签名再按源文本重建，用于修复陈旧向量；`semantic=true, vectors=true` 同时跑两套向量；`bigrams=true` 单独触发中文二元索引全量重建。
 
 ### 5.20 memory_feedback
 参数：`kind`（`note|fact`）、`id`、`rating`（`useful|misleading`），均必填。写入召回质量投票；`memory_search` 命中项返回 `usefulCount`、`misleadingCount`、`feedbackCount`、`lastFeedbackAt`、`quality`，排序使用 Bayesian 平滑后的反馈分。
