@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { boot, fakeReq, fakeRes } from './helpers.mjs';
+import { boot, fakeReq, fakeRes, backupPathOf, copyBackup } from './helpers.mjs';
 
 // Keep this file on the lexical route so ranking assertions isolate the new
 // solution-status boost from vector/embedding variance.
@@ -138,8 +138,8 @@ test('backup export and import preserve solution fields', async () => {
     kind: 'note', scope: 'global', text: 'BackupSolution 可恢复的解法',
     problemKey: 'BackupSolution signature', solutionStatus: 'verified', evidence: 'restore smoke test',
   });
-  const file = path.join(source.home, 'solution-backup.json');
-  await source.call('memory_export', { path: file });
+  const file = backupPathOf(source, 'solution-backup.json');
+  await source.call('memory_export', { path: path.basename(file) });
   const snapshot = JSON.parse(readFileSync(file, 'utf8'));
   const row = snapshot.notes.find(note => note.id === written.value.id);
   assert.equal(row.problem_key, 'backupsolution signature');
@@ -149,7 +149,8 @@ test('backup export and import preserve solution fields', async () => {
 
   const targetHome = mkdtempSync(path.join(tmpdir(), 'omni-solution-import-'));
   const target = await boot({ home: targetHome });
-  await target.call('memory_import', { path: file, dryRun: false });
+  const shared = copyBackup(source, target, 'solution-backup.json');
+  await target.call('memory_import', { path: path.basename(shared), dryRun: false });
   const found = await target.call('memory_search', { problemKey: 'BackupSolution signature', scope: 'all' });
   assert.equal(found.value.hits.length, 1);
   assert.equal(found.value.hits[0].solutionStatus, 'verified');

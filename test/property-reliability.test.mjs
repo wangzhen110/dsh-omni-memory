@@ -83,7 +83,7 @@ test('prop: tombstoned notes stay clean across store reopen', async () => {
   await fc.assert(
     fc.asyncProperty(fc.uuid(), prose, async (uid, body) => {
       const key = `prop-gc-${uid}`;
-      const scope = `proj:gc-${uid}`;
+      const scope = 'global';
       const { value: written } = await app.call('memory_write', {
         kind: 'note', text: `${uid} ${body}`, problemKey: key, scope,
       });
@@ -123,7 +123,7 @@ test('prop: mixed mutations keep the store consistent', async () => {
       fc.array(fc.oneof(fc.constant('write'), fc.constant('amend'), fc.constant('forget')), { minLength: 3, maxLength: 12 }),
       fc.array(prose, { minLength: 1, maxLength: 6 }),
       async (uid, ops, texts) => {
-        const scope = `proj:mix-${uid}`;
+        const scope = 'global';
         const ids = [];
         for (let i = 0; i < ops.length; i += 1) {
           const body = texts[i % texts.length];

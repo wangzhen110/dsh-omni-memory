@@ -509,6 +509,8 @@ mcp      以 stdio 启动 MCP（等同 hosts/mcp/bin.mjs）
 | `OMNI_PROJECT_DIR` | 当前目录 | 项目层绑定目录（MCP/CLI/HTTP） |
 | `OMNI_SESSION_ID` | `host-<哈希>` | 作用域标识 |
 | `OMNI_HTTP_PORT` / `OMNI_HTTP_BIND` | `7788` / `127.0.0.1` | 面板与 HTTP MCP 监听 |
+| `OMNI_BACKUP_DIR` | `$OMNI_HOME/memory/backups` | `memory_export` / `memory_import` 唯一允许的备份交换目录 |
+| `OMNI_TRUSTED_HOSTS` | 空 | 额外允许的 HTTP `Host`（逗号分隔；回环名与绑定地址始终允许） |
 | `OMNI_AUTO_RECALL` | 开 | `0` 关闭自动预召回（DSH 内有效） |
 | `OMNI_PROFILE` | 未设置 | 画像预算覆盖 |
 | `OMNI_SCOPE_JUDGE` | `off` | 模型复核归类：`off`/`auto`/`always` |

@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { boot } from './helpers.mjs';
+import { boot, backupPathOf, copyBackup } from './helpers.mjs';
 
 const EXPORT_FORMAT = 'omni-memory-backup';
 
@@ -38,7 +38,9 @@ function tableCounts(home) {
 }
 
 function writeSnapshot(home, name, snapshot) {
-  const file = path.join(home, name);
+  const dir = path.join(home, 'memory', 'backups');
+  mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, name);
   writeFileSync(file, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf8');
   return file;
 }
@@ -46,8 +48,8 @@ function writeSnapshot(home, name, snapshot) {
 async function exportedSeed(t, seedText) {
   const app = await bootIsolated(t);
   await app.call('memory_write', { kind: 'note', scope: 'global', text: seedText });
-  const file = path.join(app.home, 'seed.json');
-  await app.call('memory_export', { path: file });
+  const file = backupPathOf(app, 'seed.json');
+  await app.call('memory_export', { path: path.basename(file) });
   return { app, file, snapshot: JSON.parse(readFileSync(file, 'utf8')) };
 }
 
@@ -73,31 +75,33 @@ test('import rejects a snapshot written by a newer version and leaves the store 
   });
 
   await assert.rejects(
-    () => target.call('memory_import', { path: file }),
+    () => target.call('memory_import', { path: path.basename(file) }),
     (error) => /newer version/.test(error.message),
     'dryRun 也必须拒绝未来版本',
   );
   await assert.rejects(
-    () => target.call('memory_import', { path: file, dryRun: false }),
+    () => target.call('memory_import', { path: path.basename(file), dryRun: false }),
     (error) => /newer version/.test(error.message),
   );
   assert.deepEqual(tableCounts(target.home), before, '版本检查在任何写入之前发生');
 });
 
 test('import fails cleanly on truncated or malformed JSON without partial writes', async (t) => {
-  const { file: validFile } = await exportedSeed(t, 'EdgeTrunc 基准');
+  const { app: sourceApp, file: validFile } = await exportedSeed(t, 'EdgeTrunc 基准');
   const target = await bootIsolated(t);
   await target.call('memory_write', { kind: 'note', scope: 'global', text: 'EdgeTrunc 保留' });
   const before = tableCounts(target.home);
 
-  const truncated = path.join(target.home, 'truncated.json');
+  const targetBackupDir = path.join(target.home, 'memory', 'backups');
+  mkdirSync(targetBackupDir, { recursive: true });
+  const truncated = path.join(targetBackupDir, 'truncated.json');
   writeFileSync(truncated, readFileSync(validFile, 'utf8').slice(0, 100));
-  const malformed = path.join(target.home, 'malformed.json');
+  const malformed = path.join(targetBackupDir, 'malformed.json');
   writeFileSync(malformed, '{ not really json');
 
   for (const file of [truncated, malformed]) {
     await assert.rejects(
-      () => target.call('memory_import', { path: file, dryRun: false }),
+      () => target.call('memory_import', { path: path.basename(file), dryRun: false }),
       (error) => /cannot read backup/.test(error.message),
       '解析失败应被包装成受控错误，而不是抛出裸 SyntaxError',
     );
@@ -105,7 +109,8 @@ test('import fails cleanly on truncated or malformed JSON without partial writes
   assert.deepEqual(tableCounts(target.home), before, '解析失败不能留下半写入');
 
   // 失败之后库仍然可用：再导入合法快照应正常写入。
-  const applied = await target.call('memory_import', { path: validFile, dryRun: false });
+  const shared = copyBackup(sourceApp, target, 'seed.json');
+  const applied = await target.call('memory_import', { path: path.basename(shared), dryRun: false });
   assert.equal(applied.value.notes, 1);
   assert.equal(tableCounts(target.home).notes, before.notes + 1);
 });
@@ -121,7 +126,7 @@ test('import rejects a snapshot with a wrong or missing format field', async (t)
 
   for (const file of [wrong, missing]) {
     await assert.rejects(
-      () => target.call('memory_import', { path: file, dryRun: false }),
+      () => target.call('memory_import', { path: path.basename(file), dryRun: false }),
       (error) => /not an omni-memory backup/.test(error.message),
     );
   }
@@ -149,14 +154,14 @@ test('a type-invalid note aborts a mid-import transaction and rolls back every r
     entityAliases: [], persona: [], candidates: [],
   });
 
-  const dry = await target.call('memory_import', { path: file });
+  const dry = await target.call('memory_import', { path: path.basename(file) });
   assert.equal(dry.value.dryRun, true);
   assert.equal(dry.value.notes, 3, '两条好行 + 类型错误行都会进入写入计划');
   assert.equal(dry.value.skipped, 1, '缺 text 的行在计划阶段被跳过');
   assert.deepEqual(tableCounts(target.home), before, 'dryRun 不写库');
 
   await assert.rejects(
-    () => target.call('memory_import', { path: file, dryRun: false }),
+    () => target.call('memory_import', { path: path.basename(file), dryRun: false }),
     (error) => /NOT NULL constraint failed: notes\.importance/.test(error.message),
     '实际行为：写入阶段在坏行处抛出约束错误',
   );
@@ -175,8 +180,8 @@ test('global and two project scopes survive export/import without cross-scope mi
     });
   }
 
-  const file = path.join(source.home, 'cross-scope.json');
-  await source.call('memory_export', { path: file });
+  const file = backupPathOf(source, 'cross-scope.json');
+  await source.call('memory_export', { path: path.basename(file) });
   const snapshot = JSON.parse(readFileSync(file, 'utf8'));
   assert.equal(snapshot.format, EXPORT_FORMAT);
 
@@ -186,14 +191,15 @@ test('global and two project scopes survive export/import without cross-scope mi
   assert.deepEqual(expectedFacts, [['global', 1], ['proj-alpha', 1], ['proj-beta', 1]]);
 
   const target = await bootIsolated(t);
-  const dry = await target.call('memory_import', { path: file });
+  const shared = copyBackup(source, target, 'cross-scope.json');
+  const dry = await target.call('memory_import', { path: path.basename(shared) });
   assert.equal(dry.value.dryRun, true);
   assert.equal(dry.value.notes, snapshot.notes.length);
   assert.equal(dry.value.facts, snapshot.facts.length);
   assert.equal(tableCounts(target.home).notes, 0);
   assert.equal(tableCounts(target.home).facts, 0);
 
-  const applied = await target.call('memory_import', { path: file, dryRun: false });
+  const applied = await target.call('memory_import', { path: path.basename(shared), dryRun: false });
   assert.equal(applied.value.notes, snapshot.notes.length);
   assert.equal(applied.value.facts, snapshot.facts.length);
 
@@ -236,7 +242,7 @@ test('a legacy-style snapshot without newer optional note fields still imports',
   });
 
   // 实现里这些字段都用 ?? 兜底，所以删掉新增可选字段不会阻塞导入。
-  const result = await target.call('memory_import', { path: file, dryRun: false });
+  const result = await target.call('memory_import', { path: path.basename(file), dryRun: false });
   assert.equal(result.value.notes, 1);
 
   const db = dbOf(target.home);

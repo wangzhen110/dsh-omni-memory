@@ -2,6 +2,20 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.10.1] — 2026-11-21
+
+### 修复 · 深度审计 P0（安全与数据一致性）
+- **导出/导入不再是任意文件读写**：`memory_export` / `memory_import` 只接受 `memory/backups/` 内的单个 `.json` 文件名；拒绝绝对路径、盘符、UNC、`..`、子目录和符号链接；导出拒绝覆盖已有文件，写入临时文件后 `rename`；导入限制 64MB、只返回固定错误，不回显输入前缀。备份目录可用 `OMNI_BACKUP_DIR` 改到受控位置。
+- **同源校验不再用 Host 自证**：`Host` 必须是 `127.0.0.1` / `localhost` / `[::1]`、配置的绑定地址或 `OMNI_TRUSTED_HOSTS`；`Origin` 必须与之同主机同端口；`Sec-Fetch-Site: cross-site` 直接拒绝。`hosts/http/server.mjs` 的 `POST /mcp` 使用同一套规则，DNS 重绑定页不能只靠自洽的 Host/Origin 通过。
+- **按 id 的写操作回到项目边界**：`memory_forget` / `memory_restore` / `memory_dream_replace` / `memory_dream_rollback` / `memory_solution_report` / `memory_amend` / `memory_feedback` 统一按调用方当前项目 + global 过滤；项目上下文不能改另一个项目。`scope=all` 只在 amend/feedback 显式请求时放行，并写入 `meta.audit:cross-scope` 审计环（保留最近 100 条）。
+- **导入复用事实失效规则**：`mergeSnapshot` 按 `valid_from` 排序；单值关系导入前关闭同 `(subject, relation, scope)` 的旧 active 行与对应 edge；若本地已有更新的事实，则导入值落为历史值，保证同一键最多一条 `valid_to IS NULL`。
+- **dream 证据按轮次匹配**：`dreamEvidence` 优先精确匹配 `session:<id>#<seq>`，旧式 session source 按 `ts` 倒序取最近 300 条，再按文本覆盖率选最佳证据；同一 session 的多轮 transcript 不再让正确笔记被第一行误判为 `contradicted`。
+- **CI / 测试隔离**：`.github/workflows/ci.yml` 增加 `npm ci`、`fetch-depth: 0`、Node 22.13/24 × Ubuntu/Windows 矩阵；`test/helpers.mjs` 同时固定 `OMNI_HOME` 和 `DSH_HOME`，清除继承的 `OMNI_BACKUP_DIR` / `OMNI_TRUSTED_HOSTS`，避免测试写入真实库。
+
+### 测试与发布
+- 新增 `test/security-p0.test.mjs`（路径越界、覆盖保护、项目越权、事实失效、dream 轮次、OMNI_HOME 隔离）与伪造 Host 的 HTTP 回归；备份测试改为只传 basename，跨库导入走显式文件复制。
+- 测试基线 356 用例；`npm run check` 同步为 23 个内核工具、25 个 MCP 工具、21 路由、31 ADR、3.10.1。
+
 ## [3.10.0] — 2026-11-21
 
 ### 新增 · 记忆概览仪表盘（真实数据）

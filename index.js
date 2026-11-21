@@ -20,7 +20,7 @@
 
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { DIM, embedText, dot, toBlob, fromBlob, tokenize } from './lib/embed.mjs';
@@ -38,6 +38,11 @@ import { semanticConfig, embedSemantic } from './lib/semantic-embed.mjs';
 const DSH_HOME = process.env.OMNI_HOME || process.env.DSH_HOME || path.join(homedir(), '.dsh');
 const DB_DIR = path.join(DSH_HOME, 'memory');
 const DB_FILE = path.join(DB_DIR, 'omni.db');
+// Backups are the one place a model-facing tool is allowed to touch the disk.
+// Keeping that directory fixed turns export/import from an arbitrary read/write
+// primitive into a narrow, auditable file exchange.
+const BACKUP_DIR = path.resolve(process.env.OMNI_BACKUP_DIR || path.join(DB_DIR, 'backups'));
+const BACKUP_MAX_BYTES = 64 * 1024 * 1024;
 const PROFILE_BUDGET = 1200;
 const PROFILE_CACHE_MS = 30_000;
 const MAX_CAPTURE_CHARS = 4000;
@@ -1865,13 +1870,22 @@ function renewLease(db, name, token, ttlMs) {
 }
 
 /** Tombstone one row and keep its derived graph edges consistent. */
-function forgetMemory(s, kind, id) {
+function forgetMemory(s, kind, id, scope = SCOPE_GLOBAL) {
   const table = { note: 'notes', fact: 'facts', chunk: 'chunks' }[String(kind)];
   if (!table) throw new Error('kind must be note, fact or chunk');
+  const filter = scopeClause('scope', scope);
   return transaction(s.db, () => {
     let fact = null;
     if (table === 'facts') {
-      fact = prepareCached(s.db, 'SELECT subject, relation, object, scope FROM facts WHERE id = ?').get(Number(id));
+      fact = prepareCached(s.db, `SELECT subject, relation, object, scope FROM facts WHERE id = ? ${filter.sql}`)
+        .get(Number(id), ...filter.params);
+      if (!fact) return false;
+    }
+    let row = null;
+    if (table !== 'facts') {
+      row = prepareCached(s.db, `SELECT id FROM ${table} WHERE id = ? ${filter.sql}`)
+        .get(Number(id), ...filter.params);
+      if (!row) return false;
     }
     const info = prepareCached(s.db, `UPDATE ${table} SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL`)
       .run(now(), Number(id));
@@ -1923,23 +1937,69 @@ function snapshotStore(s, options = {}) {
   };
 }
 
+/**
+ * Resolve a backup name inside BACKUP_DIR.
+ *
+ * Only a single basename is accepted. Absolute paths, drive letters, UNC
+ * prefixes, separators and `..` are rejected before they reach the filesystem,
+ * and an existing symlink is never followed. `existing: true` is used by import
+ * and requires a regular file; export refuses to overwrite for the same reason.
+ */
+function backupPath(input, { existing = false } = {}) {
+  const raw = String(input ?? '').trim();
+  if (raw.includes('\0')) throw new Error('backup name contains a NUL byte');
+  if (raw && (path.isAbsolute(raw) || /[\\/]/.test(raw) || raw === '..' || raw.startsWith('../') || raw.startsWith('..\\'))) {
+    throw new Error('backup name must be a single file name inside the backup directory');
+  }
+  const name = raw || `omni-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+  if (name === '.' || name === '..' || !name.toLowerCase().endsWith('.json')) {
+    throw new Error('backup name must end in .json');
+  }
+  mkdirSync(BACKUP_DIR, { recursive: true, mode: 0o700 });
+  const target = path.resolve(BACKUP_DIR, name);
+  if (path.dirname(target) !== BACKUP_DIR) throw new Error('backup name escapes the backup directory');
+  let info = null;
+  try {
+    info = lstatSync(target);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw new Error('cannot inspect backup target');
+  }
+  if (info?.isSymbolicLink()) throw new Error('backup target is a symbolic link');
+  if (existing) {
+    if (!info || !info.isFile()) throw new Error('backup file does not exist');
+    if (Number(info.size) > BACKUP_MAX_BYTES) throw new Error('backup file is too large');
+  } else if (info) {
+    throw new Error('backup target already exists');
+  }
+  return target;
+}
+
 function exportBackup(s, options = {}) {
   const snapshot = snapshotStore(s, options);
-  const target = String(options.path ?? '').trim()
-    || path.join(DB_DIR, `omni-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
-  mkdirSync(path.dirname(target), { recursive: true });
-  writeFileSync(target, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf8');
+  const target = backupPath(options.path);
+  const tmp = `${target}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    writeFileSync(tmp, `${JSON.stringify(snapshot, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    renameSync(tmp, target);
+  } catch (error) {
+    try { unlinkSync(tmp); } catch { /* the temporary file may never have existed */ }
+    throw error;
+  }
   return { path: target, counts: snapshot.counts, audit: options.audit !== false };
 }
 
 function importBackup(s, options = {}) {
   const file = String(options.path ?? '').trim();
   if (!file) throw new Error('path is required');
+  const target = backupPath(file, { existing: true });
   let snapshot;
   try {
-    snapshot = JSON.parse(readFileSync(file, 'utf8'));
-  } catch (error) {
-    throw new Error(`cannot read backup: ${String(error?.message ?? error)}`);
+    const raw = readFileSync(target, 'utf8');
+    // Never echo the parser message or file prefix: it turns a failed import
+    // into an oracle for the first bytes of any readable file.
+    snapshot = JSON.parse(raw);
+  } catch {
+    throw new Error('cannot read backup: invalid JSON');
   }
   return mergeSnapshot(s, snapshot, options);
 }
@@ -1967,6 +2027,11 @@ function mergeSnapshot(s, snapshot, options = {}) {
 
   const noteExists = prepareCached(s.db, 'SELECT id FROM notes WHERE scope = ? AND text = ? AND superseded_by IS NULL');
   const factExists = prepareCached(s.db, 'SELECT id FROM facts WHERE subject = ? AND relation = ? AND object = ? AND scope = ?');
+  const activeFactRows = prepareCached(s.db, `
+    SELECT id, object, valid_from, scope FROM facts
+    WHERE subject = ? AND relation = ? AND valid_to IS NULL AND deleted_at IS NULL
+      AND (scope = ? OR (scope IS NULL AND ? = 'global'))
+  `);
   const chunkExists = prepareCached(s.db, "SELECT id FROM chunks WHERE hash = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global')");
   const edgeExists = prepareCached(s.db, "SELECT id FROM edges WHERE src = ? AND rel = ? AND dst = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global')");
   const candidateExists = prepareCached(s.db, `
@@ -2083,7 +2148,33 @@ function mergeSnapshot(s, snapshot, options = {}) {
       const target = idMap.get(replacement) ?? replacement;
       if (newId) prepareCached(s.db, 'UPDATE notes SET superseded_by = ? WHERE id = ?').run(target, newId);
     }
+    plan.facts.sort((a, b) => Number(a.valid_from ?? 0) - Number(b.valid_from ?? 0));
     for (const fact of plan.facts) {
+      const factScope = fact.scope ?? SCOPE_GLOBAL;
+      const factFrom = Number(fact.valid_from ?? now());
+      const cardinality = fact.cardinality === 'multi' ? 'multi' : relationCardinality(s.db, String(fact.relation));
+      const factActive = fact.valid_to === null || fact.valid_to === undefined;
+      let validTo = fact.valid_to ?? null;
+      // Importing a snapshot used to bypass the write path's single-value rule:
+      // local "裸机" and imported "Docker" both stayed valid_to=NULL. Sort by
+      // valid_from and close the rows this imported value actually replaces;
+      // if a newer local fact already exists, keep the imported one historical.
+      if (factActive && !fact.deleted_at && cardinality !== 'multi') {
+        const current = activeFactRows.all(String(fact.subject), String(fact.relation), factScope, factScope);
+        const newer = current.filter(row => Number(row.valid_from ?? 0) > factFrom);
+        if (newer.length) {
+          validTo = Math.min(...newer.map(row => Number(row.valid_from)));
+        } else {
+          for (const row of current) {
+            prepareCached(s.db, 'UPDATE facts SET valid_to = ? WHERE id = ?').run(factFrom, Number(row.id));
+            prepareCached(s.db, `
+              UPDATE edges SET valid_to = ?
+              WHERE src = ? AND rel = ? AND dst = ? AND valid_to IS NULL
+                AND (scope = ? OR scope IS NULL)
+            `).run(factFrom, String(fact.subject), String(fact.relation), String(row.object ?? ''), row.scope ?? SCOPE_GLOBAL);
+          }
+        }
+      }
       const info = prepareCached(s.db, `
         INSERT INTO facts(subject, relation, object, text, valid_from, valid_to, recorded_at, confidence, source, contested, scope, deleted_at, cardinality,
           recall_count, last_recall_at, useful_count, misleading_count)
@@ -2091,9 +2182,9 @@ function mergeSnapshot(s, snapshot, options = {}) {
       `).run(
         String(fact.subject), String(fact.relation), String(fact.object ?? ''),
         String(fact.text ?? `${fact.subject} ${fact.relation} ${fact.object ?? ''}`),
-        Number(fact.valid_from ?? now()), fact.valid_to ?? null, fact.recorded_at ?? null,
+        factFrom, validTo, fact.recorded_at ?? null,
         Number(fact.confidence ?? 0.7), fact.source ?? null, Number(fact.contested ?? 0),
-        fact.scope ?? SCOPE_GLOBAL, fact.deleted_at ?? null, fact.cardinality === 'multi' ? 'multi' : 'single',
+        factScope, fact.deleted_at ?? null, cardinality,
         Number(fact.recall_count ?? fact.recallCount ?? 0),
         fact.last_recall_at ?? fact.lastRecallAt ?? null,
         Number(fact.useful_count ?? fact.usefulCount ?? 0),
@@ -2179,12 +2270,14 @@ function mergeSnapshot(s, snapshot, options = {}) {
 }
 
 /** Revive one tombstoned row and restore its derived indexes. */
-function restoreMemory(s, kind, id) {
+function restoreMemory(s, kind, id, scope = SCOPE_GLOBAL) {
   const table = { note: 'notes', fact: 'facts', chunk: 'chunks' }[String(kind)];
   if (!table) throw new Error('kind must be note, fact or chunk');
+  const filter = scopeClause('scope', scope);
   const result = transaction(s.db, () => {
-    const row = prepareCached(s.db, `SELECT * FROM ${table} WHERE id = ?`).get(Number(id));
-    if (!row) return { restored: false, reason: 'not found' };
+    const row = prepareCached(s.db, `SELECT * FROM ${table} WHERE id = ? ${filter.sql}`)
+      .get(Number(id), ...filter.params);
+    if (!row) return { restored: false, reason: 'not found or outside the current project' };
     if (!row.deleted_at) return { restored: false, reason: 'not tombstoned' };
     if (table === 'chunks') {
       // The unique index is (hash, scope) among active rows. Restoring an old
@@ -2649,6 +2742,40 @@ function scopeClause(column, scope, nulls = true) {
   return { sql: `AND (${parts.join(' OR ')})`, params: [scope] };
 }
 
+/**
+ * Resolve the only layers a mutating tool may touch from its host context.
+ *
+ * Project scope is an isolation boundary, not a display filter. A caller may
+ * explicitly name its own project or global; anything else is refused. `all`
+ * is only available to read-only audit paths, never to a by-id write.
+ */
+function writeScopeForTool(toolContext, requested, { allowAll = false } = {}) {
+  const raw = normalizeScopeInput(requested);
+  if (raw === 'all') {
+    if (allowAll) return null;
+    throw new Error('scope=all is read-only for this operation; use the current project or global');
+  }
+  const project = currentProject(toolContext);
+  if (raw === 'project') return project || SCOPE_GLOBAL;
+  if (raw === 'global') return SCOPE_GLOBAL;
+  if (raw) {
+    if (project && raw === project) return raw;
+    throw new Error('scope must be the current project or global');
+  }
+  return project || SCOPE_GLOBAL;
+}
+
+/** Keep an explicit cross-project write visible instead of silently trusting it. */
+function auditCrossScope(db, action, id) {
+  try {
+    const key = 'audit:cross-scope';
+    const raw = prepareCached(db, 'SELECT value FROM meta WHERE key = ?').get(key)?.value;
+    const list = raw ? JSON.parse(raw) : [];
+    list.push({ at: now(), action: String(action), id: Number(id) });
+    metaSet(db, key, JSON.stringify(list.slice(-100)));
+  } catch { /* an audit failure must not break the operation */ }
+}
+
 /** Fraction of query terms that appear in the row's text. */
 function matchRatio(row, columns, terms) {
   if (!terms.length) return 0;
@@ -3082,14 +3209,48 @@ const DREAM_MAX_CHUNKS = 300;
 
 function dreamEvidence(s, note, scope = note.scope ?? SCOPE_GLOBAL) {
   const scopeFilter = scopeClause('scope', scope);
-  if (note.source) {
+  const pickBest = rows => {
+    let best = null;
+    let bestScore = -1;
+    for (const row of rows) {
+      const score = coverageScore(note.text, row.text);
+      // Equal coverage keeps the first row, which is the newest because every
+      // source query orders by ts DESC. Row order is no longer the decision.
+      if (score > bestScore) {
+        bestScore = score;
+        best = row;
+      }
+    }
+    return best;
+  };
+  const source = String(note.source ?? '').trim();
+  if (source) {
     try {
+      // New captures carry `session:<id>#<seq>`. That exact pointer identifies
+      // the turn; the old query took LIMIT 1 from every chunk of a session and
+      // could cite the wrong turn, marking a correct note as contradicted.
       const rows = prepareCached(s.db, `
         SELECT id, text, source FROM chunks
         WHERE source = ? AND deleted_at IS NULL ${scopeFilter.sql}
-        LIMIT 1
-      `).all(note.source, ...scopeFilter.params);
-      if (rows.length) return rows[0];
+        ORDER BY ts DESC, id DESC LIMIT 20
+      `).all(source, ...scopeFilter.params);
+      const exact = pickBest(rows);
+      if (exact) {
+        const score = coverageScore(note.text, exact.text);
+        if (score >= DREAM_WEAK) return exact;
+      }
+      // Legacy sources name only a session. Ask for that session's recent chunks
+      // and select by textual coverage instead of accepting the first row.
+      const base = source.replace(/#\d+$/, '');
+      if (base !== source) {
+        const legacy = prepareCached(s.db, `
+          SELECT id, text, source FROM chunks
+          WHERE source LIKE ? AND deleted_at IS NULL ${scopeFilter.sql}
+          ORDER BY ts DESC, id DESC LIMIT ${DREAM_MAX_CHUNKS}
+        `).all(`${base}#%`, ...scopeFilter.params);
+        const best = pickBest(legacy);
+        if (best && coverageScore(note.text, best.text) >= DREAM_WEAK) return best;
+      }
     } catch { /* fall through to similarity */ }
   }
   const tokens = [...new Set(tokenize(note.text))].filter(token => token.length >= 2);
@@ -3221,12 +3382,13 @@ function dreamProposals(s, limit = 50) {
 }
 
 /** Replace one flagged note with its evidence text. Explicit per-note action. */
-function dreamReplace(s, noteId) {
+function dreamReplace(s, noteId, scope = SCOPE_GLOBAL) {
+  const filter = scopeClause('scope', scope);
   const result = transaction(s.db, () => {
     const note = prepareCached(s.db,
-      'SELECT * FROM notes WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL'
-    ).get(Number(noteId));
-    if (!note) throw new Error('note not found or already superseded');
+      `SELECT * FROM notes WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL ${filter.sql}`
+    ).get(Number(noteId), ...filter.params);
+    if (!note) throw new Error('note not found, already superseded, or outside the current project');
     const evidence = dreamEvidence(s, note, note.scope ?? SCOPE_GLOBAL);
     if (!evidence) throw new Error('no evidence to build a replacement');
     const replacementText = String(evidence.text).slice(0, 600);
@@ -3252,9 +3414,11 @@ function dreamReplace(s, noteId) {
 }
 
 /** Undo a dream replacement: revive the original, tombstone the generated note. */
-function dreamRollback(s, noteId) {
+function dreamRollback(s, noteId, scope = SCOPE_GLOBAL) {
+  const filter = scopeClause('scope', scope);
   const result = transaction(s.db, () => {
-    const note = prepareCached(s.db, 'SELECT id, superseded_by, text FROM notes WHERE id = ?').get(Number(noteId));
+    const note = prepareCached(s.db, `SELECT id, superseded_by, text, scope FROM notes WHERE id = ? ${filter.sql}`)
+      .get(Number(noteId), ...filter.params);
     if (!note || !note.superseded_by) return { restored: false, reason: 'not superseded' };
     const replacement = prepareCached(s.db, 'SELECT id, source, deleted_at FROM notes WHERE id = ?').get(Number(note.superseded_by));
     if (!replacement || !String(replacement.source ?? '').startsWith('dream:')) {
@@ -5128,7 +5292,7 @@ function defineTools(ctx) {
         `solution #${value.id} -> ${value.solutionStatus} (reused ${value.reuseCount}×)`,
       ),
     },
-    async execute(args = {}) {
+    async execute(args = {}, toolContext = {}) {
       const id = Number(args.id);
       const outcome = String(args.outcome ?? '').trim().toLowerCase();
       if (!Number.isFinite(id) || id <= 0) throw new Error('id is required');
@@ -5136,11 +5300,13 @@ function defineTools(ctx) {
         throw new Error('outcome must be success, failed, or expired');
       }
       const s = openStore();
+      const scope = writeScopeForTool(toolContext, args.scope);
+      const filter = scopeClause('scope', scope);
       const note = prepareCached(s.db, `
         SELECT id, solution_status, reuse_count, problem_key
-        FROM notes WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL
-      `).get(id);
-      if (!note) throw new Error(`note ${id} not found or is no longer active`);
+        FROM notes WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL ${filter.sql}
+      `).get(id, ...filter.params);
+      if (!note) throw new Error(`note ${id} not found, inactive, or outside the current project`);
       const ts = now();
       const status = outcome === 'success' ? 'verified' : outcome === 'failed' ? 'failed' : 'expired';
       transaction(s.db, () => {
@@ -5200,10 +5366,10 @@ function defineTools(ctx) {
       if (!Number.isFinite(id) || id <= 0) throw new Error('id is required');
       const rating = String(args.rating ?? '').trim().toLowerCase();
       if (rating !== 'useful' && rating !== 'misleading') throw new Error('rating must be useful or misleading');
-      const requestedScope = normalizeScopeInput(args.scope);
-      if (requestedScope && requestedScope !== 'all') throw new Error('scope only supports all; omit it for the current project plus global');
-      const scope = requestedScope === 'all' ? null : (currentProject(toolContext) || SCOPE_GLOBAL);
+      const requestedScope = args.scope;
+      const scope = writeScopeForTool(toolContext, requestedScope, { allowAll: true });
       const s = openStore();
+      if (scope === null) auditCrossScope(s.db, 'memory_feedback', id);
       const table = kind === 'note' ? 'notes' : 'facts';
       const activeSql = kind === 'fact' ? 'AND valid_to IS NULL' : 'AND superseded_by IS NULL';
       const filter = scopeClause('scope', scope);
@@ -5364,10 +5530,10 @@ function defineTools(ctx) {
       const text = String(args.text ?? '').trim();
       if (!text) throw new Error('text is required');
       if (text.length > 4000) throw new Error(`note is ${text.length} characters; split it into smaller notes (max 4000)`);
-      const requestedScope = normalizeScopeInput(args.scope);
-      if (requestedScope && requestedScope !== 'all') throw new Error('scope only supports all; omit it for the current project plus global');
-      const scope = requestedScope === 'all' ? null : (currentProject(toolContext) || SCOPE_GLOBAL);
+      const requestedScope = args.scope;
+      const scope = writeScopeForTool(toolContext, requestedScope, { allowAll: true });
       const s = openStore();
+      if (scope === null) auditCrossScope(s.db, 'memory_amend', id);
       const filter = scopeClause('scope', scope);
       const old = prepareCached(s.db, `
         SELECT * FROM notes
@@ -5583,9 +5749,9 @@ function defineTools(ctx) {
       schema: { type: 'object', properties: { oldId: { type: 'number' }, replacementId: { type: 'number' } } },
       render: (_args, value) => textBlock(`replaced #${value.oldId} with #${value.replacementId} (rollback with memory_dream_rollback)`),
     },
-    async execute(args = {}) {
+    async execute(args = {}, toolContext = {}) {
       if (args.confirm !== true) throw new Error('confirm=true is required');
-      return dreamReplace(openStore(), args.noteId);
+      return dreamReplace(openStore(), args.noteId, writeScopeForTool(toolContext, args.scope));
     },
   }));
 
@@ -5602,8 +5768,8 @@ function defineTools(ctx) {
       schema: { type: 'object', properties: { restored: { type: 'boolean' }, replacementId: { type: 'number' } } },
       render: (_args, value) => textBlock(value.restored ? `restored #${_args.noteId}` : `not rolled back: ${value.reason}`),
     },
-    async execute(args = {}) {
-      return dreamRollback(openStore(), args.noteId);
+    async execute(args = {}, toolContext = {}) {
+      return dreamRollback(openStore(), args.noteId, writeScopeForTool(toolContext, args.scope));
     },
   }));
 
@@ -5614,7 +5780,7 @@ function defineTools(ctx) {
       type: 'object',
       additionalProperties: false,
       properties: {
-        path: { type: 'string', description: 'Destination file. Defaults to a timestamped file under $DSH_HOME/memory/.' },
+        path: { type: 'string', description: 'Backup file name (single basename, .json only) inside $OMNI_HOME/memory/backups. Defaults to a timestamped name; absolute paths and subdirectories are rejected.' },
         activeOnly: { type: 'boolean', description: 'true exports only live rows (no tombstones, superseded notes or expired facts).' },
       },
     },
@@ -5635,7 +5801,7 @@ function defineTools(ctx) {
       type: 'object',
       additionalProperties: false,
       properties: {
-        path: { type: 'string', description: 'Backup file to read.' },
+        path: { type: 'string', description: 'Backup file name (single basename, .json only) inside $OMNI_HOME/memory/backups.' },
         dryRun: { type: 'boolean', description: 'true (default) reports what would be imported without writing.' },
       },
       required: ['path'],
@@ -5667,9 +5833,9 @@ function defineTools(ctx) {
       schema: { type: 'object', properties: { restored: { type: 'boolean' }, reason: { type: 'string' }, activeId: { type: 'number' } } },
       render: (_args, value) => textBlock(value.restored ? 'restored' : `nothing to restore${value.reason ? `: ${value.reason}` : ''}`),
     },
-    async execute(args = {}) {
+    async execute(args = {}, toolContext = {}) {
       const s = openStore();
-      return restoreMemory(s, String(args.kind), Number(args.id));
+      return restoreMemory(s, String(args.kind), Number(args.id), writeScopeForTool(toolContext, args.scope));
     },
   }));
 
@@ -5799,11 +5965,11 @@ function defineTools(ctx) {
       schema: { type: 'object', properties: { forgotten: { type: 'boolean' }, reason: { type: 'string' } } },
       render: (_args, value) => textBlock(value.forgotten ? 'tombstoned' : `nothing to forget${value.reason ? `: ${value.reason}` : ''}`),
     },
-    async execute(args) {
+    async execute(args = {}, toolContext = {}) {
       const s = openStore();
       const kind = String(args.kind);
       const id = Number(args.id);
-      const forgotten = forgetMemory(s, kind, id);
+      const forgotten = forgetMemory(s, kind, id, writeScopeForTool(toolContext, args.scope));
       invalidateProfile();
       return forgotten
         ? { forgotten: true }
@@ -5911,20 +6077,70 @@ function isLoopback(req) {
 }
 
 /**
+ * Host names a local service may answer for.
+ *
+ * A browser request is not authenticated by the socket alone: a DNS-rebinding
+ * page also reaches 127.0.0.1. The Host header is the one field the page cannot
+ * choose, so it must be one of the loopback names, an explicitly configured
+ * bind address, or an operator-supplied allowlist.
+ */
+function trustedHostNames() {
+  const names = new Set(['127.0.0.1', 'localhost', '::1']);
+  const add = raw => {
+    const value = String(raw ?? '').trim().toLowerCase();
+    if (!value || value === '0.0.0.0' || value === '::' || value === '*') return;
+    const hostname = value.startsWith('[')
+      ? value.slice(1, value.indexOf(']'))
+      : value.split(':')[0];
+    if (hostname) names.add(hostname);
+  };
+  for (const item of String(process.env.OMNI_TRUSTED_HOSTS ?? '').split(',')) add(item);
+  add(process.env.OMNI_HTTP_BIND);
+  return names;
+}
+
+function requestHostName(req) {
+  const raw = String(req.headers?.host ?? '').trim().toLowerCase();
+  if (!raw) return null;
+  try {
+    const parsed = new URL(`http://${raw}`);
+    return parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  } catch {
+    return null;
+  }
+}
+
+function hostHeaderAllowed(req) {
+  const name = requestHostName(req);
+  return Boolean(name && trustedHostNames().has(name));
+}
+
+/**
  * Request-forgery guard for mutating routes.
  *
  * A browser sends Origin on cross-site POSTs; a local non-browser client may
- * omit it. The custom header is deliberately simple: a malicious page cannot
- * send it without a CORS preflight, which this server never grants. This blocks
- * browser CSRF but does not authenticate another process running as the same
- * user -- that requires a host-level credential this plugin does not own.
+ * omit it. An Origin is accepted only when its host is both the request Host
+ * and a trusted local host name. The old check compared Origin with Host alone,
+ * which let `Host: attacker.example` authenticate `Origin: attacker.example`
+ * after DNS rebinding. The explicit CSRF header remains necessary because a
+ * malicious page cannot send it without a CORS preflight this server never
+ * grants.
  */
 function sameOrigin(req) {
+  if (String(req.headers?.['sec-fetch-site'] ?? '').trim().toLowerCase() === 'cross-site') return false;
   const origin = String(req.headers?.origin ?? '').trim();
   if (!origin) return true;
-  const host = String(req.headers?.host ?? '').trim();
-  if (!host) return false;
-  return origin === `http://${host}` || origin === `https://${host}`;
+  if (!hostHeaderAllowed(req)) return false;
+  let parsed;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  if (parsed.username || parsed.password) return false;
+  const requestHost = String(req.headers?.host ?? '').trim().toLowerCase();
+  return parsed.host.toLowerCase() === requestHost;
 }
 
 function mutationAllowed(req) {

@@ -7,12 +7,24 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ['22.13', '24']
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # check-update-log walks every commit; a shallow clone makes that gate
+          # silently pass without checking anything.
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: install dependencies
+        run: npm ci
       - name: syntax + documentation gates
         run: npm run check
       - name: tests

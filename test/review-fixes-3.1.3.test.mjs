@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { boot, fakeReq, fakeRes } from './helpers.mjs';
+import { boot, fakeReq, fakeRes, backupPathOf, copyBackup } from './helpers.mjs';
 
 const PROJECT_A = 'proj:leak#abc123';
 
@@ -43,8 +43,8 @@ test('activeOnly export excludes superseded notes and expired facts', async () =
     kind: 'fact', scope: 'global', text: 'ActiveFact 状态 新值',
     subject: 'ActiveFact', relation: '状态', object: '新值',
   });
-  const file = path.join(app.home, 'active-only.json');
-  const exported = await app.call('memory_export', { path: file, activeOnly: true });
+  const file = backupPathOf(app, 'active-only.json');
+  const exported = await app.call('memory_export', { path: path.basename(file), activeOnly: true });
   assert.equal(exported.value.counts.notes, 1);
   assert.equal(exported.value.counts.facts, 1);
   const snapshot = JSON.parse(readFileSync(file, 'utf8'));
@@ -62,14 +62,15 @@ test('import restores cardinality, relations, aliases and persona', async () => 
   });
   await source.call('memory_link_entity', { alias: '咖啡', canonical: '咖啡因', apply: true });
   await source.call('memory_persona', { action: 'set', values: { 称呼: '老王', 其他: '手工字段' } });
-  const file = path.join(source.home, 'full-model.json');
-  const exported = await source.call('memory_export', { path: file });
+  const file = backupPathOf(source, 'full-model.json');
+  const exported = await source.call('memory_export', { path: path.basename(file) });
   assert.ok(exported.value.counts.relations >= 1);
   assert.ok(exported.value.counts.entityAliases >= 1);
   assert.ok(exported.value.counts.persona >= 2);
 
   const target = await boot();
-  const imported = await target.call('memory_import', { path: file, dryRun: false });
+  const shared = copyBackup(source, target, 'full-model.json');
+  const imported = await target.call('memory_import', { path: path.basename(shared), dryRun: false });
   assert.equal(imported.value.relations, exported.value.counts.relations);
   assert.equal(imported.value.entityAliases, exported.value.counts.entityAliases);
   assert.equal(imported.value.persona, exported.value.counts.persona);

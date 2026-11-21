@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { boot, fakeReq, fakeRes } from './helpers.mjs';
+import { boot, fakeReq, fakeRes, backupPathOf, copyBackup } from './helpers.mjs';
 
 function dbOf(home) {
   const db = new DatabaseSync(path.join(home, 'memory', 'omni.db'));
@@ -26,8 +26,8 @@ test('export writes a portable snapshot that includes tombstones by default', as
   await app.call('memory_forget', { kind: 'note', id: gone.value.id });
   app.fire('user/message', 'BackupChunk 一条转录', 1, 'session-backup');
 
-  const file = path.join(app.home, 'backup-full.json');
-  const exported = await app.call('memory_export', { path: file });
+  const file = backupPathOf(app, 'backup-full.json');
+  const exported = await app.call('memory_export', { path: path.basename(file) });
   assert.ok(existsSync(file));
   assert.equal(exported.value.counts.notes, 2, 'audit export keeps the tombstone');
   assert.equal(exported.value.counts.chunks, 1);
@@ -38,8 +38,8 @@ test('export writes a portable snapshot that includes tombstones by default', as
   assert.ok(snapshot.notes.some(note => note.id === active.value.id && note.deleted_at === null));
   assert.ok(snapshot.notes.some(note => note.id === gone.value.id && note.deleted_at !== null));
 
-  const activeOnly = path.join(app.home, 'backup-active.json');
-  const trimmed = await app.call('memory_export', { path: activeOnly, activeOnly: true });
+  const activeOnly = backupPathOf(app, 'backup-active.json');
+  const trimmed = await app.call('memory_export', { path: path.basename(activeOnly), activeOnly: true });
   assert.equal(trimmed.value.counts.notes, 1);
   const trimmedSnapshot = JSON.parse(readFileSync(activeOnly, 'utf8'));
   assert.ok(trimmedSnapshot.notes.every(note => note.deleted_at === null));
@@ -66,11 +66,12 @@ test('import is a dry run by default and dedupes on a second pass', async () => 
     kind: 'fact', scope: 'global', text: 'ImportEntity 状态 旧值', subject: 'ImportEntity', relation: '状态', object: '旧值',
   });
   source.fire('user/message', 'ImportChunk 一条要迁移的转录', 1, 'session-import');
-  const file = path.join(source.home, 'backup.json');
-  await source.call('memory_export', { path: file });
+  const file = backupPathOf(source, 'backup.json');
+  await source.call('memory_export', { path: path.basename(file) });
 
   const target = await boot();
-  const dry = await target.call('memory_import', { path: file });
+  const shared = copyBackup(source, target, 'backup.json');
+  const dry = await target.call('memory_import', { path: path.basename(shared) });
   assert.equal(dry.value.dryRun, true);
   assert.equal(dry.value.notes, 1);
   assert.equal(dry.value.facts, 1);
@@ -80,14 +81,14 @@ test('import is a dry run by default and dedupes on a second pass', async () => 
   assert.equal(dbBefore.prepare('SELECT COUNT(*) AS n FROM notes').get().n, 0);
   dbBefore.close();
 
-  const applied = await target.call('memory_import', { path: file, dryRun: false });
+  const applied = await target.call('memory_import', { path: path.basename(shared), dryRun: false });
   assert.equal(applied.value.dryRun, false);
   assert.equal(applied.value.notes, 1);
 
   const hits = await target.call('memory_search', { query: 'ImportNote', scope: 'all' });
   assert.ok(hits.value.hits.some(hit => hit.kind === 'note' && hit.text.includes('ImportNote')));
 
-  const again = await target.call('memory_import', { path: file, dryRun: false });
+  const again = await target.call('memory_import', { path: path.basename(shared), dryRun: false });
   assert.equal(again.value.skipped >= 2, true, 'a second import must skip existing rows');
 });
 
@@ -98,17 +99,18 @@ test('export and import keep pending candidates', async () => {
     role: 'user',
     scope: 'global',
   });
-  const file = path.join(source.home, 'candidates.json');
-  const exported = await source.call('memory_export', { path: file });
+  const file = backupPathOf(source, 'candidates.json');
+  const exported = await source.call('memory_export', { path: path.basename(file) });
   assert.equal(exported.value.counts.candidates, 1);
   const snapshot = JSON.parse(readFileSync(file, 'utf8'));
   assert.equal(snapshot.candidates.length, 1);
 
   const target = await boot();
-  const dry = await target.call('memory_import', { path: file });
+  const shared = copyBackup(source, target, 'candidates.json');
+  const dry = await target.call('memory_import', { path: path.basename(shared) });
   assert.equal(dry.value.candidates, 1);
 
-  await target.call('memory_import', { path: file, dryRun: false });
+  await target.call('memory_import', { path: path.basename(shared), dryRun: false });
   const listed = await target.call('memory_candidate', { action: 'list', status: 'all', scope: 'all' });
   assert.ok(listed.value.candidates.some(candidate => candidate.text.includes('备份候选')));
 
@@ -118,7 +120,7 @@ test('export and import keep pending candidates', async () => {
   });
   assert.equal(accepted.value.status, 'accepted');
 
-  await target.call('memory_import', { path: file, dryRun: false });
+  await target.call('memory_import', { path: path.basename(shared), dryRun: false });
   const after = await target.call('memory_candidate', { action: 'list', status: 'all', scope: 'all' });
   assert.equal(
     after.value.candidates.filter(candidate => candidate.status === 'pending' && candidate.text.includes('备份候选')).length,
@@ -135,11 +137,12 @@ test('import remaps superseded_by pointers instead of keeping stale ids', async 
   db.prepare('UPDATE notes SET superseded_by = ? WHERE id = ?').run(newNote.value.id, oldNote.value.id);
   db.close();
 
-  const file = path.join(source.home, 'lineage.json');
-  await source.call('memory_export', { path: file });
+  const file = backupPathOf(source, 'lineage.json');
+  await source.call('memory_export', { path: path.basename(file) });
 
   const target = await boot();
-  await target.call('memory_import', { path: file, dryRun: false });
+  const shared = copyBackup(source, target, 'lineage.json');
+  await target.call('memory_import', { path: path.basename(shared), dryRun: false });
   const targetDb = dbOf(target.home);
   const imported = targetDb.prepare("SELECT id, text, superseded_by FROM notes ORDER BY id").all();
   targetDb.close();

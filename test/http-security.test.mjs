@@ -236,6 +236,37 @@ test('CSRF/Origin variants: only same-origin plus x-omni-csrf mutates', async ()
   assert.equal((await search(marker)).length, 0, '遗忘后不应再被搜索召回');
 });
 
+test('forged Host cannot authenticate a matching Origin', async () => {
+  const marker = `dns-rebind-${Date.now()}`;
+  const id = await writeNote(marker);
+
+  const forge = await rawRequest({
+    target: `/omni-memory/forget?kind=note&id=${id}`,
+    method: 'POST',
+    headers: {
+      host: 'attacker.example',
+      origin: 'http://attacker.example',
+      'content-type': 'application/json',
+      'x-omni-csrf': '1',
+    },
+    body: '{}',
+  });
+  assert.equal(forge.status, 403, 'a non-loopback Host must not authenticate its own Origin');
+  assert.equal((await search(marker)).length, 1, 'the forged request must not change data');
+
+  const mcp = await rawRequest({
+    target: '/mcp',
+    method: 'POST',
+    headers: {
+      host: 'attacker.example',
+      origin: 'http://attacker.example',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/list' }),
+  });
+  assert.equal(mcp.status, 403, 'MCP must not accept a forged Host either');
+});
+
 test('malformed and oversized bodies are contained; server stays healthy', async (t) => {
   // 畸形 JSON：/mcp 明确返回 -32700 的受控错误。
   const bad = await fetch(`${base}/mcp`, {

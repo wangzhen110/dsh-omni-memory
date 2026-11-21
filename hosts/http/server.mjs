@@ -52,20 +52,58 @@ function isLoopback(req) {
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
 }
 
+/** Host names this process is willing to answer for (see index.js sameOrigin). */
+function trustedHostNames() {
+  const names = new Set(['127.0.0.1', 'localhost', '::1']);
+  const add = raw => {
+    const value = String(raw ?? '').trim().toLowerCase();
+    if (!value || value === '0.0.0.0' || value === '::' || value === '*') return;
+    const hostname = value.startsWith('[')
+      ? value.slice(1, value.indexOf(']'))
+      : value.split(':')[0];
+    if (hostname) names.add(hostname);
+  };
+  for (const item of String(process.env.OMNI_TRUSTED_HOSTS ?? '').split(',')) add(item);
+  add(process.env.OMNI_HTTP_BIND);
+  return names;
+}
+
+function requestHostName(req) {
+  const raw = String(req.headers?.host ?? '').trim().toLowerCase();
+  if (!raw) return null;
+  try {
+    return new URL(`http://${raw}`).hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  } catch {
+    return null;
+  }
+}
+
+function originAllowed(req) {
+  if (String(req.headers?.['sec-fetch-site'] ?? '').trim().toLowerCase() === 'cross-site') return false;
+  const origin = String(req.headers?.origin ?? '').trim();
+  if (!origin) return true;
+  const name = requestHostName(req);
+  if (!name || !trustedHostNames().has(name)) return false;
+  let parsed;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  if (parsed.username || parsed.password) return false;
+  return parsed.host.toLowerCase() === String(req.headers?.host ?? '').trim().toLowerCase();
+}
+
 /**
  * Mutating MCP requests need the same protection as REST writes.
  *
  * A browser cannot send `application/json` cross-origin without a preflight,
- * and a form post can only send text/plain, so requiring JSON (or the explicit
- * CSRF header used by scripts) blocks the drive-by case while keeping ordinary
- * MCP clients working.
+ * and a form post can only send text/plain. Host and Origin are checked first;
+ * an attacker who controls a DNS name cannot make its Host header trusted.
  */
 function mcpMutationAllowed(req) {
-  const origin = String(req.headers?.origin ?? '').trim();
-  if (origin) {
-    const host = String(req.headers?.host ?? '').trim();
-    if (!host || (origin !== `http://${host}` && origin !== `https://${host}`)) return false;
-  }
+  if (!originAllowed(req)) return false;
   if (String(req.headers?.['x-omni-csrf'] ?? '') === '1') return true;
   const type = String(req.headers?.['content-type'] ?? '').split(';')[0].trim().toLowerCase();
   return type === 'application/json';

@@ -1,8 +1,27 @@
-import { mkdtempSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 let counter = 0;
+
+/** The only directory memory_export/memory_import accept. */
+export function backupDirOf(app) {
+  return path.join(app.home, 'memory', 'backups');
+}
+
+/** Return a valid in-sandbox backup path, creating the directory if needed. */
+export function backupPathOf(app, name) {
+  const dir = backupDirOf(app);
+  mkdirSync(dir, { recursive: true });
+  return path.join(dir, name);
+}
+
+/** Copy an exported backup between two throwaway stores (the test equivalent of a user copy). */
+export function copyBackup(sourceApp, targetApp, name) {
+  const target = backupPathOf(targetApp, name);
+  copyFileSync(backupPathOf(sourceApp, name), target);
+  return target;
+}
 
 /**
  * Boot the plugin against a throwaway DSH_HOME and return stubs for every host
@@ -11,7 +30,13 @@ let counter = 0;
  */
 export async function boot(options = {}) {
   const home = options.home ?? mkdtempSync(path.join(tmpdir(), 'omni-test-'));
+  // index.js prefers OMNI_HOME over DSH_HOME. Setting only DSH_HOME let a
+  // developer who exported OMNI_HOME for their real adapter silently run these
+  // tests against production memory. Always pin both names to the temp home.
+  process.env.OMNI_HOME = home;
   process.env.DSH_HOME = home;
+  delete process.env.OMNI_BACKUP_DIR;
+  delete process.env.OMNI_TRUSTED_HOSTS;
   // The bundled model costs ~216MB RSS per process. Tests opt in with
   // boot({ semantic: true }) instead of paying that cost on every case.
   if (options.semantic === true) delete process.env.OMNI_DISABLE_SEMANTIC;

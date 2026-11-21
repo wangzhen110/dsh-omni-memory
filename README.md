@@ -7,7 +7,7 @@
 > **源码/架构**后做商业替代、竞品或商业服务；且**必须署名作者**。
 > 商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-349%2F349-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-356%2F356-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-Personal%20Use%201.1-lightgrey)](LICENSE)
 
 ---
@@ -59,7 +59,7 @@
 
 ```bash
 cd /path/to/omni-memory
-npm test          # 349 个用例
+npm test          # 356 个用例
 npm run check     # 语法、文档计数与模型资产完整性校验
 ```
 
@@ -155,13 +155,14 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 ## 数据与隐私
 
 - 数据文件：`$DSH_HOME/memory/omni.db`（SQLite WAL，单文件，备份即复制；**默认明文落盘，未加密**）
-- 所有 HTTP 路由仅绑定 loopback，非本机请求返回 403；写操作只接受 POST，并校验 `Origin` 与 `x-omni-csrf` 头
+- 备份交换目录：`$DSH_HOME/memory/backups/`（`memory_export` / `memory_import` 只接受该目录内的单个 `.json` 文件名；可用 `OMNI_BACKUP_DIR` 改到受控位置）
+- 所有 HTTP 路由仅绑定 loopback，非本机请求返回 403；写操作只接受 POST，`Host` 必须是本机回环名、绑定地址或 `OMNI_TRUSTED_HOSTS`，`Origin` 必须同主机同端口，并校验 `x-omni-csrf` 头；`Sec-Fetch-Site: cross-site` 直接拒绝
 - 不主动上传任何内容；只有显式配置 `OMNI_EMBED_URL`（或远程 `OMNI_EMBED_PROVIDER`）时，文本才会发送到该嵌入端点；只有显式配置 `OMNI_RERANK_*` 时，查询与候选记忆正文才会发送到该重排端点。敏感数据建议用自建端点；默认 hashed 向量 + 无 rerank 完全不出机。`OMNI_SCOPE_JUDGE` 默认 `off`，不会把写入正文发给模型
 - persona 自动刷新默认只用离线规则；只有显式 `useModel: true` 或 `OMNI_PERSONA_MODEL=auto/on` 才调用宿主模型，且证据只取全局层，不读取项目内容
 
 ## 测试与指标
 
-- 自动化用例：**349 / 349 通过**
+- 自动化用例：**356 / 356 通过**
 - 检索延迟（本机复核，Node 22.23.2；标准 bench 已改为 global scope 并断言真实命中）：10,000 行 p95 ≈ **2.4ms**；100,000 行 ≈ 2.4ms；1,000,000 行 ≈ 6.0ms；1M + 5 万向量 + 100 万 bigram ≈ **116.8ms**（两段式有界检索，见 ADR-020）
 - 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 旧 hashed 混合 0.927 → 内置本地语义单独 **0.979**；语义冷加载约 208ms，单查询约 9.5ms（20 次 191ms，本机 CPU）
 

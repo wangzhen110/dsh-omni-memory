@@ -86,7 +86,7 @@ test('prop: forgotten note is no longer recallable', async () => {
   await fc.assert(
     fc.asyncProperty(fc.uuid(), prose, async (id, body) => {
       const key = `prop-tombstone-${id}`;
-      const scope = `proj:tomb-${id}`;
+      const scope = 'global';
       const { value: written } = await app.call('memory_write', {
         kind: 'note', text: `待遗忘 ${id} ${body}`, problemKey: key, scope,
       });
