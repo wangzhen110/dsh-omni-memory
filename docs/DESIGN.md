@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | 3.9.3 |
-| 插件版本 | 3.9.3 |
+| 文档版本 | 3.9.4 |
+| 插件版本 | 3.9.4 |
 | 状态 | 已评审（本文为开发与验收的**唯一依据**） |
 | 目标平台 | DSH 0.2.2-rc.3 原生插件（Desktop，Windows 11，Node 22.23.2，`engines >=22.13`）；MCP / HTTP / OpenAPI / CLI 宿主通用 |
 | 最后更新 | 2026-11-21 |
@@ -79,6 +79,7 @@
 | FR-41 | 零配置语义索引 | 默认开启、离线；模型随包；新写入进入语义队列；旧库后台回填；`semantic_vectors` 按模型签名隔离 | ✅ 已实现（schema v14；`memory_reindex semantic` 可强制回填） |
 | FR-39 | 经验巩固 | `memory_consolidate` 按精确 `problemKey` + 精确 scope 合并；默认 dry-run；应用时写来源链摘要、旧行只 supersede、反馈计数汇总 | ✅ 已实现 |
 | FR-40 | 分层画像与重排 | 画像分 `## 全局` / `## 当前项目`；可选 cross-encoder rerank（未配置端点零延迟，失败回落融合排序）；本地/远程 embedding 预设 | ✅ 已实现 |
+| FR-42 | 跨平台项目键稳定 | Windows/macOS 同一路径不同大小写生成同一项目键；旧键首次打开时按路径迁移到 canonical key，迁移幂等且不误合并同名目录 | ✅ 已实现（schema v15，ADR-031） |
 
 ### 1.2 非功能需求
 
@@ -93,9 +94,9 @@
 | NFR-07 | 失败隔离 | 任一子系统（FTS/路由/注入）失效不得导致会话不可用 | 满足（全部 try/catch + 可选降级） |
 | NFR-08 | 隐私 | 所有数据仅存本机 `$DSH_HOME/memory/omni.db`；HTTP 仅 loopback，且浏览器跨站写请求被 Origin 校验拦截；默认不上传 | 部分满足：数据库未加密，loopback HTTP 仍依赖本机进程边界，未做进程级鉴权（ADR-017）。内置本地语义在进程内推理，不联网；显式配置 `OMNI_EMBED_URL`/远程 `OMNI_EMBED_PROVIDER` 会外发嵌入文本，配置 `OMNI_RERANK_*` 会外发查询与候选正文，均需用户自行选择可信端点 |
 | NFR-09 | 可卸载 | 卸载插件后不残留运行中的监听；数据文件保留由用户决定 | 满足 |
-| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 285/285（100%） |
+| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 288/288（100%） |
 | NFR-11 | 界面本地化 | 中英词典注册，切换语言无需重载插件 | 已实现（词典 + 订阅重渲染） |
-| NFR-12 | 多进程并发 | 同机 N 个宿主进程共用一个库，同时读写不丢数据、不报锁错 | 285/285 含 6 进程并发用例；写入等待上限 5s（ADR-028） |
+| NFR-12 | 多进程并发 | 同机 N 个宿主进程共用一个库，同时读写不丢数据、不报锁错 | 288/288 含 6 进程并发用例；写入等待上限 5s（ADR-028） |
 
 ### 1.3 约束
 
@@ -134,6 +135,7 @@
 | ADR-028 | 多进程并发 | busy_timeout + BEGIN IMMEDIATE + 事务内去重 + meta 租约 | [ADR/028-multi-process-concurrency.md](ADR/028-multi-process-concurrency.md) |
 | ADR-029 | 零配置本地语义 | BGE-small-zh int8 + ONNX Runtime WASM 随包；独立 `semantic_vectors`；后台回填 | [ADR/029-bundled-semantic.md](ADR/029-bundled-semantic.md) |
 | ADR-030 | 语义索引生命周期 | 版本化待处理项、遗忘/替代 GC、队列丢弃计数、失败退避、短租约续期与强制重算 | [ADR/030-semantic-lifecycle.md](ADR/030-semantic-lifecycle.md) |
+| ADR-031 | 跨平台项目键与旧 scope 迁移 | Windows/macOS 路径大小写归一；v15 `scope_aliases` 只迁移可反推旧键；chunk 冲突墓碑化 | [ADR/031-project-scope-alias.md](ADR/031-project-scope-alias.md) |
 
 ### 2.1 参考实现对照（可移植部分）
 
@@ -217,7 +219,7 @@ chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 ### 4.3 迁移策略
 
 `meta.schema_version` 记录整数版本；启动时按序执行 `MIGRATIONS[n]`。
-**当前版本 14**。v7 移除全局 `chunks.hash` 唯一索引，改为按 `(hash, scope)` 的部分唯一索引；为 `edges` 补 `scope`、为 `facts` 补 `recorded_at`；新增 `bigrams` 索引表；并回填旧数据的 scope 与 bigram。v11 为 notes 增加故障经验字段，旧行保持为空/NULL，按 unverified 读取。v12 为 notes/facts 增加召回反馈计数（`recall_count`、`last_recall_at`、`useful_count`、`misleading_count`），旧行从 0 起算。v13 新增 `note_candidates`（会话自动捕获的待审候选），带 `status/scope/hash` 索引，旧库补表不丢数据。v14 新增 `semantic_vectors`（按 `(kind, owner_id, model)` 隔离本地语义向量），旧库补表，语义索引由后台回填。新增列/索引必须写迁移，禁止直接改 `CREATE TABLE` 语句（新库与老库必须收敛到同一结构）。
+**当前版本 15**。v7 移除全局 `chunks.hash` 唯一索引，改为按 `(hash, scope)` 的部分唯一索引；为 `edges` 补 `scope`、为 `facts` 补 `recorded_at`；新增 `bigrams` 索引表；并回填旧数据的 scope 与 bigram。v11 为 notes 增加故障经验字段，旧行保持为空/NULL，按 unverified 读取。v12 为 notes/facts 增加召回反馈计数（`recall_count`、`last_recall_at`、`useful_count`、`misleading_count`），旧行从 0 起算。v13 新增 `note_candidates`（会话自动捕获的待审候选），带 `status/scope/hash` 索引，旧库补表不丢数据。v14 新增 `semantic_vectors`（按 `(kind, owner_id, model)` 隔离本地语义向量），旧库补表，语义索引由后台回填。v15 新增 `scope_aliases`，用于跨平台路径大小写归一时记录旧项目键到 canonical 键的映射；迁移由 `ensureProjectAlias` 在打开工作区时执行。新增列/索引必须写迁移，禁止直接改 `CREATE TABLE` 语句（新库与老库必须收敛到同一结构）。
 
 | 版本 | 变更 | 迁移动作 |
 |---|---|---|
@@ -235,6 +237,7 @@ chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 | 12 | 召回质量反馈 | `notes/facts` 增加 `recall_count / last_recall_at / useful_count / misleading_count`；旧行默认 0 |
 | 13 | 会话候选 | `note_candidates(kind, text, scope, status, hash, ...)`；pending 候选不参与正式检索 |
 | 14 | 本地语义向量 | `semantic_vectors(kind, owner_id, model, dim, vec)`；`semantic_vectors_model` 索引；不触碰旧 `vectors` |
+| 15 | 项目 scope alias | `scope_aliases(alias PRIMARY KEY, canonical, created_at)`；`scope_aliases_canonical` 索引；打开路径时迁移旧键 |
 
 未带版本的旧库按 v1 处理，自动补齐到当前版本；旧行不受影响（迁移只加列、不删数据）。
 
@@ -557,7 +560,7 @@ score = 0.6 × 文本分 + 0.2 × 权重分 + 0.2 × 时效分 + 经验状态分
 | **M3（已完成 v0.9.0）** | 图游走（按边召回）+ 冲突标记 | 96 用例 100%；图测试覆盖跳数/开关/作用域 |
 | **M4（已完成 v1.0.0）** | 做梦校验（覆盖度 + 特征词缺失，dry-run/apply） | 101 用例 100%；「错记 Docker」样例可复现纠正 |
 | **M5（已完成 v1.1.0）** | 面板分页 + 校验状态展示 + 中英 i18n + 转录增长治理 | 107 用例 100%；D-10/11 关闭 |
-| **M6（已完成 v3.9.2）** | 内置 BGE-small-zh int8 + ONNX Runtime WASM；四路 RRF；零配置离线语义 | 285 用例 100%；黄金集 MRR 0.979；冷加载 208ms / RSS 216MB |
+| **M6（已完成 v3.9.2）** | 内置 BGE-small-zh int8 + ONNX Runtime WASM；四路 RRF；零配置离线语义 | 288 用例 100%；黄金集 MRR 0.979；冷加载 208ms / RSS 216MB |
 
 ---
 

@@ -24,7 +24,7 @@ test('a v7 database upgrades to v11 with the cardinality column and relations ta
   migrated.close();
   assert.ok(columns.includes('cardinality'), 'cardinality column added');
   assert.ok(relations, 'relations registry created');
-  assert.equal(version, '14');
+  assert.equal(version, String(again.mod.SCHEMA_VERSION));
   assert.ok(again);
 });
 

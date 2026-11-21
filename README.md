@@ -7,12 +7,12 @@
 > **源码/架构**后做商业替代、竞品或商业服务；且**必须署名作者**。
 > 商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-285%2F285-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-288%2F288-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-Personal%20Use%201.1-lightgrey)](LICENSE)
 
 ---
 
-**完整机理与接口参考**：[`docs/REFERENCE.md`](docs/REFERENCE.md) —— schema、写入与检索机理、23 个工具、20 条路由、MCP 协议面、CLI、环境变量、AI 调用剧本。执行 `npm run memory:sync` 可把整本手册拆成笔记写进记忆库，之后用 `memory_search` 就能直接检索到。
+**完整机理与接口参考**：[`docs/REFERENCE.md`](docs/REFERENCE.md) —— schema、写入与检索机理、25 个 MCP 工具（23 个内核工具 + `memory_context` / `memory_rules` 适配工具）、20 条路由、MCP 协议面、CLI、环境变量、AI 调用剧本。执行 `npm run memory:sync` 可把整本手册拆成笔记写进记忆库，之后用 `memory_search` 就能直接检索到。
 
 ## 它解决什么问题
 
@@ -51,7 +51,7 @@
 
 在 DSH 插件市场搜索「全息记忆 / Omni Memory」安装，重启或刷新后左栏出现「全息记忆」入口。
 
-**语义检索开箱即用**：安装包自带 `BAAI/bge-small-zh-v1.5` int8 ONNX 模型（约 24MB）与 ONNX Runtime WASM（约 15MB），进程内 CPU 推理、默认离线；不需要安装 Ollama、LM Studio，不需要拉模型，不需要 API key。首次打开库时后台回填，新写入笔记在下一批立即进入语义索引。
+**语义检索开箱即用**：安装包自带 `BAAI/bge-small-zh-v1.5` int8 ONNX 模型（22.8 MiB）与 ONNX Runtime WASM（14.2 MiB），进程内 CPU 推理、默认离线；不需要安装 Ollama、LM Studio，不需要拉模型，不需要 API key。首次打开库时后台回填，新写入笔记在下一批立即进入语义索引。
 
 > 项目已由 `dsh-omni-memory` 更名 `omni-memory`。旧安装请移除 `@local/dsh-memory`，再安装 `@local/omni-memory`；两者共用同一份 `omni.db`，数据不受影响。
 
@@ -59,7 +59,7 @@
 
 ```bash
 cd /path/to/omni-memory
-npm test          # 285 个用例
+npm test          # 288 个用例
 npm run check     # 语法、文档计数与模型资产完整性校验
 ```
 
@@ -161,7 +161,7 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 
 ## 测试与指标
 
-- 自动化用例：**285 / 285 通过**
+- 自动化用例：**288 / 288 通过**
 - 检索延迟（本机复核，Node 22.23.2；标准 bench 已改为 global scope 并断言真实命中）：10,000 行 p95 ≈ **2.4ms**；100,000 行 ≈ 2.4ms；1,000,000 行 ≈ 6.0ms；1M + 5 万向量 + 100 万 bigram ≈ **116.8ms**（两段式有界检索，见 ADR-020）
 - 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 旧 hashed 混合 0.927 → 内置本地语义单独 **0.979**；语义冷加载约 208ms，单查询约 9.5ms（20 次 191ms，本机 CPU）
 
@@ -180,7 +180,7 @@ npm run bench:golden   # 黄金集
 ## 文档
 
 - [设计规格](docs/DESIGN.md)（需求、架构、数据模型、契约、失败模式、追溯矩阵）
-- [架构决策记录](docs/ADR)（30 份）
+- [架构决策记录](docs/ADR)（31 份）
 - [威胁模型](docs/THREAT-MODEL.md)（信任边界、残余风险、新增路由检查清单）
 - 备份/恢复设计见 [ADR-019](docs/ADR/019-backup-restore.md)
 - 1M 行检索改造见 [ADR-020](docs/ADR/020-bounded-retrieval.md)
@@ -197,7 +197,8 @@ npm run bench:golden   # 黄金集
 - [3.9.1 复核问题修复报告](docs/COMPLETION-3.9.1-2026-11-21.md)
 - [3.9.2 零配置语义整改报告](docs/COMPLETION-3.9.2-2026-11-21.md)
 - [3.9.3 语义索引治理报告](docs/COMPLETION-3.9.3-2026-11-21.md)
-- [语义索引生命周期决策](docs/ADR/030-semantic-lifecycle.md)
+- [3.9.4 跨平台项目键与 scope 迁移报告](docs/COMPLETION-3.9.4-2026-11-21.md)
+- [项目 scope alias 决策](docs/ADR/031-project-scope-alias.md)
 - [架构图](docs/architecture.png)
 
 ## 许可证

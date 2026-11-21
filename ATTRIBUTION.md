@@ -106,6 +106,7 @@ https://github.com/wangzhen110/omni-memory/issues
 | 组件 | 用途 | 许可证 | 许可文件 |
 |---|---|---|---|
 | `BAAI/bge-small-zh-v1.5` int8 ONNX | 本地语义嵌入模型 | MIT | `models/bge-small-zh-v1.5/MODEL-CARD.md` |
+| `Xenova/bge-small-zh-v1.5` ONNX export | 模型 ONNX 导出与量化来源 | MIT | https://huggingface.co/Xenova/bge-small-zh-v1.5 |
 | ONNX Runtime Web | WASM 推理运行时 | MIT | `lib/vendor/ONNXRUNTIME-LICENSE.txt` |
 | HuggingFace Tokenizers (WASM) | 分词 | Apache-2.0 | `lib/vendor/TOKENIZERS-LICENSE.txt` |
 

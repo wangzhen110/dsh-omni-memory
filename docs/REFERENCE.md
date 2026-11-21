@@ -1,6 +1,6 @@
 # 全息记忆 · 机理与接口参考
 
-> 版本 3.9.3 · 生成日期 2026-11-21 · 依据源码与真实 schema v14 核对
+> 版本 3.9.4 · 生成日期 2026-11-21 · 依据源码与真实 schema v15 核对
 >
 > **给 AI 的用法**：这份文档按「先原理、后接口、最后剧本」组织。第一次接触时读第 1、2、9 章即可开工；要精确调用某个工具，直接跳到第 9 章对应小节。若这份文档已同步进记忆库（`omni memory:sync`），也可以先用 `memory_search` 搜"全息记忆 接口"定位。
 
@@ -85,9 +85,11 @@ memory_write(kind, text, scope?)
 proj:<目录名（截 40 字符，非法字符转 -）>#<路径 FNV-1a 哈希前 6 位>
 ```
 
-例：`D:\xiangmu\全息记忆` → `proj:全息记忆#deff23`。
+Windows 与 macOS 在哈希前把规范化路径转小写，Linux 保留大小写；因此同一工作区在这些平台上不因大小写分裂。
 
-同名目录靠哈希区分，所以两个不同路径的同名项目不会串层。宿主通过"工作目录"推导，DSH 用 `session.header.cwd`，MCP/CLI/HTTP 用 `OMNI_PROJECT_DIR`，落库时同时写入 `meta.agent_project:<sessionId>`，重启后仍能恢复。
+例：`D:\xiangmu\全息记忆` → 3.9.4 起为 `proj:全息记忆#30534c`。3.9.3 及以前的旧键 `proj:全息记忆#deff23` 会在首次打开该路径时通过 schema v15 的 `scope_aliases` 迁移到 canonical 键；迁移只针对由完整路径可确定的键，不按目录名猜测合并。
+
+同名目录靠哈希区分，所以两个不同路径的同名项目不会串层。宿主通过"工作目录"推导，DSH 用 `session.header.cwd`，MCP/CLI/HTTP 用 `OMNI_PROJECT_DIR`，落库时同时写入 `meta.agent_project:<sessionId>` 与 `meta.project_path:<scope>`，重启后仍能恢复。
 
 ### 2.4 事实的冲突与时效
 
@@ -167,9 +169,9 @@ DSH 外（MCP 等）：没有注入点，改为 `memory_context` 显式调用，
 
 ---
 
-## 3. 数据模型（schema v14，实测）
+## 3. 数据模型（schema v15，实测）
 
-共 12 张业务表（不含 FTS 影子表）。字段按真实 `PRAGMA table_info` 导出。
+共 13 张业务表（不含 FTS 影子表）。字段按真实 `PRAGMA table_info` 导出。
 
 ### 3.1 meta
 `key`(pk), `value`
@@ -181,6 +183,8 @@ DSH 外（MCP 等）：没有注入点，改为 `memory_context` 显式调用，
 
 ### 3.3 notes（结论）
 `id`(pk), `ts`, `scope`, `text`, `importance`, `source`, `revision`, `superseded_by`, `contested`, `deleted_at`, `problem_key`, `solution_status`, `solution_verified_at`, `reuse_count`, `last_used_at`, `verified_at`, `verification`, `evidence`
+
+`scope` 为 NOT NULL，因此项目查询不把 NULL 当 global；`facts` / `chunks` / `edges` 的历史列允许 NULL，只有这些旧行按 `global` 兼容可见。这个口径由 `scopeClause(..., nulls)` 显式表达，不靠查询条件隐式决定。
 
 ### 3.4 facts（事实）
 `id`(pk), `subject`, `relation`, `object`, `text`, `valid_from`, `valid_to`, `recorded_at`, `confidence`, `source`, `contested`, `deleted_at`, `scope`, `cardinality`
@@ -211,6 +215,9 @@ DSH 外（MCP 等）：没有注入点，改为 `memory_context` 显式调用，
 
 ### 3.12 FTS 影子表
 `notes_fts`、`facts_fts`、`chunks_fts` 及 SQLite 内部表。由触发器/回填维护，不要手写。
+
+### 3.13 scope_aliases（项目键别名）
+`alias`(pk), `canonical`, `created_at`，索引 `scope_aliases_canonical(canonical)`。记录旧的项目 scope 键到 canonical 键的映射；只用于跨平台路径大小写归一与显式运维迁移，不改变笔记的可见性规则。`canonical` 本身仍遵循 `proj:<basename>#<hash>` 格式。
 
 ---
 
@@ -277,7 +284,9 @@ MCP 无法写客户端系统提示，所以同一份 `RULES_TEXT` 铺五条路�
 
 ---
 
-## 5. 工具参考（23 个）
+## 5. 工具参考（23 个内核工具）
+
+MCP / HTTP 适配器在启动时会额外注册 `memory_context` 与 `memory_rules`；因此真实 `tools/list` 返回 **25 个 MCP 工具**，而插件内核本身仍是 23 个 `memory_*` 工具。
 
 所有工具都是"失败即报错、成功即返回值"；MCP 侧错误统一转成 `isError: true` 的文本块。
 
@@ -367,7 +376,7 @@ MCP 无法写客户端系统提示，所以同一份 `RULES_TEXT` 铺五条路�
 参数：`path` 必填、`dryRun` boolean（默认 true）。按内容去重合并。
 
 ### 5.19 memory_reindex
-参数：`limit` number（默认 200，最大 1000）、`bigrams` boolean、`vectors` boolean、`semantic` boolean、`semanticForce` boolean。换嵌入模型、恢复旧库或模型升级后使用。`semantic=true` 只跑本地语义回填（`backend:"local"`，返回 `{processed,pending,backfillDone,forced,...}`）；`semanticForce=true` 需与 `semantic=true` 同用，先删除当前模型签名再按源文本重建，用于修复陈旧向量；`semantic=true, vectors=true` 同时跑两套向量；`bigrams=true` 单独触发中文二元索引全量重建。
+参数：`limit` number（默认 200，最大 1000）、`bigrams` boolean、`vectors` boolean、`semantic` boolean、`semanticForce` boolean。换嵌入模型、恢复旧库或模型升级后使用。`semantic=true` 只跑本地语义回填（`backend:"local"`，返回 `{processed,pending,backfillDone,forced,...}`）；`semanticForce=true` 需与 `semantic=true` 同用，先删除当前模型签名再按源文本重建，用于修复陈旧向量；`semantic=true, vectors=true` 同时跑两套向量。顶层 `processed` 只表示**当前向量后端实际写入的行数**，语义回填数量另见 `semantic.processed`；两套同时运行时不把两个口径相加，避免把“条目”和“向量行”混成同一个数字。`bigrams=true` 单独触发中文二元索引全量重建。
 
 ### 5.20 memory_feedback
 参数：`kind`（`note|fact`）、`id`、`rating`（`useful|misleading`），均必填。写入召回质量投票；`memory_search` 命中项返回 `usefulCount`、`misleadingCount`、`feedbackCount`、`lastFeedbackAt`、`quality`，排序使用 Bayesian 平滑后的反馈分。
@@ -513,7 +522,7 @@ mcp      以 stdio 启动 MCP（等同 hosts/mcp/bin.mjs）
 - **HTTP 无鉴权**：靠回环 + 同源校验；跨机部署前必须自己加反代与鉴权。
 - **Node 22 上 `node:sqlite` 是实验特性**：可用，但会有一条已被入口屏蔽的警告；`engines` 声明 `>=22.13`，本机实测 Node 22.23.2。
 - **core 未拆分**：`index.js` 仍是单体，新增宿主要走 `hosts/shared/boot.mjs`，不要再写第二套内核。
-- **默认语义是本地模型**：`BAAI/bge-small-zh-v1.5` int8，随包 39MB，零配置离线；只有想换远程嵌入时才配 `OMNI_EMBED_URL` 并 `memory_reindex(vectors=true)`。本地语义用 `memory_reindex(semantic=true)`。
+- **默认语义是本地模型**：`BAAI/bge-small-zh-v1.5` int8，随包 37.5 MiB，零配置离线；只有想换远程嵌入时才配 `OMNI_EMBED_URL` 并 `memory_reindex(vectors=true)`。本地语义用 `memory_reindex(semantic=true)`。
 
 ---
 

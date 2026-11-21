@@ -2,6 +2,26 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.9.4] — 2026-11-21
+
+### 修复 · 跨平台项目键与旧 scope 迁移（复核 P1）
+- **大小写归一**：`projectKeyFromCwd(cwd, platform)` 在 Windows/macOS 生成哈希前将规范化路径转小写，Linux 保留大小写；同一工作区 `D:\Repo` / `d:\repo` 不再分裂成两个项目层。
+- **旧键迁移**：schema v15 新增 `scope_aliases(alias, canonical, created_at)`；`legacyProjectKeyFromCwd` 保留旧算法，`ensureProjectAlias` 在 `openStore(process.cwd())`、`attachSession`、`scopeForSession` 把当前路径可推导的旧键迁移到 canonical 键，并同步 `agent_project:*` 与 `project_path:<scope>`。
+- **迁移安全**：只迁移能由完整路径确定的旧键，不按 basename 猜测；`chunks` 的 `(hash, scope)` 活跃唯一索引冲突时，目标行保留，源行 tombstone，不硬删、不覆盖；迁移幂等并由 `scope_aliases` 留痕。
+- **真实库副本验证**：`proj:全息记忆#deff23` → `proj:全息记忆#30534c`，40 条 notes、12 条 facts、12 条 edges 保留；`--scope project` 重新命中，重开无重复迁移。
+
+### 修复 · P3 收尾
+- **资产完整性**：`scripts/check-semantic-assets.mjs` 对 11 个模型/WASM/许可证文件同时校验字节数与 SHA-256，防止同长度替换。
+- **体积口径**：检查输出改用 `MiB`（11 files, 37.5 MiB），发布文档标注 MB/MiB 口径。
+- **署名**：`ATTRIBUTION.md` 补充 `Xenova/bge-small-zh-v1.5` ONNX 导出来源。
+- **scope NULL 口径**：明确 `notes` 的 `scope` NOT NULL 不包含 NULL；`facts`/`chunks`/`edges` 的 legacy NULL 继续按 global 可见，仅用于兼容旧库，不改变现有查询。
+- **reindex 计数**：`memory_reindex` 的顶层 `processed` 明确定义为当前向量后端的行数，语义回填数量始终在 `semantic.processed` 子对象中；不把两种计数混成一个数字。
+- **文档计数**：按真实 MCP `tools/list` 修正为 25 个工具（23 个内核 + 2 个适配器），同步修正 HTTP 适配器 README 的 20 条路由与 Node 版本声明。
+
+### 测试与发布
+- 新增 `test/scope-alias.test.mjs`：Windows/macOS 同键、Linux 保持大小写、旧 scope 迁移与重开幂等、chunk 冲突 tombstone。
+- 完整 `npm test` **288/288** 通过；`npm run check` 同步为 23 工具、20 路由、31 ADR、schema v15、3.9.4；`semantic assets OK: 11 files, 37.5 MiB`。
+
 ## [3.9.3] — 2026-11-21
 
 ### 修复 · 语义索引生命周期（复核 RECHECK-3.9.2）

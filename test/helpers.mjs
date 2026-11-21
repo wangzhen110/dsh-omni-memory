@@ -114,7 +114,7 @@ export async function boot(options = {}) {
     });
   };
 
-  return { home, tools, listeners, routes, call, fire, fireInbox, fireRaw, fireWithCwd, route, section: () => section };
+  return { home, tools, listeners, routes, call, fire, fireInbox, fireRaw, fireWithCwd, route, section: () => section, mod };
 }
 
 export function fakeRes() {

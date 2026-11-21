@@ -107,14 +107,34 @@ function fnv1a(text) {
   return hash >>> 0;
 }
 
-function projectKeyFromCwd(cwd) {
+function projectKeyFromCwd(cwd, platform = process.platform) {
   const raw = String(cwd ?? '').trim();
   if (!raw) return SCOPE_GLOBAL;
   const normalized = raw.replaceAll('\\', '/').replace(/\/+$/, '') || raw;
+  // Windows and macOS paths are case-insensitive by default. Keeping the hash
+  // case-sensitive there meant the same workspace opened as `C:\Repo` and
+  // `c:\repo` produced two project layers; Linux stays case-sensitive.
+  const identity = (platform === 'win32' || platform === 'darwin')
+    ? normalized.toLowerCase()
+    : normalized;
+  return projectKeyFromPath(identity);
+}
+
+/** The pre-3.9.4 key, kept only so an existing layer can be migrated. */
+function legacyProjectKeyFromCwd(cwd) {
+  const raw = String(cwd ?? '').trim();
+  if (!raw) return SCOPE_GLOBAL;
+  const normalized = raw.replaceAll('\\', '/').replace(/\/+$/, '') || raw;
+  return projectKeyFromPath(normalized);
+}
+
+function projectKeyFromPath(normalized) {
   const base = normalized.split('/').pop() ?? normalized;
   const safe = base.replace(/[^\p{L}\p{N}._-]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 40);
   return `proj:${safe || 'project'}#${fnv1a(normalized).toString(16).slice(0, 6)}`;
 }
+
+export { projectKeyFromCwd, legacyProjectKeyFromCwd };
 
 const WORKSPACES_DIR = path.join(DSH_HOME, 'sessions');
 
@@ -229,6 +249,148 @@ function newScopeFlag(db, scope) {
   `).get(scope, scope, scope);
   return row ? undefined : true;
 }
+
+/** The path identity used only for alias lookup; never persists this form. */
+function normalizeProjectPath(cwd) {
+  return String(cwd ?? '').trim().replaceAll('\\', '/').replace(/\/+$/, '');
+}
+
+function projectPathsEqual(left, right, platform = process.platform) {
+  const a = normalizeProjectPath(left);
+  const b = normalizeProjectPath(right);
+  return (platform === 'win32' || platform === 'darwin')
+    ? a.toLowerCase() === b.toLowerCase()
+    : a === b;
+}
+
+/** Follow a chain of old scope keys until a canonical scope is reached. */
+function resolveScopeAlias(db, scope) {
+  let current = String(scope ?? '');
+  for (let pass = 0; pass < 16; pass += 1) {
+    if (!current) return current;
+    let row;
+    try {
+      row = prepareCached(db, 'SELECT canonical FROM scope_aliases WHERE alias = ?').get(current);
+    } catch {
+      return current;
+    }
+    if (!row?.canonical || row.canonical === current) return current;
+    current = row.canonical;
+  }
+  return current;
+}
+
+function scopeHasRows(db, scope) {
+  try {
+    const row = prepareCached(db, `
+      SELECT 1 AS hit FROM notes WHERE scope = ?
+      UNION ALL SELECT 1 FROM facts WHERE scope = ?
+      UNION ALL SELECT 1 FROM chunks WHERE scope = ?
+      UNION ALL SELECT 1 FROM note_candidates WHERE scope = ?
+      UNION ALL SELECT 1 FROM edges WHERE scope = ?
+      UNION ALL SELECT 1 FROM meta WHERE value = ? AND key LIKE 'agent_project:%'
+      LIMIT 1
+    `).get(scope, scope, scope, scope, scope, scope);
+    return Boolean(row);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Merge one project scope into another.
+ *
+ * A cased legacy key and its lowercase twin are the same workspace, but merging
+ * blindly across arbitrary project keys would merge same-named folders from
+ * different drives. Callers must establish the alias from a real path first.
+ * Chunks have a partial unique index on (hash, scope): the destination wins and
+ * the duplicate source row is tombstoned, never hard-deleted.
+ */
+function migrateScopeAlias(db, from, to, options = {}) {
+  const source = resolveScopeAlias(db, from);
+  const target = resolveScopeAlias(db, to);
+  if (!source || !target || source === target) return { migrated: false, from: source, to: target };
+  const counts = { notes: 0, facts: 0, chunks: 0, candidates: 0, edges: 0, chunksTombstoned: 0, meta: 0 };
+  transaction(db, () => {
+    // Active chunk hashes already present at the destination must not collide.
+    const targetHashes = new Set(
+      prepareCached(db, 'SELECT hash FROM chunks WHERE scope = ? AND deleted_at IS NULL').all(target)
+        .map(row => row.hash),
+    );
+    for (const row of prepareCached(db, 'SELECT id, hash, deleted_at FROM chunks WHERE scope = ?').all(source)) {
+      if (row.deleted_at === null && targetHashes.has(row.hash)) {
+        prepareCached(db, 'UPDATE chunks SET deleted_at = ? WHERE id = ?').run(now(), row.id);
+        counts.chunksTombstoned += 1;
+      } else {
+        prepareCached(db, 'UPDATE chunks SET scope = ? WHERE id = ?').run(target, row.id);
+        counts.chunks += 1;
+        if (row.deleted_at === null) targetHashes.add(row.hash);
+      }
+    }
+    counts.notes = Number(prepareCached(db, 'UPDATE notes SET scope = ? WHERE scope = ?').run(target, source).changes);
+    counts.facts = Number(prepareCached(db, 'UPDATE facts SET scope = ? WHERE scope = ?').run(target, source).changes);
+    counts.candidates = Number(prepareCached(db, 'UPDATE note_candidates SET scope = ? WHERE scope = ?').run(target, source).changes);
+    counts.edges = Number(prepareCached(db, 'UPDATE edges SET scope = ? WHERE scope = ?').run(target, source).changes);
+    for (const row of prepareCached(db, "SELECT key FROM meta WHERE key LIKE 'agent_project:%' AND value = ?").all(source)) {
+      metaSet(db, row.key, target);
+      counts.meta += 1;
+    }
+    // Keep the path map on the canonical key, not the old spelling.
+    if (options.path && (metaGet(db, `project_path:${target}`) ?? '') !== options.path) {
+      metaSet(db, `project_path:${target}`, options.path);
+    }
+    prepareCached(db, 'DELETE FROM meta WHERE key = ?').run(`project_path:${source}`);
+    prepareCached(db, 'INSERT OR REPLACE INTO scope_aliases(alias, canonical, created_at) VALUES (?, ?, ?)')
+      .run(source, target, now());
+  });
+  return { migrated: true, from: source, to: target, ...counts };
+}
+
+/**
+ * Called when a workspace is opened. The current path's legacy key is known,
+ * so it can be merged without guessing; historical keys with no path mapping
+ * stay untouched until an explicit alias is supplied.
+ */
+function ensureProjectAlias(db, cwd) {
+  const raw = String(cwd ?? '').trim();
+  if (!raw) return { migrated: false, canonical: SCOPE_GLOBAL };
+  const canonical = resolveScopeAlias(db, projectKeyFromCwd(raw));
+  if (canonical === SCOPE_GLOBAL) return { migrated: false, canonical };
+  const candidates = new Set();
+  const legacy = resolveScopeAlias(db, legacyProjectKeyFromCwd(raw));
+  if (legacy !== canonical) candidates.add(legacy);
+
+  // A path remembered on a previous run can recover cased spellings that are
+  // no longer the process cwd. Full-path equality prevents same-basename merges.
+  try {
+    for (const row of prepareCached(db, "SELECT key, value FROM meta WHERE key LIKE 'project_path:%'").all()) {
+      if (!projectPathsEqual(row.value, raw)) continue;
+      const scope = resolveScopeAlias(db, String(row.key).slice('project_path:'.length));
+      if (scope !== canonical) candidates.add(scope);
+    }
+  } catch { /* the path map is best effort */ }
+
+  const result = { migrated: false, canonical, merged: [] };
+  for (const candidate of candidates) {
+    if (!scopeHasRows(db, candidate)) {
+      // Still remember the old key, so a later import cannot split the layer.
+      try {
+        prepareCached(db, 'INSERT OR REPLACE INTO scope_aliases(alias, canonical, created_at) VALUES (?, ?, ?)')
+          .run(candidate, canonical, now());
+        result.merged.push({ from: candidate, to: canonical, migrated: false });
+      } catch { /* schema repair is best effort */ }
+      continue;
+    }
+    result.merged.push(migrateScopeAlias(db, candidate, canonical, { path: normalizeProjectPath(raw) }));
+    if (result.merged.at(-1).migrated) result.migrated = true;
+  }
+  try {
+    const pathKey = `project_path:${canonical}`;
+    if (metaGet(db, pathKey) !== normalizeProjectPath(raw)) metaSet(db, pathKey, normalizeProjectPath(raw));
+  } catch { /* best effort */ }
+  return result;
+}
+
 
 /**
  * Model-based layer judgement.
@@ -536,6 +698,14 @@ function openStore() {
     schemaVersion,
     fts: { chunks: Boolean(chunksMode), notes: Boolean(notesMode), facts: Boolean(factsMode) },
   };
+  // A host launched from this directory should never silently split its layer
+  // from a legacy cased key. The same check also runs in attachSession for
+  // explicit cwds (CLI --dir, MCP projects).
+  try {
+    store.aliasMigration = ensureProjectAlias(db, process.cwd());
+  } catch (error) {
+    store.aliasMigration = { migrated: false, error: error?.message ?? String(error) };
+  }
   // Start the bundled semantic index in the background only when the store
   // actually has missing rows. A fresh store and an already-indexed store do
   // not pay the 216MB model load just because a host opened.
@@ -543,7 +713,7 @@ function openStore() {
   return store;
 }
 
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 let hostCtx = null;
 
 function columnExists(db, table, column) {
@@ -750,6 +920,19 @@ const MIGRATIONS = [
         ON semantic_vectors(model, kind, owner_id);
     `);
   },
+  // v15: project scope aliases. Windows/macOS cased paths used to hash to
+  // different project keys; the alias table keeps an old key -> canonical key
+  // mapping so a one-time merge is observable and repeatable.
+  db => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS scope_aliases (
+        alias TEXT PRIMARY KEY,
+        canonical TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS scope_aliases_canonical ON scope_aliases(canonical);
+    `);
+  },
 ];
 
 function migrate(db) {
@@ -835,6 +1018,16 @@ function migrate(db) {
         ON note_candidates(status, scope, ts);
       CREATE INDEX IF NOT EXISTS note_candidates_hash
         ON note_candidates(hash, scope, status);
+    `);
+  }
+  if (SCHEMA_VERSION >= 15) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS scope_aliases (
+        alias TEXT PRIMARY KEY,
+        canonical TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS scope_aliases_canonical ON scope_aliases(canonical);
     `);
   }
   prepareCached(db, "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)")
@@ -4331,7 +4524,14 @@ function scopeForSession(session) {
   const cwd = session?.header?.cwd;
   if (cwd) cwdBySession.set(sessionId, String(cwd));
   const known = cwdBySession.get(sessionId);
-  return known ? projectKeyFromCwd(known) : SCOPE_GLOBAL;
+  if (!known) return SCOPE_GLOBAL;
+  try {
+    const db = openStore().db;
+    ensureProjectAlias(db, known);
+    return resolveScopeAlias(db, projectKeyFromCwd(known));
+  } catch {
+    return projectKeyFromCwd(known);
+  }
 }
 
 function defineTools(ctx) {
@@ -6463,10 +6663,17 @@ export function attachSession(sessionId, cwd) {
   const id = String(sessionId ?? '').trim();
   if (!id) return null;
   const raw = String(cwd ?? '').trim();
-  const project = raw ? projectKeyFromCwd(raw) : SCOPE_GLOBAL;
+  let project = raw ? projectKeyFromCwd(raw) : SCOPE_GLOBAL;
   if (raw) cwdBySession.set(id, raw);
+  try {
+    const db = openStore().db;
+    if (raw) {
+      ensureProjectAlias(db, raw);
+      project = resolveScopeAlias(db, project);
+    }
+    metaSet(db, `agent_project:${id}`, project);
+  } catch { /* best effort */ }
   projectByAgent.set(id, project);
-  try { metaSet(openStore().db, `agent_project:${id}`, project); } catch { /* best effort */ }
   return project;
 }
 

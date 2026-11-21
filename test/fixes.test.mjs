@@ -273,7 +273,7 @@ test('schema v6 databases migrate to v11 without losing rows', async () => {
   await app.route('/omni-memory/list').handler(fakeReq('/omni-memory/list?limit=10'), res.res);
   const body = res.json();
   assert.equal(body.ok, true);
-  assert.equal(body.schema, 14);
+  assert.equal(body.schema, app.mod.SCHEMA_VERSION);
   assert.equal(body.stats.notes, 1);
 
   const check = new DatabaseSync(file);
