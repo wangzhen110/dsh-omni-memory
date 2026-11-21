@@ -190,3 +190,42 @@ fast-check 4.x 中，**异步断言函数必须用 `fc.asyncProperty`，不能�
 - `npm pack` 消费端安装冒烟（此前仅 `INTEGRATION-PROBE` 手工一次）。
 
 本轮未改任何运行时源码，测试全部使用隔离 home；生产库未被指向。
+
+## 第五轮：继续关闭“仍未自动化”清单（2026-11-21，同日）
+
+用户再次追问“还有哪些没测试的”。把上一轮声明的边界再收窄：能稳定自动化的全部补做，只剩依赖外部 OS / 浏览器 / 系统服务的项。
+
+### 新增 13 条用例（335 → 348）
+
+| 文件 | 条数 | 覆盖 |
+|---|---:|---|
+| `test/install-smoke.test.mjs`（新） | 1 | `npm pack` → 隔离 consumer `npm install --omit=dev` → 从安装后的 `index.js` 写入/召回；校验 13 个运行时模型资产存在；全程约 5s，无网络 |
+| `test/perf-budget.test.mjs`（新） | 2 | ADR-020 的 10k / 100k 行 p95 < 300ms 且 `hitTotal > 0`；默认都跑，实测 10k p95 3.4ms / 100k p95 2.6ms |
+| `test/backup-edge.test.mjs`（新） | 6 | 未来版本快照拒绝、截断/畸形 JSON、错误 format、类型错误中途失败事务回滚、global+两项目 scope 保真、旧版快照兼容 |
+| `test/http-lifecycle.test.mjs`（新） | 3 | 同端口关闭后重启、端口冲突受控 reject（EADDRINUSE）且首实例仍健康、同 home 顺序实例 A 写 B 召回 |
+| `test/vector-queue-saturation.test.mjs`（新） | 1 | 远程后端写 4101 条不搜索，`pending` 停在 4096、`dropped>=1`、`lastDropAt>0`；随后搜索触发 flush 且计数保持不变，证明不是假计数 |
+
+### 门禁
+
+| 门禁 | 结果 |
+|---|---|
+| `npm test` | **348/348**（335 → 348，新增 13 条） |
+| `npm run check` | 一致：348 / 23 内核工具 / 25 MCP 工具 / 20 路由 / 31 ADR / 3.9.5 |
+| `npm run bench:golden` | `pass:true`，MRR 0.979 未退化 |
+
+### 实测发现
+
+1. **向量队列满计数已能稳定行为覆盖**：只有 remote 后端会入队（hashed 同步落库），写入 4101 条约 6–7s、RSS 稳定、无隐式 flush；多出的 5 条确定被丢弃。这补上了第四轮唯一只做字段断言的缺口。
+2. **导入的“坏行”分两类**：缺 `text` 的行被 `stats.skipped` 跳过而非报错；真正触发回滚的是类型错误（如 `importance: 'not-a-number'` → NOT NULL 约束失败）。`mergeSnapshot` 整体包在事务中，坏行之前的好行也不残留。
+3. **HTTP 端口冲突是受控 Promise reject**（`server.once('error', reject)`），不会产生未捕获异常；同端口 close→restart 可干净复用。优雅关闭在途请求没有确定性构造手段，未写时序断言。
+4. **安装冒烟可离线完成**：运行时 `dependencies` 为空，`npm install --omit=dev` 不需要网络；唯一非致命现象是 Node 22 的 SQLite ExperimentalWarning。
+
+### 现在仍未自动化（只剩外部环境依赖）
+
+- 真实 macOS/Linux 文件系统大小写矩阵（当前只把 `platform` 参数喂给纯函数）；
+- 浏览器级面板交互（星图、按钮、错误提示）——需要引入浏览器驱动，超出当前零运行时依赖策略；
+- 7788 在注销/关机/休眠后的恢复与 Windows 服务/S4U 常驻（属部署形态，不是代码路径）；
+- 1M 行 + 5 万向量 + 100 万 bigram 长压（手工记录，避免 CI 时长失控）；
+- 慢速请求 / 连接耗尽类网络韧性测试（需要专门压测工具，非 node:test 合适场景）。
+
+本轮未改任何运行时源码，未碰生产库；所有新测试使用隔离 home 与临时 tarball/consumer 目录。

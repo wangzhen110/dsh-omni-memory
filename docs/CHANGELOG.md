@@ -16,7 +16,8 @@
 - 新增 `test/property.test.mjs`（devDependency `fast-check`，仅测试期）：4 条不变量属性测试，各 60 组随机输入——写入→problemKey 精确召回往返、项目 scope 不跨项目泄漏、墓碑后不可召回、任意文本安全存储与越界参数拒绝。经变异测试验证：临时禁用 `scopeClause` 隔离时恰好只有隔离属性失败，证明属性确实锁定对应不变量。
 - 新增 `test/property-reliability.test.mjs`：3 条针对 3.9.5 可靠性修复的属性测试（各 50 组随机输入）——amend 后旧笔记派生索引全清、墓碑跨重开不复活、任意写/改/删序列后库完整且计数自洽。变异测试验证：跳过 amend 的派生清理时恰好只有对应属性失败。
 - 深度测试阶段（audit-tooling 落地·第二轮）：新增 `test/fuzz-inputs.test.mjs`（4 条：MCP JSON-RPC 任意值、tools/call 恶意名、拆句输出契约、候选抽取边界）、`test/property-ranking.test.mjs`（5 条：status 排序、exact 硬优先、feedback 单调、状态过滤、排序稳定性）、`test/property-concurrency.test.mjs`（4 条：同 key 并发写不丢、并发反馈无丢失更新、跨 scope 隔离、混合并发库完整）、`test/property-scope-alias.test.mjs`（4 条：跨平台大小写归一、legacy 键关系、迁移幂等无损、循环别名终止）。fuzz 用 fast-check 任意值生成，未引入 jazzer.js（native 插桩对零依赖项目侵入过大）。三组变异测试（去拆句去重、反转 exact 优先级、去大小写归一）各自精确命中对应属性，其中“去拆句去重”首轮未被捕获，补入必然重复的输入后锁定——印证变异测试的价值。
-- 完整 `npm test` **335/335** 通过；`npm run check` 同步为 23 个内核工具、25 个 MCP 工具、20 路由、31 ADR、3.9.5。
+- 第四/五轮补测：新增 `fault-injection`、`semantic-reliability-regression`、`http-security`、`install-smoke`、`perf-budget`、`backup-edge`、`http-lifecycle`、`vector-queue-saturation`，并给 `rerank` / `embed-provider` 补故障用例；覆盖索引缺失、GC 错误可见、冷却期回填、路径穿越/CSRF、安装冒烟、10k/100k p95、坏快照事务回滚、端口冲突与向量队列饱和。测试 313 → 348。
+- 完整 `npm test` **348/348** 通过；`npm run check` 同步为 23 个内核工具、25 个 MCP 工具、20 路由、31 ADR、3.9.5。
 
 ## [3.9.4] — 2026-11-21
 
