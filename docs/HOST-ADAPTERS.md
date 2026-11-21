@@ -23,6 +23,20 @@ node hosts/mcp/bin.mjs
 
 支持 stdio 与 HTTP `POST /mcp`。`initialize.instructions`、`omni-bootstrap` prompt、`memory_rules` 工具、`omni://rules` 资源都返回同一份规则文本。
 
+### 1.1 豆包工作（官方自定义连接器）
+
+2026-11-21 实测：豆包工作客户端支持官方「自定义连接器」，可直接接本地 STDIO MCP。官方说明：`https://www.doubao.com/work/docs/zh-cn/articles/705018132598-plugins`。
+
+```text
+服务器名称：全息记忆
+传输类型：STDIO
+命令：<node.exe 绝对路径>
+参数：<repo>\hosts\mcp\bin.mjs
+环境变量：OMNI_HOME=<用户目录>\.dsh；OMNI_PROJECT_DIR=<repo>
+```
+
+实测结果：`initialize` 返回 `omni-memory 3.10.1`，`tools/list` 25 个工具，`memory_context` / `memory_search` 在真实库上正常返回。连接器由豆包客户端管理，Agent 不应自动改豆包设置、配置或注册表；首次创建需要用户在客户端点一次“保存”。
+
 ### 2. CLI context（hook / sidecar）
 
 ```bash
@@ -90,11 +104,12 @@ curl -X POST http://127.0.0.1:7788/omni-memory/tool \
 - `/tool` 是写操作，必须带 `x-omni-csrf: 1`，并校验 Origin；跨站表单无法伪造该头。
 - 跨项目读取/改写需要显式 `scope=all`；默认只走当前项目 + global。
 - 不要把 `--bind 0.0.0.0` 暴露到公网；如果必须远程，前面加 TLS、认证和网络 ACL，且不要把未鉴权的 `/mcp` 或 `/tool` 直接开放。
-- 不建议用桌面 UI 自动化硬注入豆包等闭源聊天端；接口不稳定，也可能违反平台条款。可靠的降级路径是 `/packet` + 人工/扩展粘贴。
+- 不建议用桌面 UI 自动化硬注入豆包等闭源聊天端；豆包工作已支持官方自定义连接器，优先用连接器。其他没有 MCP 的闭源聊天端才用 `/packet` + 人工/扩展粘贴。
 
 ## 一句话选择
 
 有 DSH：用原生插件。  
 有 MCP：接 stdio/HTTP MCP，再补规则或 hook。  
+豆包工作：官方自定义连接器选 STDIO，接 `hosts/mcp/bin.mjs`。  
 只有 OpenAPI：用 `openapi.json` + `/tool`。  
 只能聊天：用 `/packet` / `omni context` 做预检索 sidecar。  

@@ -34,3 +34,9 @@
 - 涉及删除、覆盖、对外发送、付费等不可逆动作前，先用 `memory_search` 确认记忆没有过时。
 - 发现记忆与当前事实冲突，用 `memory_write` 写新结论并在 `contradicts` 里填旧 id，不要默默绕过。
 <!-- omni-memory:rules v1 end -->
+
+## 豆包宿主接入
+
+- 豆包工作客户端用「自定义连接器」STDIO 接 `hosts/mcp/bin.mjs`；本会话若能看到 `memory_*` 工具，直接按上面的规则调用。
+- 若工具尚未加载，不要假设服务不存在：`GET http://127.0.0.1:7788/omni-memory/packet?q=<任务>` 可读画像与相关记忆；写入用 `POST http://127.0.0.1:7788/omni-memory/tool`，带 `x-omni-csrf: 1` 和 `{"name":"memory_write", ...}`。
+- 连接器由豆包客户端管理，需要用户在客户端保存；Agent 不自动修改豆包设置、配置或注册表。
