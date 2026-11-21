@@ -29,7 +29,8 @@ test('memory_feedback records useful and misleading signals', async () => {
   const useful = await app.call('memory_feedback', { kind: 'note', id: written.value.id, rating: 'useful' });
   assert.equal(useful.value.usefulCount, 1);
   assert.equal(useful.value.misleadingCount, 0);
-  assert.equal(useful.value.recallCount, 1);
+  assert.equal(useful.value.feedbackCount, 1);
+  assert.ok(useful.value.lastFeedbackAt > 0);
   const misleading = await app.call('memory_feedback', { kind: 'note', id: written.value.id, rating: 'misleading' });
   assert.equal(misleading.value.usefulCount, 1);
   assert.equal(misleading.value.misleadingCount, 1);
@@ -74,4 +75,71 @@ test('memory_amend creates a superseding revision and hides the old row', async 
 
   const oldGet = await app.call('memory_get', { items: [{ kind: 'note', id: old.value.id }] });
   assert.equal(oldGet.value.items.length, 0);
+});
+
+test('memory_amend preserves contested, verification, source and feedback counters', async () => {
+  const app = await boot();
+  const old = await app.call('memory_write', {
+    kind: 'note',
+    text: 'QualityAmendPreserve old wording',
+    source: 'ORIGINAL-SOURCE',
+  });
+  const db = dbOf(app);
+  const verifiedAt = 1700000000000;
+  const feedbackAt = 1700000000001;
+  db.prepare(`
+    UPDATE notes SET contested = 1, verification = 'verified', verified_at = ?,
+      evidence = 'original evidence', recall_count = 9, last_recall_at = ?,
+      useful_count = 7, misleading_count = 2
+    WHERE id = ?
+  `).run(verifiedAt, feedbackAt, old.value.id);
+  db.close();
+
+  const amended = await app.call('memory_amend', {
+    id: old.value.id,
+    text: 'QualityAmendPreserve corrected wording',
+    reason: 'fix wording',
+  });
+  const db2 = dbOf(app);
+  const row = db2.prepare('SELECT * FROM notes WHERE id = ?').get(amended.value.id);
+  const previous = db2.prepare('SELECT * FROM notes WHERE id = ?').get(old.value.id);
+  db2.close();
+
+  assert.equal(row.contested, 1);
+  assert.equal(row.verification, 'verified');
+  assert.equal(row.verified_at, verifiedAt);
+  assert.equal(row.recall_count, 9);
+  assert.equal(row.last_recall_at, feedbackAt);
+  assert.equal(row.useful_count, 7);
+  assert.equal(row.misleading_count, 2);
+  assert.equal(row.source, 'ORIGINAL-SOURCE');
+  assert.match(row.evidence, /original evidence/);
+  assert.match(row.evidence, /\[amend\] fix wording/);
+  assert.equal(previous.superseded_by, amended.value.id);
+});
+
+test('feedback and amend reject another project by default', async () => {
+  const app = await boot();
+  const foreign = await app.call('memory_write', {
+    kind: 'note',
+    text: 'QualityScope foreign project note',
+    scope: 'proj:alpha',
+  });
+  await assert.rejects(
+    () => app.call('memory_feedback', { kind: 'note', id: foreign.value.id, rating: 'useful' }),
+    /outside the current project/,
+  );
+  await assert.rejects(
+    () => app.call('memory_amend', { id: foreign.value.id, text: 'QualityScope corrected note' }),
+    /outside the current project/,
+  );
+
+  const explicitFeedback = await app.call('memory_feedback', {
+    kind: 'note', id: foreign.value.id, rating: 'useful', scope: 'all',
+  });
+  assert.equal(explicitFeedback.value.feedbackCount, 1);
+  const explicitAmend = await app.call('memory_amend', {
+    id: foreign.value.id, text: 'QualityScope corrected note', scope: 'all',
+  });
+  assert.equal(explicitAmend.value.revision, 2);
 });

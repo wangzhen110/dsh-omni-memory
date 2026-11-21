@@ -1733,10 +1733,12 @@ function solutionFields(row) {
 function feedbackFields(row) {
   const useful = Math.max(0, Number(row.useful_count ?? 0));
   const misleading = Math.max(0, Number(row.misleading_count ?? 0));
-  const recall = Math.max(0, Number(row.recall_count ?? 0));
+  // The physical column is `recall_count` for schema compatibility, but the
+  // signal is a feedback vote, not every search hit. Expose the honest name.
+  const feedback = Math.max(0, Number(row.recall_count ?? 0));
   const quality = useful + misleading === 0 ? 0.5 : (useful + 1) / (useful + misleading + 2);
   return {
-    recallCount: recall,
+    feedbackCount: feedback,
     usefulCount: useful,
     misleadingCount: misleading,
     lastFeedbackAt: row.last_recall_at ?? null,
@@ -3573,6 +3575,7 @@ function defineTools(ctx) {
         kind: { type: 'string', enum: ['note', 'fact'], description: 'Which memory type the id belongs to.' },
         id: { type: 'number', description: 'Id returned by memory_search or memory_get.' },
         rating: { type: 'string', enum: ['useful', 'misleading'], description: 'useful: it helped solve the task; misleading: it was stale, wrong, or sent you down a dead end.' },
+        scope: { type: 'string', description: 'Omit for the current project plus global. Pass all only for an explicit cross-project audit.' },
       },
       required: ['kind', 'id', 'rating'],
     },
@@ -3582,25 +3585,29 @@ function defineTools(ctx) {
         properties: {
           kind: { type: 'string' }, id: { type: 'number' }, rating: { type: 'string' },
           usefulCount: { type: 'number' }, misleadingCount: { type: 'number' },
-          recallCount: { type: 'number' }, quality: { type: 'number' },
+          feedbackCount: { type: 'number' }, lastFeedbackAt: { type: 'number' }, quality: { type: 'number' },
         },
       },
       render: (_args, value) => textBlock(
         `feedback ${value.kind}#${value.id} -> ${value.rating} (quality ${value.quality}; useful ${value.usefulCount}, misleading ${value.misleadingCount})`,
       ),
     },
-    async execute(args = {}) {
+    async execute(args = {}, toolContext = {}) {
       const kind = String(args.kind ?? '').trim().toLowerCase();
       if (kind !== 'note' && kind !== 'fact') throw new Error('kind must be note or fact');
       const id = Number(args.id);
       if (!Number.isFinite(id) || id <= 0) throw new Error('id is required');
       const rating = String(args.rating ?? '').trim().toLowerCase();
       if (rating !== 'useful' && rating !== 'misleading') throw new Error('rating must be useful or misleading');
+      const requestedScope = String(args.scope ?? '').trim();
+      if (requestedScope && requestedScope !== 'all') throw new Error('scope only supports all; omit it for the current project plus global');
+      const scope = requestedScope === 'all' ? null : (currentProject(toolContext) || SCOPE_GLOBAL);
       const s = openStore();
       const table = kind === 'note' ? 'notes' : 'facts';
       const activeSql = kind === 'fact' ? 'AND valid_to IS NULL' : 'AND superseded_by IS NULL';
-      const row = prepareCached(s.db, `SELECT id FROM ${table} WHERE id = ? AND deleted_at IS NULL ${activeSql}`).get(id);
-      if (!row) throw new Error(`${kind} ${id} not found or is no longer active`);
+      const filter = scopeClause('scope', scope);
+      const row = prepareCached(s.db, `SELECT id FROM ${table} WHERE id = ? AND deleted_at IS NULL ${activeSql} ${filter.sql}`).get(id, ...filter.params);
+      if (!row) throw new Error(`${kind} ${id} not found, inactive, or outside the current project`);
       const ts = now();
       const useful = rating === 'useful' ? 1 : 0;
       const misleading = rating === 'misleading' ? 1 : 0;
@@ -3617,7 +3624,8 @@ function defineTools(ctx) {
       `).get(id);
       return {
         kind, id, rating,
-        recallCount: Number(updated?.recall_count ?? 0),
+        feedbackCount: Number(updated?.recall_count ?? 0),
+        lastFeedbackAt: updated?.last_recall_at ?? null,
         usefulCount: Number(updated?.useful_count ?? 0),
         misleadingCount: Number(updated?.misleading_count ?? 0),
         quality: Number(feedbackFields(updated ?? {}).quality),
@@ -3740,7 +3748,8 @@ function defineTools(ctx) {
       properties: {
         id: { type: 'number', description: 'Active note id to revise.' },
         text: { type: 'string', description: 'The complete corrected note text, max 4000 characters.' },
-        reason: { type: 'string', description: 'Optional short reason for the amendment.' },
+        reason: { type: 'string', description: 'Optional short reason for the amendment; stored as an [amend] entry in evidence.' },
+        scope: { type: 'string', description: 'Omit for the current project plus global. Pass all only for an explicit cross-project audit.' },
       },
       required: ['id', 'text'],
     },
@@ -3748,35 +3757,48 @@ function defineTools(ctx) {
       schema: { type: 'object', properties: { id: { type: 'number' }, revision: { type: 'number' }, superseded: { type: 'number' }, scope: { type: 'string' } } },
       render: (_args, value) => textBlock(`amended note #${value.superseded} -> #${value.id} (revision ${value.revision})`),
     },
-    async execute(args = {}) {
+    async execute(args = {}, toolContext = {}) {
       const id = Number(args.id);
       if (!Number.isFinite(id) || id <= 0) throw new Error('id is required');
       const text = String(args.text ?? '').trim();
       if (!text) throw new Error('text is required');
       if (text.length > 4000) throw new Error(`note is ${text.length} characters; split it into smaller notes (max 4000)`);
+      const requestedScope = String(args.scope ?? '').trim();
+      if (requestedScope && requestedScope !== 'all') throw new Error('scope only supports all; omit it for the current project plus global');
+      const scope = requestedScope === 'all' ? null : (currentProject(toolContext) || SCOPE_GLOBAL);
       const s = openStore();
+      const filter = scopeClause('scope', scope);
       const old = prepareCached(s.db, `
-        SELECT * FROM notes WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL
-      `).get(id);
-      if (!old) throw new Error(`note ${id} not found or is no longer active`);
+        SELECT * FROM notes
+        WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL ${filter.sql}
+      `).get(id, ...filter.params);
+      if (!old) throw new Error(`note ${id} not found, inactive, or outside the current project`);
       if (String(old.text ?? '') === text) throw new Error('new text is identical to the current revision');
       const duplicate = prepareCached(s.db, `
         SELECT id FROM notes
         WHERE scope = ? AND text = ? AND deleted_at IS NULL AND superseded_by IS NULL AND id <> ?
       `).get(old.scope, text, id);
       if (duplicate) throw new Error(`an active note with the same text already exists: #${duplicate.id}`);
+      const reason = String(args.reason ?? '').trim();
+      const evidence = reason
+        ? `${old.evidence ? `${old.evidence}\n` : ''}[amend] ${reason}`
+        : (old.evidence ?? null);
       const ts = now();
       const result = transaction(s.db, () => {
         const info = prepareCached(s.db, `
           INSERT INTO notes(
             ts, scope, text, importance, source, revision, contested,
-            problem_key, solution_status, solution_verified_at, reuse_count, last_used_at, evidence
-          ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+            problem_key, solution_status, solution_verified_at, reuse_count, last_used_at, evidence,
+            verification, verified_at, recall_count, last_recall_at, useful_count, misleading_count
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
-          ts, old.scope, text, Number(old.importance ?? 0.5), args.reason ?? old.source ?? null,
-          Number(old.revision ?? 1) + 1,
+          ts, old.scope, text, Number(old.importance ?? 0.5), old.source ?? null,
+          Number(old.revision ?? 1) + 1, Number(old.contested ?? 0),
           old.problem_key ?? null, old.solution_status ?? null, old.solution_verified_at ?? null,
-          Number(old.reuse_count ?? 0), old.last_used_at ?? null, old.evidence ?? null,
+          Number(old.reuse_count ?? 0), old.last_used_at ?? null, evidence,
+          old.verification ?? null, old.verified_at ?? null,
+          Number(old.recall_count ?? 0), old.last_recall_at ?? null,
+          Number(old.useful_count ?? 0), Number(old.misleading_count ?? 0),
         );
         const newId = Number(info.lastInsertRowid);
         prepareCached(s.db, 'UPDATE notes SET superseded_by = ? WHERE id = ?').run(newId, id);

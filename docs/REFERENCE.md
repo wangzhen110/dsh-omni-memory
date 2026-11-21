@@ -365,13 +365,13 @@ MCP 无法写客户端系统提示，所以同一份 `RULES_TEXT` 铺五条路�
 参数：`limit` number（默认 200，最大 1000）、`bigrams` boolean、`vectors` boolean。换嵌入模型或恢复旧库后使用。
 
 ### 5.20 memory_feedback
-参数：`kind`（`note|fact`）、`id`、`rating`（`useful|misleading`），均必填。写入召回质量投票；`memory_search` 命中项返回 `usefulCount`、`misleadingCount`、`quality`、`recallCount`，排序使用 Bayesian 平滑后的反馈分。
+参数：`kind`（`note|fact`）、`id`、`rating`（`useful|misleading`），均必填。写入召回质量投票；`memory_search` 命中项返回 `usefulCount`、`misleadingCount`、`feedbackCount`、`lastFeedbackAt`、`quality`，排序使用 Bayesian 平滑后的反馈分。
 
 ### 5.21 memory_get
 参数：`items`（最多 20 个 `{kind,id}`）、`scope` 可选。渐进披露：`memory_search` 只给片段，命中后用本工具取完整正文与全部审计字段。默认当前项目层 + global；跨全部项目需显式 `scope=all`。
 
 ### 5.22 memory_amend
-参数：`id`（note）、`text`（新正文），可选 `reason`、`evidence`、`problemKey`、`solutionStatus`。生成新 revision，旧行 `superseded_by` 指向新行并保留；搜索只返回新行，`memory_get` 取不到旧行。
+参数：`id`（note）、`text`（新正文），可选 `reason`、`scope`（`all` 用于显式跨项目）。默认仅当前项目 + global。生成新 revision，旧行 `superseded_by` 指向新行并保留；搜索只返回新行，`memory_get` 取不到旧行。修订透传 `contested`、`verification`、反馈计数与原始 `source`；`reason` 以 `[amend]` 追加进 `evidence`。
 
 ---
 

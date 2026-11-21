@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | 3.7.0 |
-| 插件版本 | 3.7.0 |
+| 文档版本 | 3.7.1 |
+| 插件版本 | 3.7.1 |
 | 状态 | 已评审（本文为开发与验收的**唯一依据**） |
 | 目标平台 | DeepSeek Harness 0.2.2-rc.3（Desktop，Windows 11，Node 24.17） |
 | 最后更新 | 2026-11-21 |
@@ -88,9 +88,9 @@
 | NFR-07 | 失败隔离 | 任一子系统（FTS/路由/注入）失效不得导致会话不可用 | 满足（全部 try/catch + 可选降级） |
 | NFR-08 | 隐私 | 所有数据仅存本机 `$DSH_HOME/memory/omni.db`；HTTP 仅 loopback，且浏览器跨站写请求被 Origin 校验拦截 | 部分满足：数据库未加密，loopback HTTP 仍依赖本机进程边界，未做进程级鉴权（ADR-017） |
 | NFR-09 | 可卸载 | 卸载插件后不残留运行中的监听；数据文件保留由用户决定 | 满足 |
-| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 251/251（100%） |
+| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 253/253（100%） |
 | NFR-11 | 界面本地化 | 中英词典注册，切换语言无需重载插件 | 已实现（词典 + 订阅重渲染） |
-| NFR-12 | 多进程并发 | 同机 N 个宿主进程共用一个库，同时读写不丢数据、不报锁错 | 251/251 含 6 进程并发用例；写入等待上限 5s（ADR-028） |
+| NFR-12 | 多进程并发 | 同机 N 个宿主进程共用一个库，同时读写不丢数据、不报锁错 | 253/253 含 6 进程并发用例；写入等待上限 5s（ADR-028） |
 
 ### 1.3 约束
 
@@ -240,9 +240,9 @@ chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 | `memory_write` | `kind`(note/fact/episode), `text`, 可选 `scope`/`importance`/`source`/`subject`/`relation`/`object`；note 额外可选 `problemKey`/`solutionStatus`/`evidence` | `{id, kind, deduped, invalidated?, problemKey?, solutionStatus?, reuseCount?}` | `subject is required for kind=fact`；`text is required`；`solutionStatus` 仅限 note |
 | `memory_search` | 可选 `query`，可选 `problemKey`/`status`(all\|verified\|unverified\|failed\|expired)/`kind`(all\|note\|fact\|chunk)/`limit`(1..30)/`scope` | `{total, scope, problemKey?, hits[]}` | 空查询且无 problemKey 返回 `{total:0,hits:[]}`；status/kind 非法时报错 |
 | `memory_solution_report` | `id`, `outcome`(success/failed/expired), 可选 `evidence` | `{id, solutionStatus, reuseCount, lastUsedAt, verifiedAt}` | 笔记不存在或已被替代/墓碑化时报错 |
-| `memory_feedback` | `kind`(note/fact), `id`, `rating`(useful/misleading) | `{id, kind, usefulCount, misleadingCount, quality, recallCount, lastRecallAt}` | 记录不存在或墓碑化时报错 |
+| `memory_feedback` | `kind`(note/fact), `id`, `rating`(useful/misleading), 可选 `scope`(all) | `{id, kind, usefulCount, misleadingCount, feedbackCount, lastFeedbackAt, quality}` | 默认仅当前项目+global；跨项目需显式 `scope=all` |
 | `memory_get` | `items[{kind,id}]`（最多 20），可选 `scope` | `{items[], missing[]}` | 超过 20 条报错 |
-| `memory_amend` | `id`, `text`, 可选 `reason`/`evidence`/`problemKey`/`solutionStatus` | `{id, previousId, revision}` | 仅支持 note；原文与新文相同会拒绝 |
+| `memory_amend` | `id`, `text`, 可选 `reason`/`scope`(all) | `{id, revision, superseded, scope}` | 仅支持 note；默认仅当前项目+global；原文与新文相同会拒绝 |
 | `memory_profile` | 无 | `{text, stats, picked, budget}` | 无 |
 | `memory_timeline` | `entity` | `{entries[]}` | 无 |
 | `memory_forget` | `kind`(note/fact/chunk), `id` | `{forgotten}` | `kind must be note, fact or chunk` |

@@ -2,6 +2,14 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.7.1] — 2026-11-21
+
+### 修复 · 3.7.0 复核报告（N-1 / N-2 / N-3）
+- **N-1 `memory_amend` 字段保真**：修订时透传 `contested`、`verification`、`verified_at`、`recall_count`、`last_recall_at`、`useful_count`、`misleading_count`；`source` 保留原出处，`reason` 以 `[amend]` 追加进 `evidence`，不再覆盖原始来源。修订不会清零已验证状态或质量信号。
+- **N-2 跨项目越权**：`memory_feedback` 与 `memory_amend` 接收 `toolContext`，默认按当前项目 + global 过滤；跨项目操作必须显式 `scope='all'`。与 `memory_get` 的隔离语义对齐，补跨项目拒绝回归用例。
+- **N-3 命名纠正**：对外字段由误导性的 `recallCount` / `lastRecallAt` 改为 `feedbackCount` / `lastFeedbackAt`；物理列名保留以兼容 schema v12，不再声称“每次召回都计数”。
+- 测试：新增 2 项回归（字段保真、跨项目拒绝），完整 `npm test` 253/253 通过。
+
 ## [3.7.0] — 2026-11-21
 
 ### 新增 · 与竞品对齐的记忆质量闭环
