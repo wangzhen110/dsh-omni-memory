@@ -27,6 +27,7 @@ import { DIM, embedText, dot, toBlob, fromBlob, tokenize } from './lib/embed.mjs
 import { backendConfig, embedRemote } from './lib/embed-provider.mjs';
 import { extractCandidateTexts } from './lib/capture-rules.mjs';
 import { rerankConfig, rerankRemote } from './lib/rerank-provider.mjs';
+import { semanticConfig, embedSemantic } from './lib/semantic-embed.mjs';
 
 // Data home resolution, in priority order:
 //   1. OMNI_HOME   — set by non-DSH adapters (MCP, CLI, HTTP) to point at a shared store
@@ -530,10 +531,14 @@ function openStore() {
     schemaVersion,
     fts: { chunks: Boolean(chunksMode), notes: Boolean(notesMode), facts: Boolean(factsMode) },
   };
+  // Start the bundled semantic index in the background only when the store
+  // actually has missing rows. A fresh store and an already-indexed store do
+  // not pay the 216MB model load just because a host opened.
+  scheduleSemanticBackfill(store, 800);
   return store;
 }
 
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 let hostCtx = null;
 
 function columnExists(db, table, column) {
@@ -721,6 +726,23 @@ const MIGRATIONS = [
         ON note_candidates(status, scope, ts);
       CREATE INDEX IF NOT EXISTS note_candidates_hash
         ON note_candidates(hash, scope, status);
+    `);
+  },
+  // v14: bundled local semantic vectors. Kept separate from the hashed `vectors`
+  // table so switching between hashed, remote and local never mixes vector
+  // spaces; the old routes stay usable while the semantic index backfills.
+  db => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS semantic_vectors (
+        kind TEXT NOT NULL,
+        owner_id INTEGER NOT NULL,
+        model TEXT NOT NULL,
+        dim INTEGER NOT NULL,
+        vec BLOB NOT NULL,
+        PRIMARY KEY (kind, owner_id, model)
+      );
+      CREATE INDEX IF NOT EXISTS semantic_vectors_model
+        ON semantic_vectors(model, kind, owner_id);
     `);
   },
 ];
@@ -1002,6 +1024,9 @@ function upsertVector(s, kind, id, text) {
  * a failed request left behind.
  */
 function indexVector(s, kind, id, text) {
+  // The local semantic route is independent of the hashed/remote vector route:
+  // a failed model leaves the other routes untouched.
+  enqueueSemantic(s, kind, id, text);
   const config = backendConfig();
   if (config.kind === 'hashed') {
     try {
@@ -1061,6 +1086,277 @@ async function flushPendingVectors(s) {
 function activeVectorDim() {
   const config = backendConfig();
   return config.kind === 'hashed' ? DIM : remoteDim;
+}
+
+// Bundled local semantic index. It is deliberately a separate route and a
+// separate table: the hashed and remote vectors keep working while this index
+// fills in, and changing the semantic model never invalidates old rows.
+const SEMANTIC_BATCH = 8;
+const SEMANTIC_BACKFILL_SCAN = 64;
+const SEMANTIC_MAX_PENDING = 4096;
+const SEMANTIC_MIN_COSINE = 0.25;
+const semanticStates = new WeakMap();
+
+function semanticState(s) {
+  let state = semanticStates.get(s.db);
+  if (!state) {
+    state = {
+      pending: new Map(),
+      timer: null,
+      running: false,
+      flushing: null,
+      backfillTimer: null,
+      backfillLease: null,
+      indexed: 0,
+      lastError: '',
+      backfillDone: false,
+    };
+    semanticStates.set(s.db, state);
+  }
+  return state;
+}
+
+function scheduleSemanticWorker(s, delay = 0) {
+  const config = semanticConfig();
+  if (!config.enabled) return;
+  const state = semanticState(s);
+  if (state.running || state.timer) return;
+  const timer = setTimeout(() => {
+    state.timer = null;
+    runSemanticWorker(s).catch(() => {});
+  }, Math.max(0, delay));
+  state.timer = timer;
+  timer.unref?.();
+}
+
+function enqueueSemantic(s, kind, id, text) {
+  if (!semanticConfig().enabled) return;
+  const state = semanticState(s);
+  const key = `${kind}:${id}`;
+  if (!state.pending.has(key) && state.pending.size >= SEMANTIC_MAX_PENDING) return;
+  state.pending.set(key, { kind, id: Number(id), text: String(text ?? '') });
+  scheduleSemanticWorker(s);
+}
+
+function releaseSemanticLease(s) {
+  const state = semanticState(s);
+  if (state.backfillLease) {
+    try { releaseLease(s.db, 'semantic-backfill', state.backfillLease); } catch { /* db already closed */ }
+    state.backfillLease = null;
+  }
+  if (state.backfillTimer) {
+    clearTimeout(state.backfillTimer);
+    state.backfillTimer = null;
+  }
+}
+
+function semanticHasMissing(s, config) {
+  for (const [kind, table, extra] of [
+    ['note', 'notes', 'AND t.superseded_by IS NULL'],
+    ['fact', 'facts', 'AND t.valid_to IS NULL'],
+    ['chunk', 'chunks', ''],
+  ]) {
+    try {
+      const row = prepareCached(s.db, `
+        SELECT 1 AS found
+        FROM ${table} t
+        WHERE t.deleted_at IS NULL ${extra}
+          AND NOT EXISTS (
+            SELECT 1 FROM semantic_vectors v
+            WHERE v.kind = ? AND v.owner_id = t.id AND v.model = ?
+          )
+        LIMIT 1
+      `).get(kind, config.signature);
+      if (row) return true;
+    } catch { /* a missing table only means there is nothing to backfill */ }
+  }
+  return false;
+}
+
+/**
+ * Start the one-time backfill. The cross-process lease keeps N AI hosts from
+ * each loading the 216MB model and re-running the same scan on first open.
+ * Once every row has a vector this returns without touching the model at all.
+ */
+function scheduleSemanticBackfill(s, delay = 800) {
+  const config = semanticConfig();
+  if (!config.enabled) return;
+  const state = semanticState(s);
+  if (state.backfillDone || state.backfillTimer || state.running || state.backfillLease) return;
+  if (!semanticHasMissing(s, config)) {
+    state.backfillDone = true;
+    return;
+  }
+  const lease = acquireLease(s.db, 'semantic-backfill', 600_000);
+  if (!lease) return;
+  state.backfillLease = lease;
+  if (!state.exitHook) {
+    state.exitHook = true;
+    // A host that exits mid-backfill must not leave a 10-minute lease behind
+    // for every other host. The lease TTL is only the crash fallback.
+    process.once('exit', () => {
+      if (!state.backfillLease) return;
+      try {
+        releaseLease(s.db, 'semantic-backfill', state.backfillLease);
+      } catch { /* the process is already leaving; TTL covers a closed db */ }
+      state.backfillLease = null;
+    });
+  }
+  const timer = setTimeout(() => {
+    state.backfillTimer = null;
+    runSemanticWorker(s).catch(() => {});
+  }, Math.max(0, delay));
+  state.backfillTimer = timer;
+  timer.unref?.();
+}
+
+function semanticBackfill(s, config, limit = SEMANTIC_BACKFILL_SCAN) {
+  const state = semanticState(s);
+  if (state.backfillDone) return;
+  let found = 0;
+  for (const [kind, table, extra] of [
+    ['note', 'notes', 'AND t.superseded_by IS NULL'],
+    ['fact', 'facts', 'AND t.valid_to IS NULL'],
+    ['chunk', 'chunks', ''],
+  ]) {
+    try {
+      const rows = prepareCached(s.db, `
+        SELECT t.id AS id, t.text AS text
+        FROM ${table} t
+        WHERE t.deleted_at IS NULL ${extra}
+          AND NOT EXISTS (
+            SELECT 1 FROM semantic_vectors v
+            WHERE v.kind = ? AND v.owner_id = t.id AND v.model = ?
+          )
+        ORDER BY t.id
+        LIMIT ?
+      `).all(kind, config.signature, limit);
+      for (const row of rows) {
+        found += 1;
+        enqueueSemantic(s, kind, row.id, row.text);
+      }
+    } catch { /* a missing table only means there is nothing to backfill */ }
+  }
+  if (!found) state.backfillDone = true;
+}
+
+function writeSemantic(s, config, entries, vectors) {
+  const insert = prepareCached(s.db, `
+    INSERT OR REPLACE INTO semantic_vectors(kind, owner_id, model, dim, vec)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    insert.run(entry.kind, entry.id, config.signature, config.dim, toBlob(vectors[index]));
+  }
+}
+
+/**
+ * Embed and persist up to `limit` queued rows. Search awaits this before its
+ * semantic query so a note written in the same turn is recallable immediately.
+ * The `flushing` promise makes a foreground search and the background timer
+ * share one inference instead of racing over the same queue.
+ */
+async function flushSemanticPending(s, config, limit = SEMANTIC_BATCH) {
+  const state = semanticState(s);
+  if (state.flushing) return state.flushing;
+  const entries = [...state.pending.values()].slice(0, Math.max(1, limit));
+  if (!entries.length) return 0;
+  state.flushing = (async () => {
+    const vectors = await embedSemantic(entries.map(entry => entry.text), config);
+    if (vectors.some(vector => vector.length !== config.dim)) {
+      throw new Error(`semantic dimension mismatch: expected ${config.dim}, got ${vectors[0]?.length ?? 0}`);
+    }
+    writeSemantic(s, config, entries, vectors);
+    for (const entry of entries) state.pending.delete(`${entry.kind}:${entry.id}`);
+    state.indexed += entries.length;
+    state.lastError = '';
+    return entries.length;
+  })();
+  try {
+    return await state.flushing;
+  } finally {
+    state.flushing = null;
+  }
+}
+
+async function runSemanticWorker(s) {
+  const config = semanticConfig();
+  if (!config.enabled) return;
+  const state = semanticState(s);
+  if (state.running) return;
+  state.running = true;
+  let scheduleNext = false;
+  try {
+    if (state.pending.size < SEMANTIC_BATCH) semanticBackfill(s, config);
+    if (!state.pending.size) {
+      state.backfillDone = true;
+      return;
+    }
+    await flushSemanticPending(s, config, SEMANTIC_BATCH);
+    scheduleNext = state.pending.size > 0 || !state.backfillDone;
+  } catch (error) {
+    // A missing or corrupt model must not spin the worker or break retrieval.
+    state.lastError = String(error?.message ?? error);
+  } finally {
+    state.running = false;
+    if (state.backfillDone && state.backfillLease) {
+      releaseLease(s.db, 'semantic-backfill', state.backfillLease);
+      state.backfillLease = null;
+    }
+    // Schedule after clearing `running`: scheduleSemanticWorker refuses while a
+    // worker is marked active, so scheduling inside the try would silently stop
+    // the backfill after the first batch.
+    if (scheduleNext) scheduleSemanticWorker(s);
+  }
+}
+
+function semanticStatus(s) {
+  const config = semanticConfig();
+  const state = semanticState(s);
+  let indexed = 0;
+  try {
+    indexed = Number(prepareCached(s.db, 'SELECT COUNT(*) AS n FROM semantic_vectors WHERE model = ?')
+      .get(config.signature).n);
+  } catch { /* schema not migrated yet */ }
+  return {
+    enabled: config.enabled,
+    reason: config.reason ?? '',
+    kind: config.kind,
+    model: config.model,
+    dim: config.dim,
+    signature: config.signature,
+    pending: state.pending.size,
+    indexed,
+    running: state.running,
+    backfillDone: state.backfillDone,
+    lastError: state.lastError,
+  };
+}
+
+async function reindexSemantic(s, limit) {
+  const config = semanticConfig();
+  if (!config.enabled) return { enabled: false, reason: config.reason, model: config.model, processed: 0 };
+  let processed = 0;
+  try {
+    while (processed < limit) {
+      const state = semanticState(s);
+      if (state.pending.size < SEMANTIC_BATCH) semanticBackfill(s, config);
+      const done = await flushSemanticPending(s, config, Math.min(SEMANTIC_BATCH, limit - processed));
+      if (!done) break;
+      processed += done;
+    }
+  } catch (error) {
+    return { enabled: true, model: config.model, dim: config.dim, processed, error: String(error?.message ?? error) };
+  }
+  return {
+    enabled: true,
+    model: config.model,
+    dim: config.dim,
+    processed,
+    pending: semanticState(s).pending.size,
+    backfillDone: semanticState(s).backfillDone,
+  };
 }
 
 const STARTUP_VECTOR_BATCH = 20_000;
@@ -2573,13 +2869,105 @@ function dreamRollback(s, noteId) {
   return result;
 }
 
+/**
+ * Semantic route over the bundled local model. It is independent of the
+ * hashed/remote `vectors` table, so an old store can keep serving recall while
+ * this index backfills. A model failure returns [] and never breaks search.
+ */
+// Vectors are scanned in JS. An unbounded scan over 1M rows reads gigabytes per
+// query, so both vector routes sample the most recent rows and add lexical
+// candidates. A real ANN index is the next step, not a requirement for bounded
+// latency.
+const VECTOR_SAMPLE = Math.max(1000, Number(process.env.OMNI_VECTOR_SAMPLE ?? 5000));
+
+async function semanticSearch(s, queryText, limit, scope, candidates = []) {
+  const config = semanticConfig();
+  if (!config.enabled) return [];
+  // A note written in this same turn is still queued. Index one batch before
+  // querying so "write a note, then ask about it" never depends on a timer.
+  try {
+    await flushSemanticPending(s, config, SEMANTIC_BATCH);
+  } catch (error) {
+    // Keep the failure visible in status without breaking the other routes.
+    semanticState(s).lastError = String(error?.message ?? error);
+  }
+  let queryVector;
+  try {
+    [queryVector] = await embedSemantic([queryText], config, { query: true });
+  } catch (error) {
+    semanticState(s).lastError = String(error?.message ?? error);
+    return [];
+  }
+  if (!queryVector || queryVector.length !== config.dim) return [];
+  if (!queryVector || !queryVector.length) return [];
+  const specList = [
+    { kind: 'note', table: 'notes', extra: 'AND t.superseded_by IS NULL' },
+    { kind: 'fact', table: 'facts', extra: 'AND t.valid_to IS NULL' },
+    { kind: 'chunk', table: 'chunks', extra: '' },
+  ];
+  const candidateIds = new Map();
+  for (const hit of candidates) {
+    if (!hit || !hit.kind) continue;
+    const list = candidateIds.get(hit.kind) ?? [];
+    if (list.length < 400) list.push(Number(hit.id));
+    candidateIds.set(hit.kind, list);
+  }
+  const out = [];
+  for (const spec of specList) {
+    const sampleIds = [];
+    try {
+      for (const row of prepareCached(s.db, `
+        SELECT owner_id FROM semantic_vectors
+        WHERE model = ? AND kind = ? AND dim = ?
+        ORDER BY owner_id DESC LIMIT ?
+      `).all(config.signature, spec.kind, config.dim, VECTOR_SAMPLE)) sampleIds.push(Number(row.owner_id));
+    } catch { /* semantic table may not exist on a pre-v14 store */ }
+    const extraIds = (candidateIds.get(spec.kind) ?? []).filter(id => Number.isFinite(id) && id > 0);
+    const ids = [...new Set([...sampleIds, ...extraIds])];
+    for (let offset = 0; offset < ids.length; offset += 500) {
+      const chunk = ids.slice(offset, offset + 500);
+      if (!chunk.length) continue;
+      const placeholders = chunk.map(() => '?').join(',');
+      try {
+        for (const row of prepareCached(s.db, `
+          SELECT v.owner_id AS owner_id, v.vec AS vec, t.*
+          FROM semantic_vectors v JOIN ${spec.table} t ON t.id = v.owner_id
+          WHERE v.model = ? AND v.kind = ? AND v.dim = ?
+            AND v.owner_id IN (${placeholders})
+            AND t.deleted_at IS NULL ${spec.extra}
+        `).all(config.signature, spec.kind, config.dim, ...chunk)) {
+          if (!scopeAllows(row.scope, scope, false)) continue;
+          let score = 0;
+          try { score = dot(queryVector, fromBlob(row.vec, config.dim)); } catch { continue; }
+          if (!Number.isFinite(score) || score < SEMANTIC_MIN_COSINE) continue;
+          out.push({
+            kind: spec.kind,
+            id: Number(row.owner_id),
+            ts: Number(row.ts ?? row.valid_from ?? 0),
+            scope: row.scope ?? null,
+            text: String(row.text ?? '').slice(0, 400),
+            source: row.source ?? '',
+            ...(spec.kind === 'note' ? solutionFields(row) : {}),
+            score,
+            cosine: score,
+            semanticScore: score,
+            via: 'semantic',
+          });
+        }
+      } catch { /* skip an unreadable chunk */ }
+    }
+  }
+  out.sort((a, b) => b.score - a.score);
+  return out.slice(0, limit);
+}
+
 /** Vector route: cosine over the stored hashed n-gram vectors. */
 const VECTOR_MIN_COSINE = 0.2;
 const RRF_K = 60;
-// Vectors are scanned in JS. An unbounded scan over 1M rows reads gigabytes per
-// query, so the route samples the most recent vectors and adds lexical candidates.
-// A real ANN index is the next step, not a requirement for bounded latency.
-const VECTOR_SAMPLE = Math.max(1000, Number(process.env.OMNI_VECTOR_SAMPLE ?? 5000));
+// Local semantic scores are calibrated cosine similarities, not just ranks.
+// Giving them more RRF weight keeps a noisy hashed collision from outranking a
+// clear paraphrase hit; lexical and exact problemKey still win on exact text.
+const RRF_WEIGHT = { lexical: 1, vector: 1, semantic: 2, graph: 0.5 };
 
 async function vectorSearch(s, queryText, limit, scope, candidates = []) {
   const config = backendConfig();
@@ -2950,7 +3338,7 @@ async function runSearch(s, query, limit, scope, options = {}) {
     return true;
   };
   const profile = process.env.OMNI_PROFILE === '1'
-    ? { terms: terms.length, notes: 0, facts: 0, chunks: 0, lexical: 0, vector: 0, graph: 0 }
+    ? { terms: terms.length, notes: 0, facts: 0, chunks: 0, lexical: 0, vector: 0, semantic: 0, graph: 0 }
     : null;
   const timed = async (key, fn) => {
     if (!profile) return fn();
@@ -2977,13 +3365,14 @@ async function runSearch(s, query, limit, scope, options = {}) {
   const useVector = process.env.OMNI_DISABLE_VECTOR !== '1';
   if (useVector) await flushPendingVectors(s);
   const vector = useVector ? (await timed('vector', () => vectorSearch(s, query, limit, scope, lexical))).filter(hitAllowed) : [];
-  const graph = (await timed('graph', () => graphExpand(s, [...lexical, ...vector], Math.min(limit, 10), scope))).filter(hitAllowed);
+  const semantic = useVector ? (await timed('semantic', () => semanticSearch(s, query, limit, scope, [...lexical, ...vector]))).filter(hitAllowed) : [];
+  const graph = (await timed('graph', () => graphExpand(s, [...lexical, ...vector, ...semantic], Math.min(limit, 10), scope))).filter(hitAllowed);
   if (profile) {
-    profile.hits = lexical.length + vector.length + graph.length;
+    profile.hits = lexical.length + vector.length + semantic.length + graph.length;
     profile.at = now();
     lastSearchProfile = profile;
   }
-  if (!vector.length && !graph.length) {
+  if (!vector.length && !semantic.length && !graph.length) {
     const ranked = await maybeRerank(query, lexical, limit, options);
     return finalizeHits(ranked, limit);
   }
@@ -2991,9 +3380,13 @@ async function runSearch(s, query, limit, scope, options = {}) {
   const fused = new Map();
   const add = (hit, index) => {
     const key = `${hit.kind}:${hit.id}`;
-    const entry = fused.get(key) ?? { hit, rrf: 0, lexical: null, vector: null, graph: null };
-    entry.rrf += 1 / (RRF_K + index + 1);
-    if (hit.via === 'vector') {
+    const entry = fused.get(key) ?? { hit, rrf: 0, lexical: null, vector: null, semantic: null, graph: null };
+    const weight = RRF_WEIGHT[hit.via] ?? RRF_WEIGHT.lexical;
+    entry.rrf += weight / (RRF_K + index + 1);
+    if (hit.via === 'semantic') {
+      entry.semantic = hit.score;
+      entry.hit = { ...entry.hit, semanticScore: hit.score };
+    } else if (hit.via === 'vector') {
       entry.vector = hit.score;
       entry.hit = { ...entry.hit, vectorScore: hit.score };
     } else if (hit.via === 'graph') {
@@ -3007,6 +3400,7 @@ async function runSearch(s, query, limit, scope, options = {}) {
   };
   lexical.forEach((hit, index) => add(hit, index));
   vector.forEach((hit, index) => add(hit, index));
+  semantic.forEach((hit, index) => add(hit, index));
   graph.forEach((hit, index) => add(hit, index));
 
   const ranked = [...fused.values()]
@@ -3021,6 +3415,7 @@ async function runSearch(s, query, limit, scope, options = {}) {
         rrf: Number(entry.rrf.toFixed(6)),
         lexicalScore: entry.lexical,
         vectorScore: entry.vector,
+        semanticScore: entry.semantic,
         graphScore: entry.graph,
       };
     })
@@ -4614,33 +5009,43 @@ function defineTools(ctx) {
 
   disposers.push(registerLocalTool({
     name: 'memory_reindex',
-    description: 'Rebuild derived indexes. Vectors: backfill for the active embedding backend (after switching OMNI_EMBED_URL/model or restoring an old database). bigrams: rebuild the whole CJK two-character index in one call (a large legacy store otherwise needs many restarts).',
+    description: 'Rebuild derived indexes. Vectors: backfill for the active embedding backend (after switching OMNI_EMBED_URL/model or restoring an old database). semantic: backfill the bundled local semantic index. bigrams: rebuild the whole CJK two-character index in one call (a large legacy store otherwise needs many restarts).',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        limit: { type: 'number', description: 'Maximum vector rows to process this call, default 200, max 1000.' },
+        limit: { type: 'number', description: 'Maximum rows to process this call, default 200, max 1000.' },
         bigrams: { type: 'boolean', description: 'true rebuilds the entire CJK bigram index (explicit, can take a while on large stores).' },
-        vectors: { type: 'boolean', description: 'With bigrams: also run the vector backfill in the same call.' },
+        vectors: { type: 'boolean', description: 'Also run the active hashed/remote vector backfill.' },
+        semantic: { type: 'boolean', description: 'true backfills the bundled local semantic index (BGE-small-zh int8, no model download).' },
       },
     },
     output: {
-      schema: { type: 'object', properties: { processed: { type: 'number' }, queued: { type: 'number' }, backend: { type: 'string' }, bigrams: { type: 'object' } } },
-      render: (_args, value) => textBlock(`reindexed ${value.processed} rows (${value.backend}${value.queued ? `, ${value.queued} queued` : ''})${value.bigrams ? `; bigrams ${value.bigrams.scanned} in ${value.bigrams.passes} pass(es)` : ''}`),
+      schema: { type: 'object', properties: { processed: { type: 'number' }, queued: { type: 'number' }, backend: { type: 'string' }, bigrams: { type: 'object' }, semantic: { type: 'object' } } },
+      render: (_args, value) => textBlock(`reindexed ${value.processed} rows (${value.backend}${value.queued ? `, ${value.queued} queued` : ''})${value.semantic ? `; semantic ${value.semantic.processed ?? 0} (${value.semantic.enabled === false ? value.semantic.reason : value.semantic.model})` : ''}${value.bigrams ? `; bigrams ${value.bigrams.scanned} in ${value.bigrams.passes} pass(es)` : ''}`),
     },
     async execute(args = {}) {
       const s = openStore();
       const bigrams = args.bigrams === true ? reindexBigrams(s) : null;
       const config = backendConfig();
       const limit = Math.min(1000, Math.max(1, Number(args.limit ?? 200)));
-      if (args.bigrams === true && args.vectors !== true) {
-        return { processed: 0, queued: 0, backend: config.kind, bigrams };
+      const wantSemantic = args.semantic === true;
+      const wantVectors = args.vectors === true || (args.semantic !== true && args.bigrams !== true);
+      const semantic = wantSemantic ? await reindexSemantic(s, limit) : null;
+      if (!wantVectors) {
+        return {
+          processed: semantic?.processed ?? 0,
+          queued: semantic?.pending ?? 0,
+          backend: semantic?.enabled === false ? config.kind : 'local',
+          bigrams,
+          semantic,
+        };
       }
       if (config.kind === 'hashed') {
         const before = Number(prepareCached(s.db, 'SELECT COUNT(*) AS n FROM vectors').get().n);
         backfillVectors(s.db, { limit });
         const after = Number(prepareCached(s.db, 'SELECT COUNT(*) AS n FROM vectors').get().n);
-        return { processed: Math.max(0, after - before), queued: 0, backend: 'hashed', ...(bigrams ? { bigrams } : {}) };
+        return { processed: Math.max(0, after - before), queued: 0, backend: 'hashed', ...(bigrams ? { bigrams } : {}), ...(semantic ? { semantic } : {}) };
       }
       const dim = await ensureRemoteDim(s);
       if (!dim) throw new Error('remote embedding endpoint did not return a dimension');
@@ -4654,7 +5059,7 @@ function defineTools(ctx) {
         if (after >= before) break;
         processed += before - after;
       }
-      return { processed, queued: pendingVectors.size, backend: `remote:${dim}`, ...(bigrams ? { bigrams } : {}) };
+      return { processed, queued: pendingVectors.size, backend: `remote:${dim}`, ...(bigrams ? { bigrams } : {}), ...(semantic ? { semantic } : {}) };
     },
   }));
 
@@ -5791,6 +6196,7 @@ function registerRoutes(ctx) {
           dim: activeVectorDim(),
           pending: pendingVectors.size,
         },
+        semantic: semanticStatus(s),
         stats: {
           notes: count('notes'),
           facts: Number(prepareCached(s.db, 'SELECT COUNT(*) AS n FROM facts WHERE deleted_at IS NULL AND valid_to IS NULL').get().n),
@@ -5993,6 +6399,7 @@ export function apply(ctx) {
   }, 'omni-memory: dream timer');
 
   ctx.effect(() => () => {
+    if (store) releaseSemanticLease(store);
     try { store?.db?.close(); } catch { /* ignore */ }
     store = undefined;
   }, 'omni-memory: store');

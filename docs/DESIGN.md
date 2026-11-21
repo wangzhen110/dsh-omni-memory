@@ -2,10 +2,10 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | 3.9.1 |
-| 插件版本 | 3.9.1 |
+| 文档版本 | 3.9.2 |
+| 插件版本 | 3.9.2 |
 | 状态 | 已评审（本文为开发与验收的**唯一依据**） |
-| 目标平台 | DSH 0.2.2-rc.3 原生插件（Desktop，Windows 11，Node 24.17）；MCP / HTTP / OpenAPI / CLI 宿主通用 |
+| 目标平台 | DSH 0.2.2-rc.3 原生插件（Desktop，Windows 11，Node 22.23.2，`engines >=22.13`）；MCP / HTTP / OpenAPI / CLI 宿主通用 |
 | 最后更新 | 2026-11-21 |
 | 变更规则 | 任何行为变更必须先改本文并升版本，再改代码 |
 
@@ -54,11 +54,11 @@
 | FR-14 | 界面浏览 | 左栏「记忆」面板列出笔记与事实，含类型、正文、来源、作用域、重要性 | ✅ |
 | FR-15 | 界面搜索 | 面板搜索框调用同一检索算法，展示命中条数与结果 | ✅ |
 | FR-16 | 界面遗忘 | 面板按钮触发遗忘并刷新列表 | ✅ |
-| FR-17 | 向量融合排序 | 黄金集 MRR 不低于仅词面基线 | ✅ 默认哈希后端：MRR 0.776 → 0.927；配置远程语义后端可进一步提升 |
+| FR-17 | 向量融合排序 | 黄金集 MRR 不低于仅词面基线 | ✅ 内置本地语义：词面 MRR 0.776 → 0.927（hashed）→ **0.979**（BGE-small-zh int8） |
 | FR-18 | 图游走召回 | 通过实体边扩散，召回直接匹配不到的相关条目 | ✅ 已实现（2 跳、衰减 0.5、按边召回） |
 | FR-19 | 冲突标记 | 笔记之间冲突时置 `contested=1` 并在界面标注 | ✅ 已实现（显式 `contradicts` + 余弦 ≥0.9 启发） |
 | FR-20 | 做梦校验 | 离线任务用原文核对笔记，发现错误时标记并留痕；替代需人工确认且可回滚 | ✅ 已实现（覆盖度 + 特征词缺失判定；`apply` 只标记，`commit`/单条 replace 才替代） |
-| FR-21 | 真语义嵌入后端 | 换说法（无共享字）仍能召回；由外部 OpenAI 兼容 `/embeddings` 提供 | ✅ 已实现（默认仍为哈希后端；远程路径经本地 mock 端点验证） |
+| FR-21 | 真语义嵌入后端 | 换说法（无共享字）仍能召回；默认零配置，不要求用户安装服务、拉模型或配 key | ✅ 已实现：`BAAI/bge-small-zh-v1.5` int8 ONNX + ONNX Runtime WASM 随包分发，进程内 CPU 推理；远程 OpenAI 兼容 `/embeddings` 仍可选 |
 | FR-22 | 面板分页与状态展示 | 列表支持 `limit/offset` 并显示总数；卡片展示 `contested`、`verification`、`evidence`、`superseded` | ✅ 已实现 |
 | FR-23 | 转录增长治理 | `memory_compact` 按保留上限墓碑化最旧转录；行保留可审计；dry-run 默认 | ✅ 已实现 |
 | FR-24 | 自动召回开关 | 开启时用当前用户消息预取 top-3 并拼入提示；`OMNI_AUTO_RECALL=0` 关闭 | ✅ 已实现（默认开启） |
@@ -73,9 +73,10 @@
 | FR-33 | 召回质量反馈 | `memory_feedback` 对 note/fact 记 `useful` / `misleading`；搜索返回计数与质量，反馈参与 Bayesian 平滑后的排序 | ✅ 已实现（schema v12） |
 | FR-34 | 渐进披露 | `memory_get` 按 kind+id 展开完整正文，最多 20 条；默认当前项目 + global，`all` 需显式 | ✅ 已实现 |
 | FR-35 | 笔记修订链 | `memory_amend` 产生新 revision，旧行 `superseded_by` 指向新行；搜索只见新行，旧行保留审计 | ✅ 已实现 |
-| FR-36 | 检索质量门禁 | 黄金集 recall ≥ 0.85、MRR ≥ 0.9；`npm run bench:golden` 失败即退出码 1，CI 强制执行 | ✅ 已实现（当前 MRR 0.927） |
+| FR-36 | 检索质量门禁 | 黄金集 recall ≥ 0.85、MRR ≥ 0.9；`npm run bench:golden` 失败即退出码 1，CI 强制执行 | ✅ 已实现（当前 MRR 0.979） |
 | FR-37 | 无 MCP 宿主适配 | `GET /packet` 返回可注入的画像+召回包；`POST /tool` 暴露受限工具面；`openapi.json` 可被 function-calling/OpenAPI 客户端导入 | ✅ 已实现（HTTP adapter） |
 | FR-38 | 会话自动捕获 | `memory_ingest` 写转录并抽取 pending 候选；候选必须显式 accept 才成为 note；`scope=all` 拒写；单条上限 4000 字、每 chunk ≤3 候选 | ✅ 已实现（schema v13） |
+| FR-41 | 零配置语义索引 | 默认开启、离线；模型随包；新写入进入语义队列；旧库后台回填；`semantic_vectors` 按模型签名隔离 | ✅ 已实现（schema v14；`memory_reindex semantic` 可强制回填） |
 | FR-39 | 经验巩固 | `memory_consolidate` 按精确 `problemKey` + 精确 scope 合并；默认 dry-run；应用时写来源链摘要、旧行只 supersede、反馈计数汇总 | ✅ 已实现 |
 | FR-40 | 分层画像与重排 | 画像分 `## 全局` / `## 当前项目`；可选 cross-encoder rerank（未配置端点零延迟，失败回落融合排序）；本地/远程 embedding 预设 | ✅ 已实现 |
 
@@ -90,11 +91,11 @@
 | NFR-05 | 数据可追溯 | 每条记忆有 `source` 或用例可解释其缺失 | 已捕获项均带 source |
 | NFR-06 | 数据不丢失 | 遗忘为墓碑；事实失效为 `valid_to`；无物理删除 | 满足 |
 | NFR-07 | 失败隔离 | 任一子系统（FTS/路由/注入）失效不得导致会话不可用 | 满足（全部 try/catch + 可选降级） |
-| NFR-08 | 隐私 | 所有数据仅存本机 `$DSH_HOME/memory/omni.db`；HTTP 仅 loopback，且浏览器跨站写请求被 Origin 校验拦截；默认不上传 | 部分满足：数据库未加密，loopback HTTP 仍依赖本机进程边界，未做进程级鉴权（ADR-017）。显式配置 `OMNI_EMBED_URL`/远程 `OMNI_EMBED_PROVIDER` 会外发嵌入文本，配置 `OMNI_RERANK_*` 会外发查询与候选正文，均需用户自行选择可信端点 |
+| NFR-08 | 隐私 | 所有数据仅存本机 `$DSH_HOME/memory/omni.db`；HTTP 仅 loopback，且浏览器跨站写请求被 Origin 校验拦截；默认不上传 | 部分满足：数据库未加密，loopback HTTP 仍依赖本机进程边界，未做进程级鉴权（ADR-017）。内置本地语义在进程内推理，不联网；显式配置 `OMNI_EMBED_URL`/远程 `OMNI_EMBED_PROVIDER` 会外发嵌入文本，配置 `OMNI_RERANK_*` 会外发查询与候选正文，均需用户自行选择可信端点 |
 | NFR-09 | 可卸载 | 卸载插件后不残留运行中的监听；数据文件保留由用户决定 | 满足 |
-| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 280/280（100%） |
+| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 283/283（100%） |
 | NFR-11 | 界面本地化 | 中英词典注册，切换语言无需重载插件 | 已实现（词典 + 订阅重渲染） |
-| NFR-12 | 多进程并发 | 同机 N 个宿主进程共用一个库，同时读写不丢数据、不报锁错 | 280/280 含 6 进程并发用例；写入等待上限 5s（ADR-028） |
+| NFR-12 | 多进程并发 | 同机 N 个宿主进程共用一个库，同时读写不丢数据、不报锁错 | 283/283 含 6 进程并发用例；写入等待上限 5s（ADR-028） |
 
 ### 1.3 约束
 
@@ -119,7 +120,7 @@
 | ADR-004 | 注入策略 | 单段系统提示，1200 字预算，30s 缓存 | [ADR/004-injection.md](ADR/004-injection.md) |
 | ADR-005 | 界面位置 | 左栏导航 + `main` 面板，不用 `conversation.view` | [ADR/005-ui-seat.md](ADR/005-ui-seat.md) |
 | ADR-006 | 检索顺序 | 先词面（FTS+分词），向量与图后置 | [ADR/006-retrieval-order.md](ADR/006-retrieval-order.md) |
-| ADR-007 | 默认向量后端 | 哈希字符 n-gram（512 维）+ RRF，非语义 | [ADR/007-embedding-backend.md](ADR/007-embedding-backend.md) |
+| ADR-007 | 默认向量后端（历史） | 哈希字符 n-gram（512 维）+ RRF，非语义；3.9.2 起本地语义并行，hashed 保留为一路与降级后端 | [ADR/007-embedding-backend.md](ADR/007-embedding-backend.md) |
 | ADR-008 | 嵌入后端可插拔 | 环境变量切换；远程写入入队、检索前惰性刷新 | [ADR/008-pluggable-embedding.md](ADR/008-pluggable-embedding.md) |
 | ADR-009 | 图路线与冲突 | 按遍历到的边召回；冲突用显式声明 + 相似度启发 | [ADR/009-graph-and-contradiction.md](ADR/009-graph-and-contradiction.md) |
 | ADR-010 | 做梦校验 | 确定性覆盖度 + 特征词缺失；不调用模型 | [ADR/010-dreaming.md](ADR/010-dreaming.md) |
@@ -131,6 +132,7 @@
 | ADR-016 | 星图实现 | Canvas 2D 手写投影，零依赖；拖拽/缩放/惯性/自转 | [ADR/016-star-map.md](ADR/016-star-map.md) |
 | ADR-017 | HTTP 写入安全与默认隐私 | 写操作只接受 POST；Origin/CSRF 校验；模型复核默认关闭；队列有界 | [ADR/017-http-security.md](ADR/017-http-security.md) |
 | ADR-028 | 多进程并发 | busy_timeout + BEGIN IMMEDIATE + 事务内去重 + meta 租约 | [ADR/028-multi-process-concurrency.md](ADR/028-multi-process-concurrency.md) |
+| ADR-029 | 零配置本地语义 | BGE-small-zh int8 + ONNX Runtime WASM 随包；独立 `semantic_vectors`；后台回填 | [ADR/029-bundled-semantic.md](ADR/029-bundled-semantic.md) |
 
 ### 2.1 参考实现对照（可移植部分）
 
@@ -158,7 +160,7 @@ DSH Host 进程
 │   ├── store         SQLite 句柄与 schema/迁移（唯一写入口）
 │   ├── capture       session/event → chunks
 │   ├── recall        agent/inbox/claimed → 异步预取 top-3（TTL 120s）
-│   ├── retrieval     分词 / FTS / bigram / 向量 / 图游走 / RRF
+│   ├── retrieval     分词 / FTS / bigram / hashed 或远程向量 / 本地语义 / 图游走 / RRF
 │   ├── tools         23 个插件工具（write/ingest/candidate/consolidate/search/solution_report/profile/timeline/forget/dream/dream_proposals/dream_replace/dream_rollback/compact/reindex/export/import/restore/link_entity/persona/get/feedback/amend）
 │   ├── prompt        systemPrompt.section：画像 + 召回段（同步读缓存）
 │   └── routes        20 条 loopback HTTP（list/search/graph/node/forget/restore/export/status/persona/persona/refresh/dream/proposals/dream/replace/dream/rollback/packet/openapi.json/tool/ingest/candidates/candidate/consolidate）
@@ -214,7 +216,7 @@ chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 ### 4.3 迁移策略
 
 `meta.schema_version` 记录整数版本；启动时按序执行 `MIGRATIONS[n]`。
-**当前版本 13**。v7 移除全局 `chunks.hash` 唯一索引，改为按 `(hash, scope)` 的部分唯一索引；为 `edges` 补 `scope`、为 `facts` 补 `recorded_at`；新增 `bigrams` 索引表；并回填旧数据的 scope 与 bigram。v11 为 notes 增加故障经验字段，旧行保持为空/NULL，按 unverified 读取。v12 为 notes/facts 增加召回反馈计数（`recall_count`、`last_recall_at`、`useful_count`、`misleading_count`），旧行从 0 起算。v13 新增 `note_candidates`（会话自动捕获的待审候选），带 `status/scope/hash` 索引，旧库补表不丢数据。新增列/索引必须写迁移，禁止直接改 `CREATE TABLE` 语句（新库与老库必须收敛到同一结构）。
+**当前版本 14**。v7 移除全局 `chunks.hash` 唯一索引，改为按 `(hash, scope)` 的部分唯一索引；为 `edges` 补 `scope`、为 `facts` 补 `recorded_at`；新增 `bigrams` 索引表；并回填旧数据的 scope 与 bigram。v11 为 notes 增加故障经验字段，旧行保持为空/NULL，按 unverified 读取。v12 为 notes/facts 增加召回反馈计数（`recall_count`、`last_recall_at`、`useful_count`、`misleading_count`），旧行从 0 起算。v13 新增 `note_candidates`（会话自动捕获的待审候选），带 `status/scope/hash` 索引，旧库补表不丢数据。v14 新增 `semantic_vectors`（按 `(kind, owner_id, model)` 隔离本地语义向量），旧库补表，语义索引由后台回填。新增列/索引必须写迁移，禁止直接改 `CREATE TABLE` 语句（新库与老库必须收敛到同一结构）。
 
 | 版本 | 变更 | 迁移动作 |
 |---|---|---|
@@ -230,6 +232,8 @@ chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 | 10 | 用户设定 | `persona(key, value, updated_at)`；始终注入，不参与 dream/检索 |
 | 11 | 故障经验库 | `notes.problem_key / solution_status / solution_verified_at / reuse_count / last_used_at`；`problem_key`、`solution_status` 索引 |
 | 12 | 召回质量反馈 | `notes/facts` 增加 `recall_count / last_recall_at / useful_count / misleading_count`；旧行默认 0 |
+| 13 | 会话候选 | `note_candidates(kind, text, scope, status, hash, ...)`；pending 候选不参与正式检索 |
+| 14 | 本地语义向量 | `semantic_vectors(kind, owner_id, model, dim, vec)`；`semantic_vectors_model` 索引；不触碰旧 `vectors` |
 
 未带版本的旧库按 v1 处理，自动补齐到当前版本；旧行不受影响（迁移只加列、不删数据）。
 
@@ -328,8 +332,20 @@ score = 0.6 × 文本分 + 0.2 × 权重分 + 0.2 × 时效分 + 经验状态分
   远程模式下写入只入队，检索前批量刷新（≤32 条/次）；失败保留队列并回退词面。
 - 存储：`vectors(kind, owner_id, dim, vec)`；维度随后端变化，检索只取当前后端维度的行（切换后端无需迁移）。
 - 召回：逐行余弦，阈值 **0.2**；哈希后端额外要求**共享至少一个 token**（抑制碰撞噪声），远程后端不需要。
-- 融合：RRF，`1/(60+rank)` 叠加两路排名；命中项暴露 `lexicalScore` / `vectorScore` / `rrf`。
-- 诊断开关：`OMNI_DISABLE_VECTOR=1` 只跑词面路线（基线与回归对比）。
+- 融合：RRF，`1/(60+rank)` 叠加四路排名（词面 / hashed 或远程向量 / 本地语义 / 图）；权重为词面 1、hashed/远程 1、本地语义 2、图 0.5，避免哈希碰撞压过明确的语义改写命中。命中项暴露 `lexicalScore` / `vectorScore` / `semanticScore` / `rrf`。
+- 诊断开关：`OMNI_DISABLE_VECTOR=1` 同时关闭 hashed/远程向量与本地语义，只跑词面路线（基线与回归对比）。
+
+### 6.5.1 本地语义路线（v3.9.2）
+
+- 模型与运行时随包：`models/bge-small-zh-v1.5/` + `lib/vendor/`，约 39MB；不需要用户安装 Ollama、LM Studio 或配置 key（ADR-029）。
+- 推理：`lib/semantic-embed.mjs`，BGE int8 ONNX + onnxruntime-web WASM，进程内 CPU，CLS pooling + L2 归一化；查询加 BGE 指令前缀，文档不加。
+- 存储：`semantic_vectors(kind, owner_id, model, dim, vec)`，`model` 为签名 `local:bge-small-zh-v1.5:int8:512`；不覆盖旧 `vectors`，hashed 512 维与本地 512 维不会混算。
+- 召回：对最近 5000 条语义向量 + 词面候选做余弦，阈值 **0.25**；命中暴露 `semanticScore`，`via:'semantic'`。
+- 索引：新写入进入内存队列，后台 worker 每批 8 条；检索前先冲刷一批待处理项，保证同轮写入后立即可召回；旧库后台回填（每轮扫描上限 64 条），带 `semantic-backfill` 跨进程租约，进程退出即释放；已索引库不会在启动时加载模型。
+- 状态：`memory_status` / `/omni-memory/status` 的 `semantic` 暴露 `enabled/model/dim/pending/indexed/running/backfillDone/lastError`；`memory_reindex({semantic:true})` 强制回填。
+- 开关：`OMNI_DISABLE_SEMANTIC=1` 单独关闭；`OMNI_DISABLE_VECTOR=1` 同时关闭；`OMNI_SEMANTIC_MODEL_DIR` 可替换同结构模型；`OMNI_SEMANTIC_BATCH` 默认 8（1–64）。
+- 降级：模型缺失、损坏、WASM 加载失败或内存不足时返回空，词面/hashed/图路线继续工作；`lastError` 留痕。
+- 实测：冷加载 208ms，RSS 216MB，512 维；20 次查询 191ms（约 9.5ms/query）；黄金集 recall 1.000、MRR 0.979。
 
 ### 6.6 图路线（v0.9.0）
 
@@ -457,7 +473,7 @@ score = 0.6 × 文本分 + 0.2 × 权重分 + 0.2 × 时效分 + 经验状态分
 
 | 编号 | 缺陷 | 影响 | 计划 |
 |---|---|---|---|
-| D-01 | 真语义召回缺失 | 换说法（无共享字）仍召回不到；当前向量只改善排序 | M2b（FR-21）：接入外部 embedding |
+| D-01 | ~~真语义召回缺失~~ | **3.9.2 已修**：内置 BGE-small-zh int8，默认离线零配置；黄金集 MRR 0.927 → 0.979 | 已关闭（ADR-029） |
 | D-02 | ~~无图游走~~ | **v0.9.0 已实现**（2 跳按边召回）；纯笔记语料无增益 | 已关闭 |
 | D-03 | ~~LIKE 全表扫描~~ | **v0.6.0 已修**：notes/facts 建 FTS5（trigram）+ 回填，词面走 `MATCH`，LIKE 仅作兜底 | 已关闭 |
 | D-04 | ~~`forget` 用 GET~~ | **v0.6.0 已修**：改为 POST（JSON body），GET 保留兼容 | 已关闭 |
@@ -495,7 +511,8 @@ score = 0.6 × 文本分 + 0.2 × 权重分 + 0.2 × 时效分 + 经验状态分
 | FR-09/10 | `test/prompt.test.mjs` | 预算截断、写入即失效、空库返回空串 |
 | FR-11/12/13 | `test/tools.test.mjs` | profile/timeline/forget |
 | FR-14/15/16 | 手工 + `test/api.test.mjs` | 路由数据正确 |
-| FR-17/21 | `test/semantic.test.mjs`、`test/fixes.test.mjs` | 远程维度重启、旧库回填、词面/混合排序 |
+| FR-17/21 | `test/semantic.test.mjs`、`test/fixes.test.mjs` | 内置本地语义改写召回、远程维度重启、旧库回填、词面/混合排序 |
+| FR-41 | `test/semantic.test.mjs`、`scripts/check-semantic-assets.mjs` | 本地模型随包、同轮写入可召回、模型/WASM 完整性闸门 |
 | FR-23 | `test/fixes.test.mjs`、`test/compact.test.mjs` | 墓碑后同文重捕、compact 事务 |
 | FR-26/27/28 | `test/scope-model-judge.test.mjs`、`test/fixes.test.mjs` | HTTP scope、`scope=all` 拒写、跨 scope 事实隔离 |
 | FR-38 | `test/ingest.test.mjs`、`test/capture-rules.test.mjs` | ingest 候选、接受/拒绝、隔离、去重、hook 解析 |
@@ -511,7 +528,7 @@ score = 0.6 × 文本分 + 0.2 × 权重分 + 0.2 × 时效分 + 经验状态分
 > 可靠性 = 通过的自动化用例数 / 自动化用例总数（`npm test` 的 TAP 汇总）。
 
 - 目标：**≥ 95%**。
-- 未实现需求（FR-17..20）不计入通过率，而是以「已知缺陷」单列，避免虚高。
+- 未实现需求不计入通过率，而是以「已知缺陷」单列，避免虚高；FR-17..21 已在 3.9.2 全部实现并纳入统计。
 - 每次发布记录实际数值到 CHANGELOG。
 
 ---
@@ -538,6 +555,7 @@ score = 0.6 × 文本分 + 0.2 × 权重分 + 0.2 × 时效分 + 经验状态分
 | **M3（已完成 v0.9.0）** | 图游走（按边召回）+ 冲突标记 | 96 用例 100%；图测试覆盖跳数/开关/作用域 |
 | **M4（已完成 v1.0.0）** | 做梦校验（覆盖度 + 特征词缺失，dry-run/apply） | 101 用例 100%；「错记 Docker」样例可复现纠正 |
 | **M5（已完成 v1.1.0）** | 面板分页 + 校验状态展示 + 中英 i18n + 转录增长治理 | 107 用例 100%；D-10/11 关闭 |
+| **M6（已完成 v3.9.2）** | 内置 BGE-small-zh int8 + ONNX Runtime WASM；四路 RRF；零配置离线语义 | 283 用例 100%；黄金集 MRR 0.979；冷加载 208ms / RSS 216MB |
 
 ---
 
@@ -558,9 +576,12 @@ score = 0.6 × 文本分 + 0.2 × 权重分 + 0.2 × 时效分 + 经验状态分
 | `OMNI_JUDGE_MODEL` | 自动挑选（优先 `flash/mini/haiku/small/lite`） | 模型 id | 复核使用的模型 | 大模型更准但更贵 | ADR-015 |
 | `OMNI_AUTO_RECALL` | 开启（未设置即开） | `0` 关闭 | 装配时是否用当前用户消息预取 top-3 | 每轮一次本地检索（10k 行 p95 ≈ 10ms） | ADR-012 |
 | `OMNI_DREAM_INTERVAL_MS` | `0`（关闭） | 正整数毫秒 | 后台做梦校验的周期 | 每次最多 100 条笔记 × 300 条转录 | ADR-010 |
-| `OMNI_DISABLE_VECTOR` | 未设置 | `1` 关闭 | 是否启用向量路线 | 关闭后退化为纯词面：黄金集 MRR 0.927 → 0.776 | ADR-006/007 |
+| `OMNI_DISABLE_VECTOR` | 未设置 | `1` 关闭 | 同时关闭 hashed/远程向量与本地语义 | 关闭后退化为纯词面：黄金集 MRR 0.979 → 0.776 | ADR-006/007/029 |
+| `OMNI_DISABLE_SEMANTIC` | 未设置 | `1` 关闭 | 只关闭内置本地语义 | hashed/词面/图仍工作；黄金集回落到 0.927 | ADR-029 |
+| `OMNI_SEMANTIC_MODEL_DIR` | 包内 `models/bge-small-zh-v1.5` | 目录 | 替换本地语义模型 | 需同结构 int8 ONNX + tokenizer | ADR-029 |
+| `OMNI_SEMANTIC_BATCH` | `8` | 1–64 | 本地语义每批条数 | 越大越快回填，单批内存越高 | ADR-029 |
 | `OMNI_DISABLE_GRAPH` | 未设置 | `1` 关闭 | 是否启用图路线 | 关闭后事实链的关联召回消失 | ADR-009 |
-| `OMNI_EMBED_URL` | 未设置 | OpenAI 兼容端点 | 切换为真语义嵌入后端 | 需外部服务；每轮多一次批量 flush | ADR-008 |
+| `OMNI_EMBED_URL` | 未设置 | OpenAI 兼容端点 | 可选：覆盖为远程向量后端 | 需外部服务；本地语义仍独立运行 | ADR-008 |
 | `OMNI_EMBED_MODEL` | `text-embedding-3-small` | 模型 id | 远程嵌入模型 | — | ADR-008 |
 | `OMNI_EMBED_KEY` | 未设置 | API key | 远程鉴权 | 缺失时远程调用失败并降级 | ADR-008 |
 | `OMNI_EMBED_TIMEOUT_MS` | `10000` | 毫秒 | 远程嵌入超时 | 超时即保留队列、只用词面返回 | ADR-008 |

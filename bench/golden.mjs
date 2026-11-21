@@ -60,7 +60,7 @@ const QUESTIONS = [
   ['墓碑机制的意义', 5],
 ];
 
-const app = await boot();
+const app = await boot({ semantic: true });
 await app.call('memory_profile');
 
 const ids = [];
@@ -69,9 +69,18 @@ for (const [index, text] of CORPUS.entries()) {
   ids.push(written.value.id);
 }
 
+// The local semantic index is asynchronous by design. Fill it once so the
+// benchmark measures retrieval quality, not worker scheduling.
+const semanticIndex = await app.call('memory_reindex', { semantic: true, limit: CORPUS.length });
+if (semanticIndex.value.semantic?.enabled !== true) {
+  console.error('local semantic model is not available; refusing to report a false gate');
+  process.exit(1);
+}
+
 async function evaluate(mode) {
   // mode: 'lexical' | 'vector' | 'full'
   process.env.OMNI_DISABLE_VECTOR = mode === 'lexical' ? '1' : '';
+  process.env.OMNI_DISABLE_SEMANTIC = mode === 'full' ? '' : '1';
   process.env.OMNI_DISABLE_GRAPH = mode === 'full' ? '' : '1';
   let hits = 0;
   let mrr = 0;
@@ -107,11 +116,11 @@ console.log(JSON.stringify({
   corpus: CORPUS.length,
   questions: QUESTIONS.length,
   lexicalOnly: lexical,
-  lexicalPlusVector: vector,
-  full_lexical_vector_graph: full,
+  lexicalPlusHashedVector: vector,
+  full_lexical_hashed_semantic_graph: full,
   delta: {
-    vectorVsLexical: Number((vector.mrr - lexical.mrr).toFixed(3)),
-    graphVsVector: Number((full.mrr - vector.mrr).toFixed(3)),
+    hashedVectorVsLexical: Number((vector.mrr - lexical.mrr).toFixed(3)),
+    semanticAndGraphVsVector: Number((full.mrr - vector.mrr).toFixed(3)),
   },
   targets,
   pass,

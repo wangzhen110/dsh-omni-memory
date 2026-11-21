@@ -12,6 +12,10 @@ let counter = 0;
 export async function boot(options = {}) {
   const home = options.home ?? mkdtempSync(path.join(tmpdir(), 'omni-test-'));
   process.env.DSH_HOME = home;
+  // The bundled model costs ~216MB RSS per process. Tests opt in with
+  // boot({ semantic: true }) instead of paying that cost on every case.
+  if (options.semantic === true) delete process.env.OMNI_DISABLE_SEMANTIC;
+  else process.env.OMNI_DISABLE_SEMANTIC = '1';
   counter += 1;
   const mod = await import(`../index.js?case=${counter}-${Date.now()}`);
 

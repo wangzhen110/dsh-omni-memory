@@ -1,13 +1,13 @@
 # 全息记忆（Omni Memory）
 
-> 给任意 AI 宿主的长期记忆内核：DSH 原生插件，MCP / HTTP / OpenAPI / CLI 通用接入；**只增不改的原文留底 + 会自我校验的结论 + 按项目分层 + 三路混合召回 + 可复用的故障经验沉淀**。
+> 给任意 AI 宿主的长期记忆内核：DSH 原生插件，MCP / HTTP / OpenAPI / CLI 通用接入；**只增不改的原文留底 + 会自我校验的结论 + 按项目分层 + 四路混合召回 + 可复用的故障经验沉淀**。
 
 > ⚠️ **许可提醒**：本项目采用 **全息记忆个人使用许可 1.1** —— 仅允许个人、非商业使用；
 > **禁止任何形式的商业使用**，包括直接商用、修改后商用，以及复制、改写或提取本软件
 > **源码/架构**后做商业替代、竞品或商业服务；且**必须署名作者**。
 > 商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-280%2F280-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-283%2F283-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-Personal%20Use%201.1-lightgrey)](LICENSE)
 
 ---
@@ -28,7 +28,7 @@
 
 ## 核心能力
 
-- **混合检索**：词面（FTS5 trigram + 中文二元索引）+ 向量（512 维字符 n-gram，可选接真语义嵌入）+ 图游走，RRF 融合排序；可选 cross-encoder rerank（Jina / Cohere / SiliconFlow / 自建兼容端点），只对 top-20 候选做 0..1 归一化后混合，exact problemKey 命中始终优先
+- **混合检索**：词面（FTS5 trigram + 中文二元索引）+ 向量（内置 BGE-small-zh int8 本地语义，512 维；可选接远程嵌入）+ 图游走，四路 RRF 融合排序；可选 cross-encoder rerank（Jina / Cohere / SiliconFlow / 自建兼容端点），只对 top-20 候选做 0..1 归一化后混合，exact problemKey 命中始终优先
 - **会话自动捕获**：`memory_ingest` 把任意宿主的对话轮次落成转录与待审候选；候选先 pending，`memory_candidate` 接受后才成为正式笔记，不让人写库成为唯一入口
 - **经验巩固**：`memory_consolidate` 按 `problemKey` 把多条活跃笔记压成带来源链的摘要；默认 dry-run，应用时只写 `superseded_by`，不删除原行
 - **分层画像**：注入画像显式分为 `## 全局`、`## 当前项目`，事实段单独保留，项目规则不再和全局规则混在一起
@@ -51,14 +51,16 @@
 
 在 DSH 插件市场搜索「全息记忆 / Omni Memory」安装，重启或刷新后左栏出现「全息记忆」入口。
 
+**语义检索开箱即用**：安装包自带 `BAAI/bge-small-zh-v1.5` int8 ONNX 模型（约 24MB）与 ONNX Runtime WASM（约 15MB），进程内 CPU 推理、默认离线；不需要安装 Ollama、LM Studio，不需要拉模型，不需要 API key。首次打开库时后台回填，新写入笔记在下一批立即进入语义索引。
+
 > 项目已由 `dsh-omni-memory` 更名 `omni-memory`。旧安装请移除 `@local/dsh-memory`，再安装 `@local/omni-memory`；两者共用同一份 `omni.db`，数据不受影响。
 
 ### 本地安装（开发者）
 
 ```bash
 cd /path/to/omni-memory
-npm test          # 280 个用例
-npm run check     # 语法与 JSON 校验
+npm test          # 283 个用例
+npm run check     # 语法、文档计数与模型资产完整性校验
 ```
 
 然后在 DSH 插件管理器中选择本地目录安装。
@@ -103,7 +105,10 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 | `OMNI_SCOPE_JUDGE` | `off` | 模型复核归类：`off` / `auto` / `always`；开启后写入正文会发给复核模型 |
 | `OMNI_JUDGE_PROVIDER` / `OMNI_JUDGE_MODEL` | 自动 | 指定复核用的模型 |
 | `OMNI_PERSONA_MODEL` | `off` | `auto`/`on` 允许后台 persona 自动提炼调用宿主模型；默认只用离线规则 |
-| `OMNI_EMBED_URL` | 未设置 | 接 OpenAI 兼容 `/embeddings` 启用真语义 |
+| `OMNI_DISABLE_SEMANTIC` | 未设置 | `1` 关闭内置本地语义路线（诊断或极低内存环境用） |
+| `OMNI_SEMANTIC_MODEL_DIR` | 包内 `models/bge-small-zh-v1.5` | 换用其他同结构 BGE int8 模型目录 |
+| `OMNI_SEMANTIC_BATCH` | `8` | 本地语义每批推理条数（1–64） |
+| `OMNI_EMBED_URL` | 未设置 | 可选：接 OpenAI 兼容 `/embeddings` 覆盖为远程向量后端 |
 | `OMNI_EMBED_MODEL` | `text-embedding-3-small` | 远程嵌入模型 |
 | `OMNI_EMBED_KEY` | — | 远程嵌入鉴权 |
 | `OMNI_EMBED_PROVIDER` | 未设置 | 预设：openai / dashscope / zhipu / siliconflow / **ollama / lmstudio**（本机 OpenAI 兼容嵌入；不内置模型） |
@@ -116,7 +121,7 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 | `OMNI_RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | cross-encoder 模型名 |
 | `OMNI_RERANK_TIMEOUT_MS` | `5000` | rerank 超时；失败时回落到融合排序，不影响主结果 |
 | `OMNI_DREAM_INTERVAL_MS` | `0`（关） | 定时做梦校验 |
-| `OMNI_DISABLE_VECTOR` | 未设置 | `1` 关闭向量路线（诊断用） |
+| `OMNI_DISABLE_VECTOR` | 未设置 | `1` 同时关闭 hashed/远程向量与内置语义（诊断用） |
 | `OMNI_DISABLE_GRAPH` | 未设置 | `1` 关闭图路线 |
 
 ## 模型工具
@@ -156,9 +161,9 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 
 ## 测试与指标
 
-- 自动化用例：**280 / 280 通过**
+- 自动化用例：**283 / 283 通过**
 - 检索延迟（本机复核，Node 22.23.2；标准 bench 已改为 global scope 并断言真实命中）：10,000 行 p95 ≈ **2.4ms**；100,000 行 ≈ 2.4ms；1,000,000 行 ≈ 6.0ms；1M + 5 万向量 + 100 万 bigram ≈ **116.8ms**（两段式有界检索，见 ADR-020）
-- 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 混合检索 **0.927**
+- 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 旧 hashed 混合 0.927 → 内置本地语义单独 **0.979**；语义冷加载约 208ms，单查询约 9.5ms（20 次 191ms，本机 CPU）
 
 ```bash
 npm test
@@ -175,7 +180,7 @@ npm run bench:golden   # 黄金集
 ## 文档
 
 - [设计规格](docs/DESIGN.md)（需求、架构、数据模型、契约、失败模式、追溯矩阵）
-- [架构决策记录](docs/ADR)（28 份）
+- [架构决策记录](docs/ADR)（29 份）
 - [威胁模型](docs/THREAT-MODEL.md)（信任边界、残余风险、新增路由检查清单）
 - 备份/恢复设计见 [ADR-019](docs/ADR/019-backup-restore.md)
 - 1M 行检索改造见 [ADR-020](docs/ADR/020-bounded-retrieval.md)
@@ -190,6 +195,7 @@ npm run bench:golden   # 黄金集
 - [更新日志](docs/CHANGELOG.md)
 - [3.9.0 自动捕获与巩固完成报告](docs/COMPLETION-2026-11-21.md)
 - [3.9.1 复核问题修复报告](docs/COMPLETION-3.9.1-2026-11-21.md)
+- [3.9.2 零配置语义整改报告](docs/COMPLETION-3.9.2-2026-11-21.md)
 - [架构图](docs/architecture.png)
 
 ## 许可证

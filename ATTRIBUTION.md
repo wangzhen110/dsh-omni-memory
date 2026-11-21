@@ -98,3 +98,15 @@ https://github.com/wangzhen110/omni-memory/issues
 ---
 
 许可全文见 [LICENSE](LICENSE)。
+
+---
+
+## 五、随包第三方组件
+
+| 组件 | 用途 | 许可证 | 许可文件 |
+|---|---|---|---|
+| `BAAI/bge-small-zh-v1.5` int8 ONNX | 本地语义嵌入模型 | MIT | `models/bge-small-zh-v1.5/MODEL-CARD.md` |
+| ONNX Runtime Web | WASM 推理运行时 | MIT | `lib/vendor/ONNXRUNTIME-LICENSE.txt` |
+| HuggingFace Tokenizers (WASM) | 分词 | Apache-2.0 | `lib/vendor/TOKENIZERS-LICENSE.txt` |
+
+这些组件随插件一起分发，但不改变本项目自身的「全息记忆个人使用许可 1.1」。再分发时请保留上述许可文件与版权声明。

@@ -1,6 +1,6 @@
 # 全息记忆 · 机理与接口参考
 
-> 版本 3.9.1 · 生成日期 2026-11-21 · 依据源码与真实 schema v13 核对
+> 版本 3.9.2 · 生成日期 2026-11-21 · 依据源码与真实 schema v14 核对
 >
 > **给 AI 的用法**：这份文档按「先原理、后接口、最后剧本」组织。第一次接触时读第 1、2、9 章即可开工；要精确调用某个工具，直接跳到第 9 章对应小节。若这份文档已同步进记忆库（`omni memory:sync`），也可以先用 `memory_search` 搜"全息记忆 接口"定位。
 
@@ -24,7 +24,7 @@
    SQLite（omni.db）        单文件、本地、可备份
 ```
 
-- **内核**：schema、写入、检索、事实、实体图、画像、dream、备份。只依赖 `node:sqlite`、`node:crypto`、`node:fs`、`node:os`、`node:path`，加上自有的 `lib/embed*.mjs`。
+- **内核**：schema、写入、检索、事实、实体图、画像、dream、备份。只依赖 `node:sqlite`、`node:crypto`、`node:fs`、`node:os`、`node:path`，加上自有的 `lib/embed*.mjs`、`lib/semantic-embed.mjs` 与 `lib/vendor/` 内的 ONNX Runtime / tokenizers WASM。
 - **适配层**：`hosts/shared/headless.mjs` 提供最小宿主上下文；`hosts/mcp/`、`hosts/http/`、`hosts/cli.mjs` 各自只写传输代码。
 - **宿主**：DSH 插件（`apply(ctx)`）、MCP stdio、MCP over HTTP、REST、CLI。
 
@@ -58,7 +58,7 @@ memory_write(kind, text, scope?)
   → decideScope()        决定落哪一层
   → 去重检查              同层同内容跳过（返回 deduped=true）
   → 落库                  note / fact / chunk
-  → 派生                  facts 自动生成 entities + edges；notes/chunks 生成向量
+  → 派生                  facts 自动生成 entities + edges；notes/chunks/facts 生成向量与本地语义向量
 ```
 
 三种 `kind`：
@@ -135,8 +135,10 @@ evidence: npm test → 242/242 passed
 三路并行，然后在融合层合并：
 
 1. **词面**：SQLite FTS5（trigram）＋中文二元索引（`bigrams` 表，逐字切 2 字组合）。
-2. **向量**：默认 512 维字符 n-gram 哈希向量（零依赖、离线可用）；配置 `OMNI_EMBED_URL` 后改走真语义嵌入，维度持久化在 `meta`，换模型会触发回填。
-3. **图**：从 `facts` 生成的 `entities` + `edges`，做 2 跳关联召回。
+2. **向量**：默认 512 维字符 n-gram 哈希向量（零依赖、离线可用）；配置 `OMNI_EMBED_URL` 后这一路改走远程真语义嵌入，维度持久化在 `meta`，换模型会触发回填。
+3. **本地语义**：包内 `BAAI/bge-small-zh-v1.5` int8 ONNX + ONNX Runtime WASM，512 维，进程内 CPU；查询加 BGE 指令前缀，阈值 0.25；与 hashed 向量分表存放，互不混算。旧库按 `semantic-backfill` 跨进程租约分批回填，进程退出释放；已索引库启动时不加载模型。
+4. **图**：从 `facts` 生成的 `entities` + `edges`，做 2 跳关联召回。
+四路排名用 RRF 融合（词面 1 / hashed 或远程 1 / 本地语义 2 / 图 0.5）；命中项分别带 `lexicalScore`、`vectorScore`、`semanticScore`、`rrf`。
 
 融合用 RRF（Reciprocal Rank Fusion，`K=60`），再叠加重要性、problemKey 精确命中、状态修正。候选池按 `limit × 4` 取，避免小样本抖动。
 
@@ -161,13 +163,13 @@ DSH 外（MCP 等）：没有注入点，改为 `memory_context` 显式调用，
 - `memory_compact`：把超出保留量的最老转录墓碑化（默认留 5000，最小 50）。
 - `memory_dream`：拿原文核对笔记，结论"与原文矛盾"的只标 contested；`commit=true` 才替代。
 - `memory_export` / `memory_import`：可移植 JSON，默认含墓碑；导入按内容去重、默认 dry-run。
-- `memory_reindex`：向量回填、bigram 全量重建。
+- `memory_reindex`：hashed/远程向量回填、本地语义回填、bigram 全量重建。
 
 ---
 
-## 3. 数据模型（schema v13，实测）
+## 3. 数据模型（schema v14，实测）
 
-共 11 张业务表。字段按真实 `PRAGMA table_info` 导出。
+共 12 张业务表（不含 FTS 影子表）。字段按真实 `PRAGMA table_info` 导出。
 
 ### 3.1 meta
 `key`(pk), `value`
@@ -201,10 +203,13 @@ DSH 外（MCP 等）：没有注入点，改为 `memory_context` 显式调用，
 ### 3.9 vectors（派生向量）
 `kind`(pk), `owner_id`(pk), `dim`, `vec`。`kind` 区分 note / chunk / fact。
 
-### 3.10 bigrams（中文二元索引）
+### 3.10 semantic_vectors（本地语义向量）
+`kind`(pk), `owner_id`(pk), `model`(pk), `dim`, `vec`。`model` 是签名 `local:bge-small-zh-v1.5:int8:512`；与 `vectors` 分开，避免 512 维 hashed 与 512 维 BGE 混算。索引 `semantic_vectors_model(model)`。
+
+### 3.11 bigrams（中文二元索引）
 `layer`(pk), `owner_id`(pk), `gram`(pk)，索引 `bigrams_gram(gram, layer, owner_id)`。
 
-### 3.11 FTS 影子表
+### 3.12 FTS 影子表
 `notes_fts`、`facts_fts`、`chunks_fts` 及 SQLite 内部表。由触发器/回填维护，不要手写。
 
 ---
@@ -362,7 +367,7 @@ MCP 无法写客户端系统提示，所以同一份 `RULES_TEXT` 铺五条路�
 参数：`path` 必填、`dryRun` boolean（默认 true）。按内容去重合并。
 
 ### 5.19 memory_reindex
-参数：`limit` number（默认 200，最大 1000）、`bigrams` boolean、`vectors` boolean。换嵌入模型或恢复旧库后使用。
+参数：`limit` number（默认 200，最大 1000）、`bigrams` boolean、`vectors` boolean、`semantic` boolean。换嵌入模型、恢复旧库或模型升级后使用。`semantic=true` 只跑本地语义回填（`backend:"local"`，返回 `{processed,pending,backfillDone,...}`）；`semantic=true, vectors=true` 同时跑两套向量；`bigrams=true` 单独触发中文二元索引全量重建。
 
 ### 5.20 memory_feedback
 参数：`kind`（`note|fact`）、`id`、`rating`（`useful|misleading`），均必填。写入召回质量投票；`memory_search` 命中项返回 `usefulCount`、`misleadingCount`、`feedbackCount`、`lastFeedbackAt`、`quality`，排序使用 Bayesian 平滑后的反馈分。
@@ -488,13 +493,15 @@ mcp      以 stdio 启动 MCP（等同 hosts/mcp/bin.mjs）
 | `OMNI_SCOPE_JUDGE` | `off` | 模型复核归类：`off`/`auto`/`always` |
 | `OMNI_JUDGE_PROVIDER` / `OMNI_JUDGE_MODEL` | 自动 | 复核用模型 |
 | `OMNI_PERSONA_MODEL` | `off` | persona 提炼是否允许调模型 |
-| `OMNI_EMBED_URL` / `OMNI_EMBED_MODEL` / `OMNI_EMBED_KEY` | 未设置 | 远程语义嵌入（OpenAI 兼容） |
+| `OMNI_DISABLE_SEMANTIC` | 未设置 | `1` 关闭包内本地语义 |
+| `OMNI_SEMANTIC_MODEL_DIR` / `OMNI_SEMANTIC_BATCH` | 包内模型 / `8` | 本地语义模型目录与批大小 |
+| `OMNI_EMBED_URL` / `OMNI_EMBED_MODEL` / `OMNI_EMBED_KEY` | 未设置 | 可选：远程语义嵌入（OpenAI 兼容），覆盖 hashed 这一路 |
 | `OMNI_EMBED_PROVIDER` | 未设置 | 预设：openai/dashscope/zhipu/siliconflow |
 | `OMNI_EMBED_BATCH` / `OMNI_EMBED_RETRIES` / `OMNI_EMBED_TIMEOUT_MS` | `64` / `2` / `10000` | 嵌入批处理与重试 |
 | `OMNI_DREAM_INTERVAL_MS` | `0`（关） | 定时做梦校验 |
 | `OMNI_BUSY_TIMEOUT_MS` | `5000` | 写锁等待上限（毫秒，上限 60000）；多客户端共用一库时调大更稳 |
 | `OMNI_SEARCH_WINDOW` / `OMNI_VECTOR_SAMPLE` | 内部默认 | 检索候选窗口与向量采样 |
-| `OMNI_DISABLE_VECTOR` / `OMNI_DISABLE_GRAPH` | 未设置 | 诊断：关闭某一路 |
+| `OMNI_DISABLE_VECTOR` / `OMNI_DISABLE_GRAPH` / `OMNI_DISABLE_SEMANTIC` | 未设置 | 诊断：关闭对应路线；`DISABLE_VECTOR` 同时关本地语义 |
 
 ---
 
@@ -504,9 +511,9 @@ mcp      以 stdio 启动 MCP（等同 hosts/mcp/bin.mjs）
 - **MCP 无事件流**：原文转录不会自动增长，只有显式写入。
 - **无模型复核 / dream 定时**：非 DSH 宿主不提供 `llm`，两项能力自然关闭。
 - **HTTP 无鉴权**：靠回环 + 同源校验；跨机部署前必须自己加反代与鉴权。
-- **Node 22 上 `node:sqlite` 是实验特性**：可用，但会有一条已被入口屏蔽的警告；声明 `>=24`。
+- **Node 22 上 `node:sqlite` 是实验特性**：可用，但会有一条已被入口屏蔽的警告；`engines` 声明 `>=22.13`，本机实测 Node 22.23.2。
 - **core 未拆分**：`index.js` 仍是单体，新增宿主要走 `hosts/shared/boot.mjs`，不要再写第二套内核。
-- **向量默认是字符 n-gram 哈希**：语义能力有限；要真语义必须接远程嵌入并 `memory_reindex`。
+- **默认语义是本地模型**：`BAAI/bge-small-zh-v1.5` int8，随包 39MB，零配置离线；只有想换远程嵌入时才配 `OMNI_EMBED_URL` 并 `memory_reindex(vectors=true)`。本地语义用 `memory_reindex(semantic=true)`。
 
 ---
 
@@ -570,10 +577,13 @@ memory_reindex(bigrams=true, vectors=true)
 ## 12. 文件地图
 
 ```
-index.js                内核 + DSH 插件入口（约 4400 行）
+index.js                内核 + DSH 插件入口（约 4900 行）
 client.js               DSH 客户端星图（React）
 lib/embed.mjs           512 维字符 n-gram 哈希向量
 lib/embed-provider.mjs  远程嵌入适配
+lib/semantic-embed.mjs  包内 BGE-small-zh int8 本地语义
+lib/vendor/             ONNX Runtime WASM + tokenizers WASM + 许可证
+models/bge-small-zh-v1.5/  int8 ONNX 权重、tokenizer、模型卡
 hosts/shared/headless.mjs   最小宿主上下文
 hosts/shared/boot.mjs       三个入口共用启动
 hosts/shared/context-tool.mjs  memory_context
@@ -584,5 +594,6 @@ hosts/http/server.mjs   面板 / REST 挂载 / HTTP MCP
 hosts/http/web/         独立面板（列表/星图/规则）
 hosts/cli.mjs           omni 命令行
 scripts/check-docs.mjs  文档漂移闸门
-test/*.test.mjs         242 个用例
+scripts/check-semantic-assets.mjs  模型与运行时完整性闸门
+test/*.test.mjs         283 个用例
 ```

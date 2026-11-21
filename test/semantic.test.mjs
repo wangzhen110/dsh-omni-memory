@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { boot } from './helpers.mjs';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { boot, fakeReq, fakeRes } from './helpers.mjs';
 
 /**
  * A mock OpenAI-compatible embeddings endpoint. It maps text to a concept
@@ -96,6 +99,67 @@ test('FR-21 the same query finds nothing on the hashed backend', async () => {
   } finally {
     if (previous !== undefined) process.env.OMNI_EMBED_URL = previous;
   }
+});
+
+test('FR-21 the bundled local model recalls a paraphrase with zero shared characters', async () => {
+  const app = await boot({ semantic: true });
+  await app.call('memory_write', {
+    kind: 'note',
+    text: '调用 inspectSession 会把实时投影顶掉，聊天区变空白',
+    importance: 0.9,
+  });
+
+  const hit = await app.call('memory_search', { query: '那个把界面弄没的坑' });
+  assert.equal(hit.value.hits.length, 1, 'local semantic route should recall the note');
+  const first = hit.value.hits[0];
+  assert.ok(first.semanticScore > 0, 'local semantic route must contribute');
+  assert.equal(first.lexicalScore ?? null, null, 'lexical route cannot match this query');
+});
+
+test('FR-41 the background worker drains more than one semantic batch', async () => {
+  const app = await boot({ semantic: true });
+  for (let index = 0; index < 12; index += 1) {
+    await app.call('memory_write', {
+      kind: 'note',
+      text: `语义回填测试第 ${index} 条：${index % 2 ? '磁盘满了如何释放系统盘' : '实时投影被顶掉导致聊天区空白'}`,
+      importance: 0.8,
+    });
+  }
+
+  let status;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const { res, json } = fakeRes();
+    await app.route('/omni-memory/status').handler(fakeReq('/omni-memory/status'), res);
+    status = json();
+    if (status.semantic.indexed >= 12 && status.semantic.backfillDone) break;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.ok(status.semantic.indexed >= 12, `worker indexed only ${status.semantic.indexed} rows`);
+  assert.equal(status.semantic.backfillDone, true, 'backfill should finish after draining batches');
+});
+
+test('FR-41 an upgraded store backfills rows written before the model existed', async () => {
+  const home = mkdtempSync(path.join(tmpdir(), 'omni-semantic-old-'));
+  const old = await boot({ home });
+  for (let index = 0; index < 12; index += 1) {
+    await old.call('memory_write', {
+      kind: 'note',
+      text: `升级前写入的第 ${index} 条：${index % 2 ? '磁盘满了如何释放系统盘' : '实时投影被顶掉导致聊天区空白'}`,
+      importance: 0.8,
+    });
+  }
+
+  const app = await boot({ home, semantic: true });
+  let status;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const { res, json } = fakeRes();
+    await app.route('/omni-memory/status').handler(fakeReq('/omni-memory/status'), res);
+    status = json();
+    if (status.semantic.indexed >= 12 && status.semantic.backfillDone) break;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.ok(status.semantic.indexed >= 12, `upgraded store indexed only ${status.semantic.indexed} rows`);
+  assert.equal(status.semantic.backfillDone, true, 'old rows should backfill without an explicit reindex');
 });
 
 test('FR-21 the remote backend still answers when the endpoint is down', async () => {

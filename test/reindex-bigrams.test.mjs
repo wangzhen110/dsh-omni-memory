@@ -35,7 +35,7 @@ test('memory_reindex bigrams rebuilds the whole CJK index in one call', async ()
   const version = after.prepare("SELECT value FROM meta WHERE key = 'bigrams_version'").get()?.value;
   after.close();
   assert.ok(restored > 0, 'bigram rows are rebuilt');
-  assert.equal(version, '13');
+  assert.equal(version, '14');
 
   const hits = await app.call('memory_search', { query: '部署', scope: 'all' });
   assert.ok(hits.value.hits.length > 0, 'two-character CJK search works after rebuild');

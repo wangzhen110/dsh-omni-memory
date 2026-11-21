@@ -2,6 +2,19 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.9.2] — 2026-11-21
+
+### 新增 · 默认零配置真语义检索
+- **模型随包**：新增 `lib/semantic-embed.mjs`，使用 `BAAI/bge-small-zh-v1.5` int8 ONNX（MIT）+ `onnxruntime-web` WASM + HuggingFace tokenizers WASM，进程内 CPU 推理。用户不需要安装 Ollama / LM Studio、不需要拉模型、不需要 API key；默认离线。包体增加约 39MB，其中模型权重 23.9MB、WASM 运行时 14.8MB。
+- **schema v14**：新增 `semantic_vectors(kind, owner_id, model, dim, vec)` 与 `semantic_vectors_model` 索引；`model` 存签名 `local:bge-small-zh-v1.5:int8:512`，与旧 hashed `vectors` 完全隔离，老库可边服务边回填。
+- **四路融合**：检索从词面 / hashed 或远程向量 / 图三路，扩展为词面 / hashed 或远程向量 / 本地语义 / 图四路 RRF；权重为词面 1、hashed/远程 1、本地语义 2、图 0.5（等权时全量 MRR 只有 0.938，加权后 0.979）。`memory_search` 命中新增 `semanticScore`，`via` 可为 `semantic`。
+- **后台回填**：新写入进入内存队列，后台 worker 每批 8 条写入；检索前先冲刷一小批待处理项，保证同轮写入后立刻可召回；旧库首次打开先检查是否缺向量，有才启动回填；回填持有 `semantic-backfill` 跨进程租约，进程退出即释放，已索引库启动时不加载模型。`memory_reindex({semantic:true})` 可强制回填。
+- **状态可见**：`memory_status` 与 `/omni-memory/status` 新增 `semantic` 块（`enabled/model/dim/pending/indexed/running/backfillDone/lastError`）。
+- **质量实测**：黄金集 20 条语料 / 24 个问题，本地语义单独 recall 1.000、MRR 0.979；旧 hashed 混合 MRR 0.927，纯词面 0.776。冷加载 208ms，RSS 216MB，20 次查询 191ms（约 9.5ms/query）。语义阈值取 0.25；真改写对 0.479–0.621，不相关中文约 0.217。
+- **发布闸门**：`scripts/check-semantic-assets.mjs` 校验模型、tokenizer、WASM 与许可证文件的存在与字节数，缺文件或截断会让 `npm run check` 失败；`models` 加入 `package.json` 的 `files`；`engines` 改为 `>=22.13`（本机 Node 22.23.2 实测）。
+- **测试**：默认测试进程设置 `OMNI_DISABLE_SEMANTIC=1`，只有显式 `boot({ semantic: true })` 才加载 216MB 模型；新增本地语义改写召回用例。完整 `npm test` **283/283** 通过；`npm run check` 同步为 23 工具、20 路由、29 ADR、schema v14、3.9.2。
+- **降级**：模型缺失、WASM 加载失败、内存不足或推理异常时语义路线返回空并写 `lastError`，词面 / hashed / 图路线继续工作；`OMNI_DISABLE_SEMANTIC=1` 单独关闭，`OMNI_DISABLE_VECTOR=1` 同时关闭 hashed/远程与本地语义（诊断用）。
+
 ## [3.9.1] — 2026-11-21
 
 ### 修复 · 复核发现的边界问题
