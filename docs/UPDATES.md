@@ -2,7 +2,7 @@
 
 > 本文件由 `npm run update-log` 从 git 历史自动生成，按时间倒序记录每一次提交。
 > 版本摘要见 [CHANGELOG](CHANGELOG.md)，版本报告见下方“版本报告”。
-> 共 58 次提交；更新记录自身的提交不计入列表。
+> 共 59 次提交；更新记录自身的提交不计入列表。
 
 ## 版本报告
 
@@ -15,10 +15,11 @@
 
 ## 2026-11-21
 
-- 15:50:52 `ae3c52c9` — test: add install and lifecycle coverage — [提交](https://github.com/wangzhen110/omni-memory/commit/ae3c52c95ecfb42fbbb68b3f42734c78fb1ba473)
-- 15:25:33 `ab32760b` — test: close testing gaps with fault and security coverage — [提交](https://github.com/wangzhen110/omni-memory/commit/ab32760becc82c7ff3a2b6d7b238866b522aa3a7)
-- 15:04:44 `81bcfbf7` — test: add property and fuzz coverage — [提交](https://github.com/wangzhen110/omni-memory/commit/81bcfbf714b26dec70d91b1b5e97e32780c0cc43)
-- 14:36:24 `ec7a7824` — docs: correct 3.9.5 package entry count — [提交](https://github.com/wangzhen110/omni-memory/commit/ec7a7824d2f0d4e3f717a43a766cf91bd11677e5)
+- 18:26:21 `cb621f6e` — feat: real-data memory overview dashboard (3.10.0) — [提交](https://github.com/wangzhen110/omni-memory/commit/cb621f6ef490e58054e37d11e92800187392a0a1)
+- 16:05:00 `a93221c0` — test: add install and lifecycle coverage — [提交](https://github.com/wangzhen110/omni-memory/commit/a93221c0937f598998383eaa4fa55f435967e228)
+- 15:28:00 `f0b804dd` — test: close testing gaps with fault and security coverage — [提交](https://github.com/wangzhen110/omni-memory/commit/f0b804dd95c2fdf81facaa21e7e06123a880c31f)
+- 15:04:44 `a3b59764` — test: add property and fuzz coverage — [提交](https://github.com/wangzhen110/omni-memory/commit/a3b59764cb8e50a22c1d8212210dd6dffd48a8f5)
+- 14:36:24 `5c50de56` — docs: correct 3.9.5 package entry count — [提交](https://github.com/wangzhen110/omni-memory/commit/5c50de5695d6d5417fcddce24c6786caa9a9d804)
 - 14:34:31 `3208efe6` — docs: record 3.9.5 deployment and verification — [提交](https://github.com/wangzhen110/omni-memory/commit/3208efe6580a3823a2dfa1bad144c0b6a9316c9c)
 - 14:33:18 `ab5dc99f` — fix: close semantic reliability debt (3.9.5) — [提交](https://github.com/wangzhen110/omni-memory/commit/ab5dc99f090a236dc0cc265085b9a890565fae3b)
 - 14:15:03 `ee5733d3` — docs: gate MCP tool and route counts — [提交](https://github.com/wangzhen110/omni-memory/commit/ee5733d3298942edaabb1617c9fbca4a8d999f1a)
