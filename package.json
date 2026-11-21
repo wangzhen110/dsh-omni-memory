@@ -71,5 +71,8 @@
         "@deepseek-ai/dsh-client-ui-conversation"
       ]
     }
+  },
+  "devDependencies": {
+    "fast-check": "^4.10.3"
   }
 }

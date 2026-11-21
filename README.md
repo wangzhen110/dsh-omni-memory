@@ -7,7 +7,7 @@
 > **源码/架构**后做商业替代、竞品或商业服务；且**必须署名作者**。
 > 商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-289%2F289-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-313%2F313-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-Personal%20Use%201.1-lightgrey)](LICENSE)
 
 ---
@@ -59,7 +59,7 @@
 
 ```bash
 cd /path/to/omni-memory
-npm test          # 289 个用例
+npm test          # 313 个用例
 npm run check     # 语法、文档计数与模型资产完整性校验
 ```
 
@@ -161,7 +161,7 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 
 ## 测试与指标
 
-- 自动化用例：**289 / 289 通过**
+- 自动化用例：**313 / 313 通过**
 - 检索延迟（本机复核，Node 22.23.2；标准 bench 已改为 global scope 并断言真实命中）：10,000 行 p95 ≈ **2.4ms**；100,000 行 ≈ 2.4ms；1,000,000 行 ≈ 6.0ms；1M + 5 万向量 + 100 万 bigram ≈ **116.8ms**（两段式有界检索，见 ADR-020）
 - 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 旧 hashed 混合 0.927 → 内置本地语义单独 **0.979**；语义冷加载约 208ms，单查询约 9.5ms（20 次 191ms，本机 CPU）
 
@@ -199,6 +199,7 @@ npm run bench:golden   # 黄金集
 - [3.9.3 语义索引治理报告](docs/COMPLETION-3.9.3-2026-11-21.md)
 - [3.9.4 跨平台项目键与 scope 迁移报告](docs/COMPLETION-3.9.4-2026-11-21.md)
 - [3.9.5 语义可靠性收尾报告](docs/COMPLETION-3.9.5-2026-11-21.md)
+- [属性测试落地记录（313 用例）](docs/PROPERTY-TESTING-ROLLOUT-2026-11-21.md)
 - [项目 scope alias 决策](docs/ADR/031-project-scope-alias.md)
 - [架构图](docs/architecture.png)
 
