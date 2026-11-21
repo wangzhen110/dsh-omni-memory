@@ -37,6 +37,8 @@
 
 ## 豆包宿主接入
 
-- 豆包工作客户端用「自定义连接器」STDIO 接 `hosts/mcp/bin.mjs`；本会话若能看到 `memory_*` 工具，直接按上面的规则调用。
-- 若工具尚未加载，不要假设服务不存在：`GET http://127.0.0.1:7788/omni-memory/packet?q=<任务>` 可读画像与相关记忆；写入用 `POST http://127.0.0.1:7788/omni-memory/tool`，带 `x-omni-csrf: 1` 和 `{"name":"memory_write", ...}`。
-- 连接器由豆包客户端管理，需要用户在客户端保存；Agent 不自动修改豆包设置、配置或注册表。
+- **默认零配置，不要求用户添加自定义连接器。** 本会话若能看到 `memory_*` 工具，直接按上面的规则调用。
+- 没有原生工具时，用现成 CLI：`node hosts\cli.mjs context --dir <项目> --query "<任务>"` 读取；写入用 `node hosts\cli.mjs write --dir <项目> --kind note ...`。CLI 会落到当前项目层，不需要 HTTP，也不需要修改豆包设置。若宿主报 `non_interactive_command_*.ps1` 找不到，等 2 秒重试一次；仍失败才走只读兜底，不要连续重试三次。
+- CLI 也不可用时，才用 `GET http://127.0.0.1:7788/omni-memory/packet?cwd=<项目目录>&q=<任务>` 做只读兜底；必须带 `cwd`，否则默认 global，不能当项目层用。写入等 CLI 恢复。
+- 连接器只是可选增强；用户不主动要求时，不要提“去插件页保存连接器”。
+- Agent 不自动修改豆包设置、配置或注册表。

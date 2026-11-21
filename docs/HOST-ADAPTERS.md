@@ -23,9 +23,18 @@ node hosts/mcp/bin.mjs
 
 支持 stdio 与 HTTP `POST /mcp`。`initialize.instructions`、`omni-bootstrap` prompt、`memory_rules` 工具、`omni://rules` 资源都返回同一份规则文本。
 
-### 1.1 豆包工作（官方自定义连接器）
+### 1.1 豆包工作（零配置 CLI 优先；连接器可选）
 
-2026-11-21 实测：豆包工作客户端支持官方「自定义连接器」，可直接接本地 STDIO MCP。官方说明：`https://www.doubao.com/work/docs/zh-cn/articles/705018132598-plugins`。
+豆包工作客户端默认走项目自带的 CLI，不需要用户手动添加连接器：
+
+```powershell
+node hosts\cli.mjs context --dir <repo> --query "<任务>"
+node hosts\cli.mjs write --dir <repo> --kind note --text "..."
+```
+
+`hosts/cli.mjs` 用与 MCP 相同的 `toolContext` 解析项目层，写入不会落到 global。项目内的 `AGENTS.md` 和用户 Skill `omni-memory` 都指向这条路径。
+
+如果用户主动要求原生工具调用，再接官方「自定义连接器」（2026-11-21 实测支持 STDIO）：
 
 ```text
 服务器名称：全息记忆
@@ -35,7 +44,14 @@ node hosts/mcp/bin.mjs
 环境变量：OMNI_HOME=<用户目录>\.dsh；OMNI_PROJECT_DIR=<repo>
 ```
 
-实测结果：`initialize` 返回 `omni-memory 3.10.1`，`tools/list` 25 个工具，`memory_context` / `memory_search` 在真实库上正常返回。连接器由豆包客户端管理，Agent 不应自动改豆包设置、配置或注册表；首次创建需要用户在客户端点一次“保存”。
+实测：`initialize` 返回 `omni-memory 3.10.1`，`tools/list` 25 个工具。连接器只是可选增强，由豆包客户端管理；Agent 不应自动改豆包设置、配置或注册表。
+
+#### 宿主瞬断（2026-11-21 实测）
+
+- 症状：豆包客户端登录或重启后，PowerShell/CU 报 `non_interactive_command_*.ps1` 找不到；有时 `Test-Path` 能成功一次，下一条命令又失败。
+- 根因：`agent_infra` 下的临时脚本目录被客户端清理，工具写入的脚本在执行前被删；不是 CLI、MCP 或参数错误。
+- 处置：重启豆包客户端可恢复；CLI 首次失败等 2 秒重试一次，仍失败再走 `GET /omni-memory/packet?cwd=<项目>&q=<任务>` 只读兜底。不要连续重试三次，也不要改客户端配置/注册表绕过。
+- 常态化：原生 MCP 连接器由客户端托管 Node 进程，不依赖 PowerShell 临时脚本；但它仍需用户在客户端保存一次，是可选增强。
 
 ### 2. CLI context（hook / sidecar）
 
@@ -104,12 +120,12 @@ curl -X POST http://127.0.0.1:7788/omni-memory/tool \
 - `/tool` 是写操作，必须带 `x-omni-csrf: 1`，并校验 Origin；跨站表单无法伪造该头。
 - 跨项目读取/改写需要显式 `scope=all`；默认只走当前项目 + global。
 - 不要把 `--bind 0.0.0.0` 暴露到公网；如果必须远程，前面加 TLS、认证和网络 ACL，且不要把未鉴权的 `/mcp` 或 `/tool` 直接开放。
-- 不建议用桌面 UI 自动化硬注入豆包等闭源聊天端；豆包工作已支持官方自定义连接器，优先用连接器。其他没有 MCP 的闭源聊天端才用 `/packet` + 人工/扩展粘贴。
+- 不建议用桌面 UI 自动化硬注入豆包等闭源聊天端；豆包工作优先用零配置 CLI（`hosts/cli.mjs`），原生自定义连接器只作可选增强。其他没有 MCP 的闭源聊天端才用 `/packet` + 人工/扩展粘贴。
 
 ## 一句话选择
 
 有 DSH：用原生插件。  
 有 MCP：接 stdio/HTTP MCP，再补规则或 hook。  
-豆包工作：官方自定义连接器选 STDIO，接 `hosts/mcp/bin.mjs`。  
+豆包工作：零配置 CLI 优先，原生连接器可选。  
 只有 OpenAPI：用 `openapi.json` + `/tool`。  
 只能聊天：用 `/packet` / `omni context` 做预检索 sidecar。  
