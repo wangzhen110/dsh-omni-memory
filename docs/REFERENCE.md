@@ -375,7 +375,7 @@ MCP 无法写客户端系统提示，所以同一份 `RULES_TEXT` 铺五条路�
 
 ---
 
-## 6. REST 接口（13 条）
+## 6. REST 接口（16 条）
 
 统一前缀 `/omni-memory`，默认只听回环。写操作要求 `POST` 且同源（有 `Origin` 时必须与 Host 一致）；不带 `Origin` 的本地客户端放行。
 
@@ -395,6 +395,9 @@ MCP 无法写客户端系统提示，所以同一份 `RULES_TEXT` 铺五条路�
 | `/restore` | POST | `kind` `id` | 复活墓碑 |
 | `/status` | GET | — | 运行态：注入统计、嵌入后端、计数 |
 | `/search` | GET | `q` `limit` `scope` | 混合检索 |
+| `/packet` | GET | `q` `scope` `cwd` `limit` `budget` `format` | 无 MCP 宿主的可注入记忆包；`format=text` 直接输出纯文本 |
+| `/openapi.json` | GET | — | HTTP adapter 的 OpenAPI 3.0 描述（packet/search/list/node/status/tool） |
+| `/tool` | POST | body `name` `arguments`；header `x-omni-csrf: 1` | 受限工具桥：write/search/solution_report/feedback/get/amend/profile/timeline |
 | `/forget` | POST | `kind` `id`（body 或 query） | 墓碑化 |
 
 响应统一带 `ok`。错误为 `{ ok: false, error }`。

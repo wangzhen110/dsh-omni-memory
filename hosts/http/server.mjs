@@ -117,7 +117,7 @@ export async function startHttpServer({
     host,
     toolContext,
     serverInfo: { name: 'omni-memory', version },
-    instructions: '全息记忆本地服务：REST 在 /omni-memory/*，MCP 在 POST /mcp，规则在 ' + RULES_URI + '。',
+    instructions: '全息记忆本地服务：REST 在 /omni-memory/*，MCP 在 POST /mcp，规则在 ' + RULES_URI + '。无 prompt hook 的宿主先取 GET /omni-memory/packet?q=<任务>，OpenAPI 在 /omni-memory/openapi.json。',
     rulesText: RULES_TEXT,
   });
 
@@ -242,14 +242,14 @@ export async function startHttpServer({
         return;
       }
 
-      if (req.method === 'GET' && (pathname === '/' || MIME[path.extname(pathname)])) {
-        await serveStatic(req, res, pathname);
-        return;
-      }
-
       const route = routes.find(item => item.kind === 'exact' && item.path === pathname);
       if (route) {
         await route.handler(req, res);
+        return;
+      }
+
+      if (req.method === 'GET' && (pathname === '/' || MIME[path.extname(pathname)])) {
+        await serveStatic(req, res, pathname);
         return;
       }
 

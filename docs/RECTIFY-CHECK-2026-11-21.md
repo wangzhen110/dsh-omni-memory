@@ -115,3 +115,22 @@
 ## 复核边界声明
 
 本次为只读静态审计 + 隔离环境动态实测，未运行生产数据、未 profiler 压测；MRR/延迟数字引用项目自测，未独立复跑 golden 基准（但已验证门禁断言代码为真实 fail-fast）。所有缺陷结论均附可复现路径与实测输出。未修改任何源码/文档，仅新增本报告。
+
+---
+
+## 六、二次复核（3.7.1，2026-11-21 09:44）
+
+用户针对 N-1/N-2/N-3 发布修复提交 `6c7af16`（版本 3.7.1）。独立复核结论：**三项全部修复到位，实测确认**。
+
+| 缺陷 | 修复状态 | 复核证据 |
+|---|---|---|
+| N-1 amend 字段丢失 | ✅ 已修 | `index.js:3770-3791` INSERT 补齐全部审计字段。实测 amend 后 `source=ORIG-SRC`（未被 reason 覆盖）、`contested=1`、`verification=verified`、`verified_at` 保留、`recall/useful/misleading_count=9/7/2` 全部保留；`reason` 以 `[amend] FIX-REASON` 追加进 `evidence`。 |
+| N-2 跨项目越权 | ✅ 已修 | 两个工具均接收 `toolContext` 并用 `scopeClause` 过滤。实测 global 上下文对 `proj:alpha` 笔记执行 feedback / amend 均被拒绝（`not found, inactive, or outside the current project`）；显式 `scope=all` 放行走审计路径。与 `memory_get` 语义一致。 |
+| N-3 命名误导 | ✅ 已修 | `feedbackFields` 对外改为 `feedbackCount` / `lastFeedbackAt`；全仓无 `recallCount` 对外残留（仅剩 import 兼容读取 `note.recallCount` 的容错分支）；schema v12 物理列名保持不变，无迁移。 |
+
+- 测试：新增 2 项回归（字段保真、跨项目拒绝），当时 `npm test` **253/253 通过**（exit=0）；3.7.2 宿主适配层加入后为 **257/257 通过**。
+- 门禁：当时 `npm run check` 全绿（253 tests / 20 tools / 13 routes / 28 ADRs / v3.7.1）；3.7.2 后为 257 tests / 16 routes / v3.7.2。
+- 变更范围核对：仅 `index.js` + 测试 + 文档，**未触碰 schema 版本**（保持 v12），修复为纯工具逻辑，风险面小。
+- 命名细节确认：CHANGELOG 写"由 `lastRecallAt` 改为 `lastFeedbackAt`"，而上一版对外字段实为 `lastFeedbackAt`（`feedbackFields` 早已用此名），此处 CHANGELOG 表述略有出入，但不影响功能与契约，属文案瑕疵，可不修。
+
+**二次复核边界**：静态审查 + 隔离临时库实测，未跑生产数据；独立复用了自己构造的字段保真/越权场景，未依赖项目新增测试作为唯一证据。本次仅更新本报告与工作日志，未改动任何源码。

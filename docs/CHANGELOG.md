@@ -2,6 +2,15 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.7.2] — 2026-11-21
+
+### 新增 · 宿主适配层
+- **`GET /omni-memory/packet`**：无 MCP 宿主的预检索出口。返回画像、用户设定与当前任务相关记忆的可注入文本；支持 `scope` / `cwd` / `budget` / `limit`，`format=text` 可直接粘贴到对话开头。
+- **`GET /omni-memory/openapi.json`**：导出 OpenAPI 3.0 描述，供只支持 OpenAPI / function calling 的客户端接入。
+- **`POST /omni-memory/tool`**：受限 HTTP 工具桥，暴露 `memory_write`、`memory_search`、`memory_solution_report`、`memory_feedback`、`memory_get`、`memory_amend`、`memory_profile`、`memory_timeline`；导出、导入、dream、compact、reindex 等维护操作仍留在 MCP/CLI。写操作要求 `x-omni-csrf: 1`。
+- **文档**：新增 [`docs/HOST-ADAPTERS.md`](HOST-ADAPTERS.md)，明确 DSH 原生 / MCP / OpenAPI / 闭源聊天端四类宿主的接入路径与安全边界。
+- 测试：新增 `test/host-adapter.test.mjs` 4 项（packet 画像与召回、项目隔离与文本模式、OpenAPI、tool 桥），完整 `npm test` 257/257 通过。
+
 ## [3.7.1] — 2026-11-21
 
 ### 修复 · 3.7.0 复核报告（N-1 / N-2 / N-3）

@@ -48,6 +48,15 @@ const BUSY_TIMEOUT_MS = (() => {
 
 let store;
 
+/** Tool definitions registered by this module instance, for non-DSH HTTP adapters. */
+const localToolDefinitions = new Map();
+
+/** HTTP tool bridge: read/write/recall only; destructive maintenance stays on MCP/CLI. */
+const HTTP_TOOL_ALLOWLIST = new Set([
+  'memory_write', 'memory_search', 'memory_solution_report', 'memory_feedback',
+  'memory_get', 'memory_amend', 'memory_profile', 'memory_timeline',
+]);
+
 // Prepared statements are compiled once per SQL string and database. The hot
 // paths used to re-compile the same SELECT/INSERT every row, which shows up
 // most clearly during backfills and repeated panel reads.
@@ -2900,6 +2909,130 @@ function buildProfileText(projectKey) {
   return capProfileLines(lines);
 }
 
+const PACKET_BUDGET = 1800;
+
+/**
+ * Build the text a host with no prompt hook can splice in before a turn.
+ *
+ * This is deliberately transport-neutral: `memory_context` (MCP/CLI) and
+ * `GET /omni-memory/packet` (browser/sidecar) return the same shape, while
+ * `POST /omni-memory/tool` exposes the callable half to OpenAPI clients.
+ */
+async function buildMemoryPacket(scope, query, options = {}) {
+  const limit = Math.min(10, Math.max(1, Number(options.limit ?? 5) || 5));
+  const budget = Math.min(4000, Math.max(400, Number(options.budget ?? PACKET_BUDGET) || PACKET_BUDGET));
+  const s = openStore();
+  const persona = personaLines(s.db);
+  const personaBody = persona.length ? persona.slice(1).join('\n').trim() : '';
+  // `project` means "all project layers" for search, but the profile has no
+  // single project to prefer, so it falls back to the global profile.
+  const profileScope = scope && scope !== 'project' && scope !== 'all' ? scope : null;
+  const profile = buildProfileText(profileScope).trim();
+  const search = query ? await runSearch(s, query, limit, scope) : { hits: [] };
+  const hits = (search.hits ?? [])
+    .filter(hit => hit.kind !== 'note' || !['failed', 'expired'].includes(String(hit.solutionStatus ?? 'unverified')))
+    .slice(0, limit);
+  const sections = [];
+  if (personaBody) sections.push('## 用户设定\n' + personaBody);
+  if (profile && profile !== 'memory is empty') sections.push('## 常驻画像\n' + profile);
+  if (hits.length) {
+    sections.push('## 与当前任务相关\n' + hits.map(hit => {
+      const layer = hit.scope && hit.scope !== 'global' ? ` · ${hit.scope}` : '';
+      const flag = hit.contested ? ' · contested' : '';
+      const status = hit.solutionStatus && hit.solutionStatus !== 'unverified' ? ` · ${hit.solutionStatus}` : '';
+      return `- [${hit.kind}#${hit.id}] ${String(hit.text ?? '').replace(/\s+/g, ' ').slice(0, 220)}${layer}${status}${flag}`;
+    }).join('\n'));
+  }
+  if (!sections.length) {
+    return { text: '', chars: 0, hits: 0, truncated: false, memories: [] };
+  }
+  sections.push('以上内容可能过时。涉及删除、覆盖、外部发送等不可逆动作前，先 memory_search 复核。');
+  const full = sections.join('\n\n');
+  const text = full.length > budget ? full.slice(0, budget) : full;
+  return {
+    text,
+    chars: text.length,
+    hits: hits.length,
+    truncated: text.length < full.length,
+    memories: hits.map(hit => ({
+      kind: hit.kind, id: hit.id, scope: hit.scope ?? null,
+      solutionStatus: hit.solutionStatus ?? null, contested: Boolean(hit.contested),
+      text: String(hit.text ?? '').slice(0, 220),
+    })),
+  };
+}
+
+/** OpenAPI document for the plain-HTTP host adapter. */
+const HOST_OPENAPI = {
+  openapi: '3.0.3',
+  info: {
+    title: 'Omni Memory host adapter',
+    version: '1.0.0',
+    description: 'Loopback-only REST adapter for hosts without MCP. GET /packet returns prompt-ready context; POST /tool exposes the non-destructive memory tool subset. Writes require x-omni-csrf: 1.',
+  },
+  servers: [{ url: 'http://127.0.0.1:7788' }],
+  paths: {
+    '/omni-memory/packet': {
+      get: {
+        summary: 'Prompt-ready memory packet',
+        parameters: [
+          { name: 'q', in: 'query', schema: { type: 'string' }, description: 'Current task text; omit for profile only.' },
+          { name: 'scope', in: 'query', schema: { type: 'string' }, description: 'all, project, global, or one exact project key.' },
+          { name: 'cwd', in: 'query', schema: { type: 'string' }, description: 'Derive the project layer from a working directory when scope is omitted.' },
+          { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 10, default: 5 } },
+          { name: 'budget', in: 'query', schema: { type: 'integer', minimum: 400, maximum: 4000, default: 1800 } },
+          { name: 'format', in: 'query', schema: { type: 'string', enum: ['json', 'text'], default: 'json' } },
+        ],
+        responses: { 200: { description: 'Packet JSON, or plain text when format=text' } },
+      },
+    },
+    '/omni-memory/search': {
+      get: {
+        summary: 'Hybrid memory search',
+        parameters: [
+          { name: 'q', in: 'query', required: true, schema: { type: 'string' } },
+          { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 60, default: 30 } },
+          { name: 'scope', in: 'query', schema: { type: 'string' } },
+        ],
+        responses: { 200: { description: 'Ranked hits' } },
+      },
+    },
+    '/omni-memory/list': {
+      get: { summary: 'Browse memories', parameters: [
+        { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 200, default: 40 } },
+        { name: 'offset', in: 'query', schema: { type: 'integer', minimum: 0, default: 0 } },
+        { name: 'scope', in: 'query', schema: { type: 'string' } },
+      ], responses: { 200: { description: 'Memory list and stats' } } },
+    },
+    '/omni-memory/node': {
+      get: { summary: 'One entity or note detail', parameters: [
+        { name: 'node', in: 'query', required: true, schema: { type: 'string' } },
+        { name: 'scope', in: 'query', schema: { type: 'string' } },
+      ], responses: { 200: { description: 'Node detail' } } },
+    },
+    '/omni-memory/status': {
+      get: { summary: 'Runtime status', responses: { 200: { description: 'Status' } } },
+    },
+    '/omni-memory/tool': {
+      post: {
+        summary: 'Call one allowlisted memory tool',
+        description: 'Requires header x-omni-csrf: 1. Names: memory_write, memory_search, memory_solution_report, memory_feedback, memory_get, memory_amend, memory_profile, memory_timeline.',
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: {
+            type: 'object', required: ['name'], additionalProperties: false,
+            properties: {
+              name: { type: 'string', enum: [...HTTP_TOOL_ALLOWLIST] },
+              arguments: { type: 'object', additionalProperties: true },
+            },
+          } } },
+        },
+        responses: { 200: { description: 'Tool value and rendered text' }, 403: { description: 'Missing CSRF header or non-loopback caller' } },
+      },
+    },
+  },
+};
+
 const profileCache = new Map();
 
 function cachedProfile(projectKey) {
@@ -3068,7 +3201,16 @@ function scopeForSession(session) {
 function defineTools(ctx) {
   const disposers = [];
 
-  disposers.push(ctx.tools.register({
+  const registerLocalTool = definition => {
+    localToolDefinitions.set(definition.name, definition);
+    const dispose = ctx.tools.register(definition);
+    return () => {
+      if (localToolDefinitions.get(definition.name) === definition) localToolDefinitions.delete(definition.name);
+      if (typeof dispose === 'function') dispose();
+    };
+  };
+
+  disposers.push(registerLocalTool({
     name: 'memory_write',
     description: 'Store one durable memory. kind=note for conclusions, rules and problem-solving experience; kind=fact for subject/relation/object triples (text optional when the triple is complete); kind=episode for raw observations. Returns the stored id. For experience notes, set problemKey to the stable error signature and solutionStatus to what actually happened.',
     parameters: {
@@ -3394,7 +3536,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_search',
     description: "Recall stored notes, facts, transcripts and problem-solving experience. When blocked by an error or tool failure, search the exact problemKey first: verified solutions rank above unverified notes, while failed attempts stay visible but lower. Then widen to keywords or the web only if the stored experience is absent or weak.",
     parameters: {
@@ -3495,7 +3637,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_solution_report',
     description: 'Close the loop after trying a stored solution. success marks the note verified and increments its reuse count; failed records a dead end; expired marks it as no longer applicable. Call this after the result is known, not before.',
     parameters: {
@@ -3565,7 +3707,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_feedback',
     description: 'Record whether a recalled note or fact was useful or misleading. This is the quality signal for ranking: useful votes lift a memory, misleading votes push it down. Call it after actually using the memory and observing the outcome.',
     parameters: {
@@ -3633,7 +3775,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_get',
     description: 'Progressive disclosure: fetch full records by id after memory_search returned a compact hit. Accepts up to 20 items. Scope defaults to the current project; pass all only when auditing across projects.',
     parameters: {
@@ -3739,7 +3881,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_amend',
     description: 'Amend one note by creating a new revision. The old row is superseded, not deleted, so the revision chain remains auditable. Use this instead of write + contradicts + forget for a corrected note.',
     parameters: {
@@ -3821,7 +3963,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_reindex',
     description: 'Rebuild derived indexes. Vectors: backfill for the active embedding backend (after switching OMNI_EMBED_URL/model or restoring an old database). bigrams: rebuild the whole CJK two-character index in one call (a large legacy store otherwise needs many restarts).',
     parameters: {
@@ -3867,7 +4009,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_persona',
     description: 'Read or write the long-lived user settings (name, personality, habits, preferences, custom fields). These are injected into the system prompt; values are plain text.',
     parameters: {
@@ -3909,7 +4051,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_link_entity',
     description: 'Register an entity alias and merge existing facts/edges written under that alias into the canonical name. Dry run by default; apply=true rewrites the rows.',
     parameters: {
@@ -3931,7 +4073,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_dream_proposals',
     description: 'List replacement candidates produced by dream: flagged notes plus the evidence text that would replace them. Read-only.',
     parameters: {
@@ -3952,7 +4094,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_dream_replace',
     description: 'Replace one flagged note with its evidence text. Requires confirm=true; the old note is superseded (kept for audit) and the replacement can be rolled back.',
     parameters: {
@@ -3974,7 +4116,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_dream_rollback',
     description: 'Undo a dream replacement: revive the original note and tombstone the generated replacement. Only works on replacements created by memory_dream (source dream:<id>).',
     parameters: {
@@ -3992,7 +4134,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_export',
     description: 'Write a portable JSON backup (notes, facts, transcripts, edges, entities, relations, entity aliases, persona). Vectors are derived and excluded. Tombstones are included by default so a later restore can revive them.',
     parameters: {
@@ -4013,7 +4155,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_import',
     description: 'Merge a JSON backup written by memory_export. Dry run by default: pass dryRun=false to write. Rows are deduplicated by content, not by id; vectors are rebuilt.',
     parameters: {
@@ -4036,7 +4178,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_restore',
     description: 'Revive one tombstoned memory (kind + id). Derived indexes are rebuilt; use the audit view to find deleted rows.',
     parameters: {
@@ -4058,7 +4200,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_profile',
     description: 'Read the hot memory profile: the highest-importance notes that fit the always-injected budget, plus store statistics. Scope defaults to the current project, or global when unknown.',
     parameters: {
@@ -4113,7 +4255,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_timeline',
     description: 'Show how knowledge about one entity changed over time: facts with their validity spans, plus notes that mention the entity.',
     parameters: {
@@ -4185,7 +4327,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_forget',
     description: 'Tombstone one memory by kind and id. The row stays auditable; it stops appearing in recall and the profile.',
     parameters: {
@@ -4213,7 +4355,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_dream',
     description: 'Verify stored notes against the transcripts they came from. Dry run by default; apply=true records each verdict and flags unsupported notes as contested, but never replaces anything. commit=true (with apply) or memory_dream_replace performs a reversible replacement. Needs a captured session stream and an LLM; under a plain MCP host it reports no_source.',
     parameters: {
@@ -4253,7 +4395,7 @@ function defineTools(ctx) {
     },
   }));
 
-  disposers.push(ctx.tools.register({
+  disposers.push(registerLocalTool({
     name: 'memory_compact',
     description: 'Bound transcript growth by tombstoning the oldest chunks beyond a keep limit. Rows stay auditable and recoverable; the raw record is never destroyed. Dry run by default. Requires the host to have captured a transcript stream; under a plain MCP host with no sessions this is a no-op that reports total 0.',
     parameters: {
@@ -4376,6 +4518,93 @@ function registerRoutes(ctx) {
       if (typeof dispose === 'function') disposers.push(dispose);
     } catch { /* a missing route is not fatal */ }
   };
+
+  add({
+    kind: 'exact',
+    path: '/omni-memory/packet',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) return json(res, 403, { ok: false });
+      if (String(req.method ?? 'GET').toUpperCase() !== 'GET') {
+        return json(res, 405, { ok: false, error: 'packet requires GET' });
+      }
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      const requestedScope = String(url.searchParams.get('scope') ?? '').trim();
+      const cwd = String(url.searchParams.get('cwd') ?? '').trim();
+      const scopeLabel = requestedScope || (cwd ? projectKeyFromCwd(cwd) : SCOPE_GLOBAL);
+      const scope = requestedScope === 'all' ? null : (requestedScope || (cwd ? projectKeyFromCwd(cwd) : SCOPE_GLOBAL));
+      const query = String(url.searchParams.get('q') ?? '').trim();
+      const packet = await buildMemoryPacket(scope, query, {
+        limit: Number(url.searchParams.get('limit') ?? 5),
+        budget: Number(url.searchParams.get('budget') ?? PACKET_BUDGET),
+      });
+      const format = String(url.searchParams.get('format') ?? 'json').trim().toLowerCase();
+      if (format === 'text') {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'text/plain; charset=utf-8');
+        res.setHeader('cache-control', 'no-store');
+        res.end(packet.text);
+        return;
+      }
+      return json(res, 200, {
+        ok: true,
+        format: 'markdown',
+        scope: scopeLabel,
+        query,
+        cwd: cwd || null,
+        ...packet,
+        generatedAt: now(),
+      });
+    },
+  });
+
+  add({
+    kind: 'exact',
+    path: '/omni-memory/openapi.json',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) return json(res, 403, { ok: false });
+      if (String(req.method ?? 'GET').toUpperCase() !== 'GET') {
+        return json(res, 405, { ok: false, error: 'openapi.json requires GET' });
+      }
+      return json(res, 200, HOST_OPENAPI);
+    },
+  });
+
+  add({
+    kind: 'exact',
+    path: '/omni-memory/tool',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) return json(res, 403, { ok: false });
+      if (String(req.method ?? 'GET').toUpperCase() !== 'POST') {
+        return json(res, 405, { ok: false, error: 'tool requires POST' });
+      }
+      if (!mutationAllowed(req)) return json(res, 403, { ok: false, error: 'forbidden' });
+      const body = await readJsonBody(req, 64 * 1024);
+      const name = String(body.name ?? '').trim();
+      if (!HTTP_TOOL_ALLOWLIST.has(name)) {
+        return json(res, 400, { ok: false, error: `tool not allowed on the HTTP adapter: ${name || '(empty)'}` });
+      }
+      const definition = localToolDefinitions.get(name);
+      if (!definition || typeof definition.execute !== 'function') {
+        return json(res, 503, { ok: false, error: `tool unavailable: ${name}` });
+      }
+      const args = body.arguments && typeof body.arguments === 'object' && !Array.isArray(body.arguments)
+        ? body.arguments
+        : {};
+      try {
+        const value = await definition.execute(args, {});
+        let text = '';
+        try {
+          const rendered = typeof definition.output?.render === 'function' ? definition.output.render(args, value) : '';
+          text = Array.isArray(rendered)
+            ? rendered.map(block => String(block?.text ?? '')).join('\n')
+            : String(rendered?.text ?? rendered ?? '');
+        } catch { /* rendering is a convenience, not part of the result */ }
+        return json(res, 200, { ok: true, name, value, text });
+      } catch (error) {
+        return json(res, 400, { ok: false, error: String(error?.message ?? error) });
+      }
+    },
+  });
 
   add({
     kind: 'exact',

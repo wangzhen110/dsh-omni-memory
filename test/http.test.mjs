@@ -3,7 +3,7 @@
 
 /**
  * The standalone daemon has to prove three things at once:
- *  - the plugin's own 13 routes mount unchanged through the `webServer` shim
+ *  - the plugin's own 16 routes mount unchanged through the `webServer` shim
  *  - MCP over HTTP answers with the same protocol objects as stdio
  *  - the panel is actually served
  *
@@ -35,12 +35,12 @@ test('http adapter: routes mount, MCP over HTTP works, panel is served', async (
   const url = server.url;
 
   try {
-    assert.equal(server.routes, 13, 'all plugin routes should mount through the shim');
+    assert.equal(server.routes, 16, 'all plugin routes should mount through the shim');
 
     const health = await (await fetch(`${url}/health`)).json();
     assert.equal(health.ok, true);
     assert.equal(health.tools, 22, '20 plugin tools plus memory_context and memory_rules');
-    assert.equal(health.routes ?? server.routes, 13);
+    assert.equal(health.routes ?? server.routes, 16);
 
     const panel = await fetch(`${url}/`);
     assert.equal(panel.status, 200);
@@ -88,6 +88,15 @@ test('http adapter: routes mount, MCP over HTTP works, panel is served', async (
     const graph = await (await fetch(`${url}/omni-memory/graph`)).json();
     assert.equal(graph.ok, true);
     assert.ok(Array.isArray(graph.nodes));
+
+    const spec = await (await fetch(`${url}/omni-memory/openapi.json`)).json();
+    assert.equal(spec.openapi, '3.0.3');
+    assert.ok(spec.paths['/omni-memory/packet'], 'dotted JSON route must beat static-file dispatch');
+
+    const packet = await fetch(`${url}/omni-memory/packet?q=${encodeURIComponent('HTTP 适配层')}&format=text`);
+    assert.equal(packet.status, 200);
+    assert.match(packet.headers.get('content-type') ?? '', /text\/plain/);
+    assert.match(await packet.text(), /HTTP 适配层/);
 
     const missing = await fetch(`${url}/omni-memory/nope`);
     assert.equal(missing.status, 404);

@@ -7,12 +7,12 @@
 > **源码/架构**后做商业替代、竞品或商业服务；且**必须署名作者**。
 > 商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-253%2F253-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-257%2F257-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-Personal%20Use%201.1-lightgrey)](LICENSE)
 
 ---
 
-**完整机理与接口参考**：[`docs/REFERENCE.md`](docs/REFERENCE.md) —— schema、写入与检索机理、20 个工具、13 条路由、MCP 协议面、CLI、环境变量、AI 调用剧本。执行 `npm run memory:sync` 可把整本手册拆成笔记写进记忆库，之后用 `memory_search` 就能直接检索到。
+**完整机理与接口参考**：[`docs/REFERENCE.md`](docs/REFERENCE.md) —— schema、写入与检索机理、20 个工具、16 条路由、MCP 协议面、CLI、环境变量、AI 调用剧本。执行 `npm run memory:sync` 可把整本手册拆成笔记写进记忆库，之后用 `memory_search` 就能直接检索到。
 
 ## 它解决什么问题
 
@@ -51,7 +51,7 @@
 
 ```bash
 cd memory-core
-npm test          # 253 个用例
+npm test          # 257 个用例
 npm run check     # 语法与 JSON 校验
 ```
 
@@ -62,8 +62,11 @@ npm run check     # 语法与 JSON 校验
 同一份内核可以脱离 DSH 运行，三个入口共用一个本地记忆库：
 
 - `hosts/mcp/bin.mjs` — 零依赖 stdio MCP 服务，Claude Code、Cursor、Cline、Codex CLI、Zed 都能接
-- `hosts/http/server.mjs` — 独立面板 + REST（直接挂载插件原有的 13 条路由）+ HTTP 上的 MCP（`POST /mcp`）
+- `hosts/http/server.mjs` — 独立面板 + REST（直接挂载插件原有的 16 条路由）+ HTTP 上的 MCP（`POST /mcp`）
 - `hosts/cli.mjs` — `omni rules / context / search / serve / mcp`
+- `GET /omni-memory/packet` — 面向无 MCP 宿主的可注入记忆包；`openapi.json` 与 `POST /tool` 给 OpenAPI/function-calling 客户端
+
+无 MCP 宿主的接入方式与能力边界见 [`docs/HOST-ADAPTERS.md`](docs/HOST-ADAPTERS.md)。
 
 **规则怎么送到模型**：MCP 没有系统提示注入点，所以准备五条通道，同一份文本、永不漂移：
 
@@ -138,7 +141,7 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 
 ## 测试与指标
 
-- 自动化用例：**253 / 253 通过**
+- 自动化用例：**257 / 257 通过**
 - 检索延迟（本机复核，Node 22.23.2；标准 bench 已改为 global scope 并断言真实命中）：10,000 行 p95 ≈ **2.4ms**；100,000 行 ≈ 2.4ms；1,000,000 行 ≈ 6.0ms；1M + 5 万向量 + 100 万 bigram ≈ **116.8ms**（两段式有界检索，见 ADR-020）
 - 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 混合检索 **0.927**
 

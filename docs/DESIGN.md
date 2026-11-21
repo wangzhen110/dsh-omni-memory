@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | 3.7.1 |
-| 插件版本 | 3.7.1 |
+| 文档版本 | 3.7.2 |
+| 插件版本 | 3.7.2 |
 | 状态 | 已评审（本文为开发与验收的**唯一依据**） |
 | 目标平台 | DeepSeek Harness 0.2.2-rc.3（Desktop，Windows 11，Node 24.17） |
 | 最后更新 | 2026-11-21 |
@@ -74,6 +74,7 @@
 | FR-34 | 渐进披露 | `memory_get` 按 kind+id 展开完整正文，最多 20 条；默认当前项目 + global，`all` 需显式 | ✅ 已实现 |
 | FR-35 | 笔记修订链 | `memory_amend` 产生新 revision，旧行 `superseded_by` 指向新行；搜索只见新行，旧行保留审计 | ✅ 已实现 |
 | FR-36 | 检索质量门禁 | 黄金集 recall ≥ 0.85、MRR ≥ 0.9；`npm run bench:golden` 失败即退出码 1，CI 强制执行 | ✅ 已实现（当前 MRR 0.927） |
+| FR-37 | 无 MCP 宿主适配 | `GET /packet` 返回可注入的画像+召回包；`POST /tool` 暴露受限工具面；`openapi.json` 可被 function-calling/OpenAPI 客户端导入 | ✅ 已实现（HTTP adapter） |
 
 ### 1.2 非功能需求
 
@@ -88,9 +89,9 @@
 | NFR-07 | 失败隔离 | 任一子系统（FTS/路由/注入）失效不得导致会话不可用 | 满足（全部 try/catch + 可选降级） |
 | NFR-08 | 隐私 | 所有数据仅存本机 `$DSH_HOME/memory/omni.db`；HTTP 仅 loopback，且浏览器跨站写请求被 Origin 校验拦截 | 部分满足：数据库未加密，loopback HTTP 仍依赖本机进程边界，未做进程级鉴权（ADR-017） |
 | NFR-09 | 可卸载 | 卸载插件后不残留运行中的监听；数据文件保留由用户决定 | 满足 |
-| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 253/253（100%） |
+| NFR-10 | 测试可靠性 | 自动化测试通过率 ≥95% | 257/257（100%） |
 | NFR-11 | 界面本地化 | 中英词典注册，切换语言无需重载插件 | 已实现（词典 + 订阅重渲染） |
-| NFR-12 | 多进程并发 | 同机 N 个宿主进程共用一个库，同时读写不丢数据、不报锁错 | 253/253 含 6 进程并发用例；写入等待上限 5s（ADR-028） |
+| NFR-12 | 多进程并发 | 同机 N 个宿主进程共用一个库，同时读写不丢数据、不报锁错 | 257/257 含 6 进程并发用例；写入等待上限 5s（ADR-028） |
 
 ### 1.3 约束
 
@@ -157,7 +158,7 @@ DSH Host 进程
 │   ├── retrieval     分词 / FTS / bigram / 向量 / 图游走 / RRF
 │   ├── tools         20 个插件工具（write/search/solution_report/profile/timeline/forget/dream/dream_proposals/dream_replace/dream_rollback/compact/reindex/export/import/restore/link_entity/persona/get/feedback/amend）
 │   ├── prompt        systemPrompt.section：画像 + 召回段（同步读缓存）
-│   └── routes        13 条 loopback HTTP（list/search/graph/node/forget/restore/export/status/persona/persona/refresh/dream/proposals/dream/replace/dream/rollback）
+│   └── routes        16 条 loopback HTTP（list/search/graph/node/forget/restore/export/status/persona/persona/refresh/dream/proposals/dream/replace/dream/rollback/packet/openapi.json/tool）
 ├── 本插件 Client 半边（client.js，~1108 行）
 │   ├── sidebar.panellist[id=omni-memory]   左栏入口图标
 │   ├── main[key=omni-memory]               记忆面板（分页/搜索/状态/遗忘）
@@ -261,6 +262,9 @@ chunks_fts / notes_fts / facts_fts  -- FTS5，trigram 优先
 | `/omni-memory/list` | GET | `limit`(1..200, 默认 40), `offset`(≥0), `scope`(`all`\|`global`\|`project`\|项目键) | `{ok, db, fts, schema, index, page{limit,offset,scope,totalNotes,totalFacts,hasMore*}, stats{notes,facts,chunks,globalNotes,projectNotes,contested,verified}, projects[{scope,notes,facts,chunks,lastAt}], chunks[]（仅精确项目键）, notes[], facts[]}` |
 | `/omni-memory/graph` | GET | 无 | `{ok, nodes[{id,kind,label,weight,scope}], links[{source,target,rel}]}`（节点 ≤300，无悬空边） |
 | `/omni-memory/search` | GET | `q`, `limit`(1..60) | `{ok, hits[]}` |
+| `/omni-memory/packet` | GET | `q` `scope` `cwd` `limit`(1..10, 默认 5) `budget`(400..4000, 默认 1800) `format`(`json`\|`text`) | `{ok, format, scope, query, text, chars, hits, truncated, memories[], generatedAt}`；`format=text` 直接输出纯文本 |
+| `/omni-memory/openapi.json` | GET | — | OpenAPI 3.0 描述：packet/search/list/node/status/tool |
+| `/omni-memory/tool` | POST | body `name` `arguments`；header `x-omni-csrf: 1` | `{ok, name, value, text}`；仅允许 write/search/solution_report/feedback/get/amend/profile/timeline |
 | `/omni-memory/forget` | **POST**（GET 兼容） | `kind`, `id`（**查询参数**；宿主可能已读空 body） | `{ok, forgotten}` |
 
 > 平台约束（实测 2026-11-15）：DSH 在 **`/api` 前缀**上注册了连接鉴权（`connection.admit`），非浏览器会话请求会被 `401 unauthorized` 拦下，且响应不是 JSON。插件自建路由必须避开该前缀，本插件统一使用 **`/omni-memory/*`**。
