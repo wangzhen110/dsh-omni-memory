@@ -15,7 +15,7 @@
 
 ## 2026-11-21
 
-- 18:26:21 `cb621f6e` — feat: real-data memory overview dashboard (3.10.0) — [提交](https://github.com/wangzhen110/omni-memory/commit/cb621f6ef490e58054e37d11e92800187392a0a1)
+- 18:26:21 `cb621f6e` — feat: real-data memory overview dashboard (3.10.0) — [提交](https://github.com/wangzhen110/omni-memory/commit/cb621f6ea0da13e79c19bc55f129d19a8a930e2d)
 - 16:05:00 `a93221c0` — test: add install and lifecycle coverage — [提交](https://github.com/wangzhen110/omni-memory/commit/a93221c0937f598998383eaa4fa55f435967e228)
 - 15:28:00 `f0b804dd` — test: close testing gaps with fault and security coverage — [提交](https://github.com/wangzhen110/omni-memory/commit/f0b804dd95c2fdf81facaa21e7e06123a880c31f)
 - 15:04:44 `a3b59764` — test: add property and fuzz coverage — [提交](https://github.com/wangzhen110/omni-memory/commit/a3b59764cb8e50a22c1d8212210dd6dffd48a8f5)
