@@ -36,6 +36,21 @@ function runWorker(home, label, count, mode) {
   });
 }
 
+async function removeTree(dir) {
+  // Windows can keep a just-exited worker's SQLite handle for a short while.
+  // rmSync's maxRetries does not cover every rmdir EBUSY path, so retry here.
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (!['EBUSY', 'ENOTEMPTY', 'EPERM'].includes(error?.code)) throw error;
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+  }
+  rmSync(dir, { recursive: true, force: true });
+}
+
 test('concurrent processes write to one store without losing rows', async () => {
   const home = mkdtempSync(path.join(tmpdir(), 'omni-concurrency-'));
   try {
@@ -65,6 +80,6 @@ test('concurrent processes write to one store without losing rows', async () => 
     assert.equal(Number(same.n), 1, 'identical text from three processes must collapse to one row');
     assert.equal(Number(lease.n), 0, 'maintenance lease must be released after boot');
   } finally {
-    rmSync(home, { recursive: true, force: true });
+    await removeTree(home);
   }
 });

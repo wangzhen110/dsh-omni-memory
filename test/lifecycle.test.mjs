@@ -74,6 +74,32 @@ test('lifecycle matrix: search never returns superseded, tombstoned or out-of-sc
   assert.ok(!projectIds.includes(rows.foreignNote.value.id), 'foreign project note leaked into project search');
 });
 
+test('lifecycle matrix: panel pseudo-scope project spans every project, not global', async () => {
+  const app = await boot();
+  const rows = await seed(app);
+
+  const search = fakeRes();
+  await app.route('/omni-memory/search').handler(
+    fakeReq('/omni-memory/search?q=Life&scope=project&limit=30'), search.res,
+  );
+  const noteIds = search.json().hits.filter(hit => hit.kind === 'note').map(hit => hit.id);
+  assert.ok(noteIds.includes(rows.projectNote.value.id), 'alpha project missing from pseudo-project search');
+  assert.ok(noteIds.includes(rows.foreignNote.value.id), 'beta project missing from pseudo-project search');
+  assert.ok(!noteIds.includes(rows.active.value.id), 'global note leaked into pseudo-project search');
+
+  const projectNode = fakeRes();
+  await app.route('/omni-memory/node').handler(
+    fakeReq(`/omni-memory/node?node=n:${rows.projectNote.value.id}&scope=project`), projectNode.res,
+  );
+  assert.equal(projectNode.state.statusCode, 200, 'project node must open from the pseudo-project layer');
+
+  const globalNode = fakeRes();
+  await app.route('/omni-memory/node').handler(
+    fakeReq(`/omni-memory/node?node=n:${rows.active.value.id}&scope=project`), globalNode.res,
+  );
+  assert.equal(globalNode.state.statusCode, 404, 'global node must not open from the pseudo-project layer');
+});
+
 test('lifecycle matrix: profile excludes contested and superseded notes', async () => {
   const app = await boot();
   const rows = await seed(app);

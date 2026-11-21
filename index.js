@@ -352,13 +352,12 @@ function openStore() {
   if (store) return store;
   mkdirSync(DB_DIR, { recursive: true });
   const db = new DatabaseSync(DB_FILE);
+  // Several AI hosts can hold the same file open at once. Set the busy timeout
+  // before switching journal mode: concurrent first opens race on that PRAGMA
+  // and would otherwise fail with "database is locked" before the handler exists.
+  db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA synchronous = NORMAL');
-  // Several AI hosts can hold the same file open at once. Without a busy
-  // timeout SQLite fails instantly when another process holds the write lock,
-  // so a second Claude window would see "database is locked" instead of waiting
-  // its turn. Blocking is correct here: every write is short.
-  db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
   // Keep the WAL from growing without bound when many readers keep snapshots
   // alive; the limit is applied at the next checkpoint.
   db.exec('PRAGMA journal_size_limit = 16777216');
