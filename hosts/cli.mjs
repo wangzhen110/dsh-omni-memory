@@ -50,6 +50,10 @@ const USAGE = `全息记忆 · omni
                [--cardinality single|multi] [--contradicts <id,id>]
   omni report  --id <笔记id> --outcome success|failed|expired [--evidence <证据>]
   omni forget  --kind note|fact|chunk --id <行id>
+  omni scope-alias --from <旧proj键> --to <新proj键> [--apply]
+               旧项目键没有 project_path 证据时，显式合并 scope；默认只预览
+  omni scope-alias --list
+               列出已记录的旧键 → canonical 键映射
   omni serve   [--port <端口>] [--bind <地址>]
   omni mcp     以 stdio 方式启动 MCP 服务（等同 hosts/mcp/bin.mjs）
 
@@ -398,6 +402,45 @@ async function commandSearch() {
   }
 }
 
+async function commandScopeAlias() {
+  const booted = await boot();
+  try {
+    const { openStore, migrateScopeAlias, scopeHasRows } = await import('../index.js');
+    const store = openStore();
+    if (flags.list === true) {
+      const rows = store.db.prepare('SELECT alias, canonical, created_at FROM scope_aliases ORDER BY created_at').all();
+      process.stdout.write(JSON.stringify({ aliases: rows }) + '\n');
+      return;
+    }
+    const from = String(flags.from ?? '').trim();
+    const to = String(flags.to ?? '').trim();
+    if (!from.startsWith('proj:') || !to.startsWith('proj:')) {
+      log('--from 与 --to 必须是 proj:<名称>#<哈希> 形式；不允许合并 global');
+      process.exitCode = 2;
+      return;
+    }
+    if (from === to) {
+      log('--from 与 --to 相同，无需迁移');
+      return;
+    }
+    const preview = {
+      from,
+      to,
+      fromHasRows: scopeHasRows(store.db, from),
+      toHasRows: scopeHasRows(store.db, to),
+      applied: flags.apply === true,
+    };
+    if (flags.apply !== true) {
+      process.stdout.write(JSON.stringify({ ...preview, hint: '加 --apply 执行合并；默认只预览' }) + '\n');
+      return;
+    }
+    const result = migrateScopeAlias(store.db, from, to);
+    process.stdout.write(JSON.stringify({ ...preview, ...result }) + '\n');
+  } finally {
+    booted.host.dispose();
+  }
+}
+
 async function commandServe() {
   const { startHttpServer } = await import('./http/server.mjs');
   const { readFileSync } = await import('node:fs');
@@ -452,6 +495,9 @@ switch (command) {
     break;
   case 'forget':
     await commandForget();
+    break;
+  case 'scope-alias':
+    await commandScopeAlias();
     break;
   case 'serve':
     await commandServe();

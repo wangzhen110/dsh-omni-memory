@@ -2,6 +2,19 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.9.5] — 2026-11-21
+
+### 修复 · 语义可靠性收尾（复核 P2/P3）
+- **冷却期漏调度**：`runSemanticWorker` 在 `retryAt` 未来时早退，调度条件补上 `|| !state.backfillDone`；冷却结束后即使 `pending` 为空，也会继续未完成的回填。
+- **派生 GC 原子化**：`pruneSemanticVectors` 改为单个事务，失败不再逐条吞掉，写入 `semantic_gc_last_error` / `semantic_gc_failed_at` 并通过 `semantic.gcError` / `gcFailedAt` 暴露；`dropDerivedIndexes` 只在表确实存在时删除，已有表上的删除失败会让事务回滚。
+- **替代路径清全索引**：`memory_amend`、dream replace、consolidate、rollback 从“只清 semantic_vectors”改为清理 FTS / bigram / hashed/remote `vectors` / `semantic_vectors`，避免被替代笔记的派生索引长期累积。
+- **远程向量队列可观测**：`enqueueVector` 队列满时记录 `dropped` / `lastDropAt`，`/omni-memory/status` 的 `embedding` 暴露，不再无声丢弃。
+- **手工 scope 迁移**：新增 `omni scope-alias --from <旧键> --to <新键> --apply` 与 `--list`；没有 `project_path` 证据的历史旧键可以在确认归属后显式迁移，默认只预览，不自动猜测。
+
+### 测试与发布
+- 新增 `test/derived-gc.test.mjs`：amend 后旧 note 的 FTS / bigram / vector 清零。
+- 完整 `npm test` **289/289** 通过；`npm run check` 同步为 23 个内核工具、25 个 MCP 工具、20 路由、31 ADR、3.9.5。
+
 ## [3.9.4] — 2026-11-21
 
 ### 修复 · 跨平台项目键与旧 scope 迁移（复核 P1）

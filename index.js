@@ -135,6 +135,7 @@ function projectKeyFromPath(normalized) {
 }
 
 export { projectKeyFromCwd, legacyProjectKeyFromCwd };
+export { openStore, migrateScopeAlias, scopeHasRows };
 
 const WORKSPACES_DIR = path.join(DSH_HOME, 'sessions');
 
@@ -663,12 +664,20 @@ function openStore() {
   // (for example the v4 vector reset) after the first process already set the
   // backfill marker, silently breaking vector recall.
   let schemaVersion = SCHEMA_VERSION;
+  let semanticGcReport = null;
   try {
     schemaVersion = migrate(db);
     // One-time derived-index repair. Forget/compact now delete semantic rows in
     // the same transaction; this sweep removes rows left behind by older builds.
-    if (metaGet(db, 'semantic_gc_version') !== String(SCHEMA_VERSION) && pruneSemanticVectors(db)) {
-      metaSet(db, 'semantic_gc_version', SCHEMA_VERSION);
+    if (metaGet(db, 'semantic_gc_version') !== String(SCHEMA_VERSION)) {
+      semanticGcReport = pruneSemanticVectors(db);
+      if (semanticGcReport.ok) {
+        metaSet(db, 'semantic_gc_version', SCHEMA_VERSION);
+        metaSet(db, 'semantic_gc_last_error', '');
+      } else {
+        metaSet(db, 'semantic_gc_last_error', semanticGcReport.error);
+        metaSet(db, 'semantic_gc_failed_at', now());
+      }
     }
     const ftsMarker = metaGet(db, 'fts_backfill_version');
     if (ftsMarker !== String(SCHEMA_VERSION)) {
@@ -696,6 +705,7 @@ function openStore() {
     db,
     ftsMode,
     schemaVersion,
+    semanticGc: semanticGcReport,
     fts: { chunks: Boolean(chunksMode), notes: Boolean(notesMode), facts: Boolean(factsMode) },
   };
   // A host launched from this directory should never silently split its layer
@@ -728,6 +738,15 @@ function addColumn(db, table, column, type) {
   if (columnExists(db, table, column)) return false;
   db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
   return true;
+}
+
+/** Optional derived tables differ by schema age; only skip when truly absent. */
+function tableExists(db, table) {
+  try {
+    return Boolean(prepareCached(db, "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1130,6 +1149,8 @@ const pendingVectors = new Map();
 let remoteDim = 0;
 let remoteSignatureValue = '';
 let remoteProbeFailedAt = 0;
+let vectorDropped = 0;
+let vectorLastDropAt = 0;
 const REMOTE_PROBE_COOLDOWN_MS = 60_000;
 
 function metaGet(db, key) {
@@ -1204,7 +1225,11 @@ async function ensureRemoteDim(s) {
 
 function enqueueVector(kind, id, text) {
   const key = `${kind}:${id}`;
-  if (!pendingVectors.has(key) && pendingVectors.size >= MAX_PENDING_VECTORS) return;
+  if (!pendingVectors.has(key) && pendingVectors.size >= MAX_PENDING_VECTORS) {
+    vectorDropped += 1;
+    vectorLastDropAt = now();
+    return;
+  }
   pendingVectors.set(key, { kind, id: Number(id), text: String(text ?? '') });
 }
 
@@ -1396,10 +1421,9 @@ function releaseSemanticLease(s) {
 function dropSemanticIndex(s, kind, id) {
   const state = semanticState(s);
   state.pending.delete(`${kind}:${Number(id)}`);
-  try {
-    prepareCached(s.db, 'DELETE FROM semantic_vectors WHERE kind = ? AND owner_id = ?')
-      .run(kind, Number(id));
-  } catch { /* schema may be older than v14 */ }
+  if (!tableExists(s.db, 'semantic_vectors')) return;
+  prepareCached(s.db, 'DELETE FROM semantic_vectors WHERE kind = ? AND owner_id = ?')
+    .run(kind, Number(id));
 }
 
 /** Remove every derived index for a row whose source data is gone or inactive. */
@@ -1407,9 +1431,16 @@ function dropDerivedIndexes(s, kind, id) {
   const table = { note: 'notes', fact: 'facts', chunk: 'chunks' }[String(kind)];
   if (!table) return;
   dropSemanticIndex(s, kind, id);
-  try { prepareCached(s.db, `DELETE FROM ${table}_fts WHERE rowid = ?`).run(Number(id)); } catch { /* FTS may be absent */ }
-  try { prepareCached(s.db, 'DELETE FROM bigrams WHERE layer = ? AND owner_id = ?').run(kind, Number(id)); } catch { /* bigrams may be absent */ }
-  try { prepareCached(s.db, 'DELETE FROM vectors WHERE kind = ? AND owner_id = ?').run(kind, Number(id)); } catch { /* vectors may be absent */ }
+  pendingVectors.delete(`${kind}:${Number(id)}`);
+  if (tableExists(s.db, `${table}_fts`)) {
+    prepareCached(s.db, `DELETE FROM ${table}_fts WHERE rowid = ?`).run(Number(id));
+  }
+  if (tableExists(s.db, 'bigrams')) {
+    prepareCached(s.db, 'DELETE FROM bigrams WHERE layer = ? AND owner_id = ?').run(kind, Number(id));
+  }
+  if (tableExists(s.db, 'vectors')) {
+    prepareCached(s.db, 'DELETE FROM vectors WHERE kind = ? AND owner_id = ?').run(kind, Number(id));
+  }
 }
 
 /**
@@ -1418,27 +1449,34 @@ function dropDerivedIndexes(s, kind, id) {
  * a deleted note compete in ranking if a future query bypasses the JOIN.
  */
 function pruneSemanticVectors(db) {
-  let ok = true;
-  for (const [kind, table, extra] of [
-    ['note', 'notes', 'AND t.superseded_by IS NULL'],
-    ['fact', 'facts', 'AND t.valid_to IS NULL'],
-    ['chunk', 'chunks', ''],
-  ]) {
-    try {
-      prepareCached(db, `
-        DELETE FROM semantic_vectors
-        WHERE kind = ?
-          AND NOT EXISTS (
-            SELECT 1 FROM ${table} t
-            WHERE t.id = semantic_vectors.owner_id
-              AND t.deleted_at IS NULL ${extra}
-          )
-      `).run(kind);
-    } catch {
-      ok = false;
-    }
+  const report = { ok: true, deleted: 0, error: '' };
+  try {
+    transaction(db, () => {
+      for (const [kind, table, extra] of [
+        ['note', 'notes', 'AND t.superseded_by IS NULL'],
+        ['fact', 'facts', 'AND t.valid_to IS NULL'],
+        ['chunk', 'chunks', ''],
+      ]) {
+        if (!tableExists(db, 'semantic_vectors')) continue;
+        const info = prepareCached(db, `
+          DELETE FROM semantic_vectors
+          WHERE kind = ?
+            AND NOT EXISTS (
+              SELECT 1 FROM ${table} t
+              WHERE t.id = semantic_vectors.owner_id
+                AND t.deleted_at IS NULL ${extra}
+            )
+        `).run(kind);
+        report.deleted += Number(info.changes ?? 0);
+      }
+    });
+  } catch (error) {
+    // A failed sweep must remain observable instead of silently committing a
+    // half-clean index. The main store still opens; lexical recall is unaffected.
+    report.ok = false;
+    report.error = String(error?.message ?? error);
   }
-  return ok;
+  return report;
 }
 
 function semanticHasMissing(s, config) {
@@ -1604,7 +1642,7 @@ async function runSemanticWorker(s) {
   let scheduleDelay = 0;
   try {
     if (state.retryAt > now()) {
-      scheduleNext = state.pending.size > 0;
+      scheduleNext = state.pending.size > 0 || !state.backfillDone;
       scheduleDelay = Math.max(0, state.retryAt - now());
       return;
     }
@@ -1662,6 +1700,8 @@ function semanticStatus(s) {
     running: state.running,
     backfillDone: state.backfillDone,
     lastError: state.lastError,
+    gcError: metaGet(s.db, 'semantic_gc_last_error') ?? '',
+    gcFailedAt: Number(metaGet(s.db, 'semantic_gc_failed_at') ?? 0) || null,
   };
 }
 
@@ -2526,7 +2566,7 @@ export function consolidateProblemNotes(problemKey, options = {}, toolContext = 
     const update = prepareCached(s.db, 'UPDATE notes SET superseded_by = ? WHERE id = ?');
     for (const id of activeIds) {
       update.run(summaryId, id);
-      dropSemanticIndex(s, 'note', id);
+      dropDerivedIndexes(s, 'note', id);
     }
     return { applied: true, noteId: summaryId, sourceIds: activeIds, summary: summaryText };
   });
@@ -3139,7 +3179,7 @@ function dreamRun(s, apply, options = {}) {
           ).run(now(), note.scope, replacementText, 0.5, `dream:${note.id}`, Number(note.revision ?? 1) + 1);
           const replacementId = Number(info.lastInsertRowid);
           prepareCached(s.db, 'UPDATE notes SET superseded_by = ? WHERE id = ?').run(replacementId, Number(note.id));
-          dropSemanticIndex(s, 'note', note.id);
+          dropDerivedIndexes(s, 'note', note.id);
           if (s.fts.notes) {
             try {
               prepareCached(s.db, 'INSERT INTO notes_fts(rowid, text) VALUES (?, ?)')
@@ -3195,7 +3235,7 @@ function dreamReplace(s, noteId) {
     ).run(now(), note.scope, replacementText, 0.5, `dream:${note.id}`, Number(note.revision ?? 1) + 1);
     const replacementId = Number(info.lastInsertRowid);
     prepareCached(s.db, 'UPDATE notes SET superseded_by = ?, contested = 1 WHERE id = ?').run(replacementId, Number(note.id));
-    dropSemanticIndex(s, 'note', note.id);
+    dropDerivedIndexes(s, 'note', note.id);
     if (s.fts.notes) {
       try { prepareCached(s.db, 'INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(replacementId, replacementText); } catch { /* best effort */ }
     }
@@ -5363,7 +5403,7 @@ function defineTools(ctx) {
         );
         const newId = Number(info.lastInsertRowid);
         prepareCached(s.db, 'UPDATE notes SET superseded_by = ? WHERE id = ?').run(newId, id);
-        dropSemanticIndex(s, 'note', id);
+        dropDerivedIndexes(s, 'note', id);
         if (s.fts.notes) {
           try {
             prepareCached(s.db, 'INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(newId, text);
@@ -6578,6 +6618,8 @@ function registerRoutes(ctx) {
           kind: backendConfig().kind,
           dim: activeVectorDim(),
           pending: pendingVectors.size,
+          dropped: vectorDropped,
+          lastDropAt: vectorLastDropAt || null,
         },
         semantic: semanticStatus(s),
         stats: {

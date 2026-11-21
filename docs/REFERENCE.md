@@ -1,6 +1,6 @@
 # 全息记忆 · 机理与接口参考
 
-> 版本 3.9.4 · 生成日期 2026-11-21 · 依据源码与真实 schema v15 核对
+> 版本 3.9.5 · 生成日期 2026-11-21 · 依据源码与真实 schema v15 核对
 >
 > **给 AI 的用法**：这份文档按「先原理、后接口、最后剧本」组织。第一次接触时读第 1、2、9 章即可开工；要精确调用某个工具，直接跳到第 9 章对应小节。若这份文档已同步进记忆库（`omni memory:sync`），也可以先用 `memory_search` 搜"全息记忆 接口"定位。
 
@@ -88,6 +88,15 @@ proj:<目录名（截 40 字符，非法字符转 -）>#<路径 FNV-1a 哈希前
 Windows 与 macOS 在哈希前把规范化路径转小写，Linux 保留大小写；因此同一工作区在这些平台上不因大小写分裂。
 
 例：`D:\xiangmu\全息记忆` → 3.9.4 起为 `proj:全息记忆#30534c`。3.9.3 及以前的旧键 `proj:全息记忆#deff23` 会在首次打开该路径时通过 schema v15 的 `scope_aliases` 迁移到 canonical 键；迁移只针对由完整路径可确定的键，不按目录名猜测合并。
+
+没有留下 `project_path` 的旧键不会被自动猜测合并；确认两个 scope 属于同一项目后，用 CLI 显式补：
+
+```powershell
+omni scope-alias --from proj:旧名#旧哈希 --to proj:新名#新哈希 --apply
+omni scope-alias --list
+```
+
+默认只预览 `fromHasRows` / `toHasRows` 与将写入的映射；`--apply` 才会在事务内迁移 notes/facts/chunks/note_candidates/edges 与 `agent_project`。不要用它合并同名不同盘的项目。
 
 同名目录靠哈希区分，所以两个不同路径的同名项目不会串层。宿主通过"工作目录"推导，DSH 用 `session.header.cwd`，MCP/CLI/HTTP 用 `OMNI_PROJECT_DIR`，落库时同时写入 `meta.agent_project:<sessionId>` 与 `meta.project_path:<scope>`，重启后仍能恢复。
 
@@ -419,7 +428,7 @@ MCP / HTTP 适配器在启动时会额外注册 `memory_context` 与 `memory_rul
 | `/dream/rollback` | POST | `noteId` | 撤销替代 |
 | `/export` | GET | `activeOnly` `download` | 备份；`download=1` 走附件下载 |
 | `/restore` | POST | `kind` `id` | 复活墓碑 |
-| `/status` | GET | — | 运行态：注入统计、嵌入后端、计数 |
+| `/status` | GET | — | 运行态：注入统计、嵌入后端；`embedding.dropped` / `lastDropAt` 与 `semantic.gcError` / `gcFailedAt` 可观测队列丢弃和启动 GC 失败 |
 | `/search` | GET | `q` `limit` `scope` | 混合检索 |
 | `/packet` | GET | `q` `scope` `cwd` `limit` `budget` `format` | 无 MCP 宿主的可注入记忆包；`format=text` 直接输出纯文本 |
 | `/openapi.json` | GET | — | HTTP adapter 的 OpenAPI 3.0 描述（packet/search/list/node/status/tool） |
@@ -481,6 +490,8 @@ write    --kind note|fact|episode (--text <文本> | --stdin | --file <路径>)
          输出写入结果 JSON：id / scope / scopeReason / deduped / solutionStatus
 report   --id <笔记id> --outcome success|failed|expired [--evidence <证据>]
 forget   --kind note|fact|chunk --id <行id>
+scope-alias --from <旧proj键> --to <新proj键> [--apply]
+         默认预览；--apply 事务内合并 scope；--list 列出已记录别名
 serve    [--port <端口>] [--bind <地址>]
 mcp      以 stdio 启动 MCP（等同 hosts/mcp/bin.mjs）
 ```
@@ -604,5 +615,5 @@ hosts/http/web/         独立面板（列表/星图/规则）
 hosts/cli.mjs           omni 命令行
 scripts/check-docs.mjs  文档漂移闸门
 scripts/check-semantic-assets.mjs  模型与运行时完整性闸门
-test/*.test.mjs         283 个用例
+test/*.test.mjs         289 个用例
 ```
