@@ -11,8 +11,9 @@
 - **可选 cross-encoder rerank（P1）**：新增 `lib/rerank-provider.mjs`，支持 Cohere / Jina / SiliconFlow / 自建兼容端点；`OMNI_RERANK_*` 配置后对融合结果重排，未配置时零额外延迟，失败时静默回落。`memory_search` 增加 `rerank` 开关。
 - **本地语义嵌入入口**：`OMNI_EMBED_PROVIDER` 新增 `ollama`、`lmstudio` 预设，仍不内置模型；默认 hashed 向量保持零配置可运行。
 - **核心拆分**：候选抽取规则移入 `lib/capture-rules.mjs`，新增 `test/capture-rules.test.mjs`；重排提供方独立为 `lib/rerank-provider.mjs`。
+- **备份完整性**：`memory_export` 快照新增 `candidates`（默认含全部待审/已审候选，`activeOnly` 只导 pending）；`memory_import` 按 `hash + scope` 只恢复 pending 候选，避免把已接受/已拒绝的审计行重新灌回队列。
 - **检索去重优先级**：同一段文本同时命中转录 chunk 与已接受 note 时，最终结果优先保留 note/fact，不再让原始 chunk 把结论遮住；补回归断言。
-- 测试：新增 ingest 6 项、consolidation 4 项、rerank 3 项、capture rules 4 项；完整 `npm test` **275/275** 通过；`npm run check` 文档计数同步为 23 工具、20 路由、schema v13、3.9.0。
+- 测试：新增 ingest 7 项、consolidation 4 项、rerank 3 项、capture rules 4 项、候选备份 1 项；完整 `npm test` **276/276** 通过；`npm run check` 文档计数同步为 23 工具、20 路由、schema v13、3.9.0。
 
 ## [3.8.0] — 2026-11-21
 

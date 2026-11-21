@@ -356,7 +356,7 @@ MCP 无法写客户端系统提示，所以同一份 `RULES_TEXT` 铺五条路�
 参数：`noteId` number（原笔记 id）。撤销 dream 替代。
 
 ### 5.17 memory_export
-参数：`path` string（默认落到 `$DSH_HOME/memory/` 的时间戳文件）、`activeOnly` boolean（默认 false，含墓碑）。向量是派生数据，不导出。
+参数：`path` string（默认落到 `$DSH_HOME/memory/` 的时间戳文件）、`activeOnly` boolean（默认 false，含墓碑与全部候选；true 时只导活跃行和 pending 候选）。向量是派生数据，不导出。
 
 ### 5.18 memory_import
 参数：`path` 必填、`dryRun` boolean（默认 true）。按内容去重合并。

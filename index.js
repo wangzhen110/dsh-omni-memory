@@ -1194,10 +1194,12 @@ function snapshotStore(s, options = {}) {
   const factsWhere = audit ? '' : 'WHERE deleted_at IS NULL AND valid_to IS NULL';
   const chunksWhere = audit ? '' : 'WHERE deleted_at IS NULL';
   const edgesWhere = audit ? '' : 'WHERE valid_to IS NULL';
+  const candidatesWhere = audit ? '' : "WHERE status = 'pending'";
   const notes = prepareCached(s.db, `SELECT * FROM notes ${notesWhere} ORDER BY id`).all();
   const facts = prepareCached(s.db, `SELECT * FROM facts ${factsWhere} ORDER BY id`).all();
   const chunks = prepareCached(s.db, `SELECT * FROM chunks ${chunksWhere} ORDER BY id`).all();
   const edges = prepareCached(s.db, `SELECT * FROM edges ${edgesWhere} ORDER BY id`).all();
+  const candidates = prepareCached(s.db, `SELECT * FROM note_candidates ${candidatesWhere} ORDER BY id`).all();
   const entities = prepareCached(s.db, 'SELECT name FROM entities ORDER BY name').all().map(row => row.name);
   const relations = prepareCached(s.db, 'SELECT name, cardinality, aliases, updated_at FROM relations ORDER BY name').all();
   const entityAliases = prepareCached(s.db, 'SELECT alias, canonical, updated_at FROM entity_aliases ORDER BY alias').all();
@@ -1212,8 +1214,9 @@ function snapshotStore(s, options = {}) {
       notes: notes.length, facts: facts.length, chunks: chunks.length,
       edges: edges.length, entities: entities.length,
       relations: relations.length, entityAliases: entityAliases.length, persona: persona.length,
+      candidates: candidates.length,
     },
-    notes, facts, chunks, edges, entities, relations, entityAliases, persona,
+    notes, facts, chunks, edges, entities, relations, entityAliases, persona, candidates,
   };
 }
 
@@ -1252,14 +1255,21 @@ function mergeSnapshot(s, snapshot, options = {}) {
   const dryRun = options.dryRun !== false;
   const stats = {
     notes: 0, facts: 0, chunks: 0, edges: 0, entities: 0,
-    relations: 0, entityAliases: 0, persona: 0, skipped: 0, dryRun,
+    relations: 0, entityAliases: 0, persona: 0, candidates: 0, skipped: 0, dryRun,
   };
-  const plan = { notes: [], facts: [], chunks: [], edges: [], entities: [], relations: [], entityAliases: [], persona: [] };
+  const plan = {
+    notes: [], facts: [], chunks: [], edges: [], entities: [], relations: [], entityAliases: [], persona: [],
+    candidates: [],
+  };
 
   const noteExists = prepareCached(s.db, 'SELECT id FROM notes WHERE scope = ? AND text = ? AND superseded_by IS NULL');
   const factExists = prepareCached(s.db, 'SELECT id FROM facts WHERE subject = ? AND relation = ? AND object = ? AND scope = ?');
   const chunkExists = prepareCached(s.db, "SELECT id FROM chunks WHERE hash = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global')");
   const edgeExists = prepareCached(s.db, "SELECT id FROM edges WHERE src = ? AND rel = ? AND dst = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global')");
+  const candidateExists = prepareCached(s.db, `
+    SELECT id FROM note_candidates
+    WHERE hash = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global') AND status = 'pending'
+  `);
 
   for (const note of Array.isArray(snapshot.notes) ? snapshot.notes : []) {
     if (!note?.text) { stats.skipped += 1; continue; }
@@ -1284,6 +1294,14 @@ function mergeSnapshot(s, snapshot, options = {}) {
     if (!edge?.src || !edge?.rel || !edge?.dst) { stats.skipped += 1; continue; }
     if (edgeExists.get(edge.src, edge.rel, edge.dst, edge.scope ?? SCOPE_GLOBAL)) { stats.skipped += 1; continue; }
     plan.edges.push(edge);
+  }
+  for (const candidate of Array.isArray(snapshot.candidates) ? snapshot.candidates : []) {
+    const text = String(candidate?.text ?? '').trim();
+    if (!text || (candidate.status && candidate.status !== 'pending')) { stats.skipped += 1; continue; }
+    const scope = candidate.scope ?? SCOPE_GLOBAL;
+    const digest = hash(`${scope}\n${text}`);
+    if (candidateExists.get(digest, scope)) { stats.skipped += 1; continue; }
+    plan.candidates.push({ ...candidate, text, scope, hash: digest });
   }
   for (const name of Array.isArray(snapshot.entities) ? snapshot.entities : []) {
     if (!name) { stats.skipped += 1; continue; }
@@ -1318,6 +1336,7 @@ function mergeSnapshot(s, snapshot, options = {}) {
   stats.relations = plan.relations.length;
   stats.entityAliases = plan.entityAliases.length;
   stats.persona = plan.persona.length;
+  stats.candidates = plan.candidates.length;
   if (dryRun) return stats;
 
   const idMap = new Map();
@@ -1400,6 +1419,15 @@ function mergeSnapshot(s, snapshot, options = {}) {
       }
       indexBigrams(s.db, 'chunk', newId, text);
       upsertVector(s, 'chunk', newId, text);
+    }
+    for (const candidate of plan.candidates) {
+      prepareCached(s.db, `
+        INSERT INTO note_candidates(ts, scope, text, hash, source, chunk_id, confidence, status)
+        VALUES (?, ?, ?, ?, ?, NULL, ?, 'pending')
+      `).run(
+        Number(candidate.ts ?? now()), candidate.scope ?? SCOPE_GLOBAL, String(candidate.text),
+        String(candidate.hash), candidate.source ?? null, Number(candidate.confidence ?? 0.5),
+      );
     }
     for (const edge of plan.edges) {
       prepareCached(s.db, `

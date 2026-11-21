@@ -34,11 +34,13 @@
 
 ## 验证结果
 
-- `npm test`：**275/275 通过**（新增 ingest 7、consolidation 4、rerank 3、capture rules 4）。
+- `npm test`：**276/276 通过**（新增 ingest 7、consolidation 4、rerank 3、capture rules 4、候选备份 1）。
 - `npm run check`：文档与语法检查通过；当前计数 **23 工具 / 20 路由 / schema v13 / 3.9.0 / 28 ADR**。
 - `npm run bench:golden`：recall **1.0**、MRR **0.927**，门槛 recall≥0.85 / MRR≥0.9 通过，重排与去重改造未降低黄金集。
 - 线上服务已重启为 **3.9.0 / 25 个工具**（含 `memory_context`、`memory_rules`），OpenAPI 导出 10 条 path；`GET /omni-memory/candidates` 在真实库上返回 200。
 - 临时库端到端验证：ingest → candidates → accept → 两条同 problemKey note → consolidate 干跑 → apply → `memory_get` 取到来源链摘要。
+- 备份链路已补候选：`memory_export` 快照包含 `candidates`，`memory_import` 只恢复 pending 候选并按 `hash + scope` 去重；`activeOnly` 只导出 pending。
+- Git：3.9.0 主提交 `fb8912d` 与备份补丁均已推送 `origin/main`；GitHub API 确认远端 SHA 与本地 HEAD 一致。
 
 ## 明确边界
 

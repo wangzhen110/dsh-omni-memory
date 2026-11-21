@@ -7,7 +7,7 @@
 > **源码/架构**后做商业替代、竞品或商业服务；且**必须署名作者**。
 > 商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-275%2F275-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-276%2F276-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-Personal%20Use%201.1-lightgrey)](LICENSE)
 
 ---
@@ -41,7 +41,7 @@
 - **做梦校验**：离线拿转录核对笔记，发现"与原文矛盾"时**只标记为待复核**；替代需单条确认（`memory_dream_replace`），且可一键反替代
 - **记忆星图**：整屏旋臂星系，拖拽旋转/滚轮缩放/分层切换；**单击任意星点弹出记忆卡**，搜索命中会亮起脉冲光环
 - **活跃视图**：列表/搜索默认只显示活跃记忆；历史（被替代、已删除、已失效）通过面板「审计」查看并可单条**恢复**
-- **备份/导出/导入**：`memory_export` 导出可移植 JSON（含墓碑），`memory_import` 合并导入（默认 dry-run），`memory_restore` 复活单条
+- **备份/导出/导入**：`memory_export` 导出可移植 JSON（含墓碑与待审候选），`memory_import` 合并导入（默认 dry-run），`memory_restore` 复活单条
 - **多客户端并发**：同一台机器上多个 AI 客户端各起一个服务进程，共用一个 `omni.db`；写入等待而不是报锁错，去重与事实失效在写锁内完成，迁移/索引重建/做梦由全机唯一的租约持有者执行（见 [ADR-028](docs/ADR/028-multi-process-concurrency.md)）
 - **隐私**：全部数据在本地 SQLite（`$OMNI_HOME/memory/omni.db`，未设置时回退 `$DSH_HOME`），HTTP 只监听 loopback；写操作只接受 POST 并校验 Origin/CSRF 头
 
@@ -57,7 +57,7 @@
 
 ```bash
 cd /path/to/omni-memory
-npm test          # 275 个用例
+npm test          # 276 个用例
 npm run check     # 语法与 JSON 校验
 ```
 
@@ -143,7 +143,7 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 | `memory_reindex` | 回填缺失向量（hashed / remote）；`bigrams: true` 一次重建全库 CJK 两字索引 |
 | `memory_link_entity` | 登记实体别名并合并事实/边（默认 dry-run） |
 | `memory_persona` | 读取/修正/自动提炼用户设定：称呼 / 性格 / 习惯 / 偏好 / 其他；刷新默认保留手工字段，`useModel: true` 才调用宿主模型 |
-| `memory_export` | 导出 JSON 备份（默认含墓碑；`activeOnly` 只导活跃） |
+| `memory_export` | 导出 JSON 备份（默认含墓碑与待审候选；`activeOnly` 只导活跃） |
 | `memory_import` | 合并导入备份（默认 dry-run，按内容去重，重建向量） |
 | `memory_restore` | 恢复一条被墓碑化的记忆（重建索引） |
 
@@ -156,7 +156,7 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 
 ## 测试与指标
 
-- 自动化用例：**275 / 275 通过**
+- 自动化用例：**276 / 276 通过**
 - 检索延迟（本机复核，Node 22.23.2；标准 bench 已改为 global scope 并断言真实命中）：10,000 行 p95 ≈ **2.4ms**；100,000 行 ≈ 2.4ms；1,000,000 行 ≈ 6.0ms；1M + 5 万向量 + 100 万 bigram ≈ **116.8ms**（两段式有界检索，见 ADR-020）
 - 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 混合检索 **0.927**
 

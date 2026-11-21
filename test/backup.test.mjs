@@ -91,6 +91,34 @@ test('import is a dry run by default and dedupes on a second pass', async () => 
   assert.equal(again.value.skipped >= 2, true, 'a second import must skip existing rows');
 });
 
+test('export and import keep pending candidates', async () => {
+  const source = await boot();
+  await source.call('memory_ingest', {
+    text: '记住：备份候选必须能恢复。',
+    role: 'user',
+    scope: 'global',
+  });
+  const file = path.join(source.home, 'candidates.json');
+  const exported = await source.call('memory_export', { path: file });
+  assert.equal(exported.value.counts.candidates, 1);
+  const snapshot = JSON.parse(readFileSync(file, 'utf8'));
+  assert.equal(snapshot.candidates.length, 1);
+
+  const target = await boot();
+  const dry = await target.call('memory_import', { path: file });
+  assert.equal(dry.value.candidates, 1);
+
+  await target.call('memory_import', { path: file, dryRun: false });
+  const listed = await target.call('memory_candidate', { action: 'list', status: 'all', scope: 'all' });
+  assert.ok(listed.value.candidates.some(candidate => candidate.text.includes('备份候选')));
+
+  const accepted = await target.call('memory_candidate', {
+    action: 'accept',
+    id: listed.value.candidates.find(candidate => candidate.text.includes('备份候选')).id,
+  });
+  assert.equal(accepted.value.status, 'accepted');
+});
+
 test('import remaps superseded_by pointers instead of keeping stale ids', async () => {
   const source = await boot();
   const oldNote = await source.call('memory_write', { kind: 'note', scope: 'global', text: 'LineageOld 旧结论' });
