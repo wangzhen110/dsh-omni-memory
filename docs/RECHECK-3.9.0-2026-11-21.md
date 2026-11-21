@@ -152,3 +152,27 @@
 ## 复核边界
 
 只读静态审查 + 隔离环境动态实测，未跑生产库压测，未配置真实 rerank/embedding 端点（故重排与语义的实际质量未独立复测，仅验证代码路径正确性与失败降级）。B1/B3 已由我独立实测复现，M-1/M-2 已回源码核实，B2/F1 及若干低优先级项为深审 agent 发现（我未逐条复跑）。两路深度审计均已返回并合并。本次未修改任何源码，仅新增本报告。
+
+---
+
+## 九、3.9.1 修复闭环复核（2026-11-21）
+
+提交 `29be35a`（3.9.1）针对本报告的全部发现逐条修复。我**不看项目新增测试**，用与上轮完全相同的脚本 + 独立隔离库重新验证，结论：**9 项全部修复到位，无新引入缺陷**。
+
+| 项 | 状态 | 我的独立证据 |
+|---|---|---|
+| **B1 英文拆句** | ✅ | 同一脚本：英文 2418 字符从「0 句 0 候选」→「2 句 2 候选」；英文 3 句→3 句；中文 2 句→2 句无退化。改用 `Intl.Segmenter('en')`，带旧正则 fallback（`capture-rules.mjs:17-25`）。 |
+| **B3 scope 大小写** | ✅ | 同一脚本：`ALL`/`All` 均被 `scope=all is read-only` 拦截。`normalizeScopeInput`（`index.js:195`）对 all/project/global 统一小写，覆盖 18 处工具与 HTTP 入口。 |
+| **B2 导入幂等** | ✅ | 独立隔离库跑完整链路：导出→导入（1 pending）→accept→**再次导入复活 pending = 0**，该候选稳定为 accepted。`candidateExists` 已去掉 `status='pending'` 限制（`index.js:1281`）。 |
+| **M-1 隐私告知** | ✅ | README:154 明确 `OMNI_RERANK_*` 外发 query + 候选正文；DESIGN NFR-08、THREAT-MODEL:39/52 同步补充。 |
+| **M-2 分数量级/硬优先** | ✅ | `normalizeScoreVector` min-max 归一化后 25/75 混合（`index.js:2880/2922`）；`compareRerankedHits` 把 `exactProblem` 作为**第一比较键**（硬优先，`:2889`）；负 logits 不再被 `score>0` 误判；`MAX_RERANK_CANDIDATES=20` 只重排 top-20。 |
+| **F1 候选字段保真** | ✅ | `writeCandidateNote` 保留候选原始 `ts`，`confidence` 映射 importance（0.3–0.9 钳制），不再硬编码 0.55/now()（`index.js:1738-1745`）。 |
+| **去重满结果边界（低）** | ✅ | `finalizeHits` 移除 `hits.length>=limit` 提前 break，排位靠后的 note/fact 仍可替换同文本 chunk，末尾按分数重排（`index.js:2669-2690`）。 |
+| **画像空标题（低）** | ✅ | `capProfileLines` 尾部清理空 `##` 标题（`index.js:3334-3347`）。 |
+| **负分数判定（低）** | ✅ | `maybeRerank` 改用「全等/全零视为无信号」，负 logits 参与归一化（`index.js:2916-2918`）。 |
+
+**门禁**：`npm test` **280/280**（exit=0）；`npm run check` 全绿（280 tests / 23 tools / 20 routes / 28 ADRs / 3.9.1）；`npm run bench:golden` **pass**（recall 1.0 / MRR 0.927，归一化改动未拉低质量）。
+
+**未改（明示的设计取舍，非缺陷）**：`memory_consolidate` 仍接受任意精确 scope（运维操作，HTTP 有 loopback+CSRF 兜底）；默认 hashed 向量、rerank 仍 opt-in；候选抽取仍是确定性规则不调 LLM。
+
+**结论**：3.9.0 复核发现的中等级问题全部在 3.9.1 闭环，修复质量高（尤其 M-2 把软加分改为排序硬优先、B3 一处归一化覆盖 18 个入口）。当前版本无待修缺陷。剩余差距回到战略层：默认语义检索（成本/隐私权衡）与渐进拆 core（index.js 已近 6000 行）。本次仅追加本报告与工作日志，未改动任何源码。

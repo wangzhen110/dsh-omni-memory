@@ -10,6 +10,7 @@
 - **scope 大小写（B3）**：`all` / `project` / `global` 在写入、ingest、候选、巩固、搜索、列表等入口统一大小写归一化；`ALL`、`All` 不再能绕过 `scope=all` 拒写。
 - **rerank 分数（M-2）**：原融合分与 rerank 分先各自归一化到 0..1，再按 25/75 混合；exact `problemKey` 命中改为硬优先排序，不再被高分弱命中反超。负 logits 不再被 `score > 0` 误判为无信号；只对 top-20 候选调用重排，成本有上限。
 - **隐私告知（M-1）**：README、DESIGN NFR-08、THREAT-MODEL 明确说明 `OMNI_RERANK_*` 会外发 query 与候选正文，敏感数据建议自建端点。
+- **候选审核原子性**：`reviewNoteCandidate` 的 accept/reject 现在包在单个 `BEGIN IMMEDIATE` 事务内；事务内重新读取 pending 状态，写 note 与更新候选状态同进同退，不再出现“note 已写、候选仍 pending/未更新”的半状态。
 - **候选字段保真（F1）**：accept 落 note 时保留候选原始 `ts`，并用 `confidence` 映射 `importance`，不再硬编码 0.55 / now()。
 - **满结果去重（低）**：`finalizeHits` 不再在达到 limit 时提前退出，排位靠后的 note/fact 仍可替换同文本 chunk，替换后按分数重排。
 - **画像边界（低）**：`capProfileLines` 清理尾部空标题；`addSection` 只有标题加首条内容能放下时才写标题，避免空的 `## 当前项目`。

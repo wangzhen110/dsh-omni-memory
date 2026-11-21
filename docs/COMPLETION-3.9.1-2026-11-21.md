@@ -40,6 +40,10 @@
 - accept 落 note 时保留候选原始 `ts`。
 - `confidence` 映射到 `importance`（0.3–0.9），不再硬编码 0.55 / `now()`。
 
+### 候选审核原子性
+
+- `reviewNoteCandidate` 的 accept/reject 包在单个 `BEGIN IMMEDIATE` 事务内；事务内重新读取 pending 状态，写 note 与更新候选状态同进同退，不再依赖 dedupe 兜底。
+
 ### 低优先级边界
 
 - `finalizeHits` 不再在达到 limit 时提前退出；排位靠后的 note/fact 仍可替换同文本 chunk，替换后按分数重排。

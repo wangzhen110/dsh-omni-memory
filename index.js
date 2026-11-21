@@ -1726,8 +1726,7 @@ export function listNoteCandidates(options = {}, toolContext = {}) {
   };
 }
 
-function writeCandidateNote(row) {
-  const s = openStore();
+function writeCandidateNoteInTransaction(s, row) {
   const text = String(row.text ?? '').trim();
   const scope = String(row.scope ?? SCOPE_GLOBAL);
   if (!text) throw new Error('candidate text is empty');
@@ -1743,30 +1742,25 @@ function writeCandidateNote(row) {
     ? Number(Math.min(0.9, Math.max(0.3, 0.4 + confidence * 0.4)).toFixed(3))
     : 0.55;
   const source = row.source ? `${row.source} · candidate:${row.id}` : `candidate:${row.id}`;
-  const result = transaction(s.db, () => {
-    const raced = prepareCached(s.db, `
-      SELECT id FROM notes
-      WHERE scope = ? AND text = ? AND deleted_at IS NULL AND superseded_by IS NULL
-    `).get(scope, text);
-    if (raced) return { id: Number(raced.id), deduped: true };
-    const info = prepareCached(s.db, `
-      INSERT INTO notes(ts, scope, text, importance, source)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(ts, scope, text, importance, source);
-    const noteId = Number(info.lastInsertRowid);
-    if (s.fts.notes) {
-      try { prepareCached(s.db, 'INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(noteId, text); } catch { /* index best effort */ }
-    }
-    indexBigrams(s.db, 'note', noteId, text);
-    upsertVector(s, 'note', noteId, text);
-    return { id: noteId, deduped: false };
-  });
-  invalidateProfile();
-  return result;
+  const raced = prepareCached(s.db, `
+    SELECT id FROM notes
+    WHERE scope = ? AND text = ? AND deleted_at IS NULL AND superseded_by IS NULL
+  `).get(scope, text);
+  if (raced) return { id: Number(raced.id), deduped: true };
+  const info = prepareCached(s.db, `
+    INSERT INTO notes(ts, scope, text, importance, source)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(ts, scope, text, importance, source);
+  const noteId = Number(info.lastInsertRowid);
+  if (s.fts.notes) {
+    try { prepareCached(s.db, 'INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(noteId, text); } catch { /* index best effort */ }
+  }
+  indexBigrams(s.db, 'note', noteId, text);
+  upsertVector(s, 'note', noteId, text);
+  return { id: noteId, deduped: false };
 }
 
-/** Accept or reject one pending candidate. Cross-project review requires scope=all. */
-export function reviewNoteCandidate(id, action, options = {}, toolContext = {}) {
+/** Accept or reject one pending candidate. Cross-project review requires scope=all. */export function reviewNoteCandidate(id, action, options = {}, toolContext = {}) {
   const s = openStore();
   const candidateId = Number(id);
   if (!Number.isFinite(candidateId) || candidateId <= 0) throw new Error('id must be a positive number');
@@ -1781,18 +1775,31 @@ export function reviewNoteCandidate(id, action, options = {}, toolContext = {}) 
   if (String(row.status) !== 'pending') throw new Error(`candidate is already ${row.status}`);
   const ts = now();
   if (normalized === 'reject') {
-    prepareCached(s.db, `
-      UPDATE note_candidates SET status = 'rejected', reviewed_at = ?, reason = ? WHERE id = ?
-    `).run(ts, String(options.reason ?? '').trim().slice(0, 500) || null, candidateId);
+    transaction(s.db, () => {
+      prepareCached(s.db, `
+        UPDATE note_candidates SET status = 'rejected', reviewed_at = ?, reason = ? WHERE id = ?
+      `).run(ts, String(options.reason ?? '').trim().slice(0, 500) || null, candidateId);
+    });
     return { action: 'reject', id: candidateId, status: 'rejected' };
   }
-  const note = writeCandidateNote(row);
-  prepareCached(s.db, `
-    UPDATE note_candidates SET status = 'accepted', reviewed_at = ?, note_id = ? WHERE id = ?
-  `).run(ts, Number(note.id), candidateId);
+  let accepted = row;
+  const note = transaction(s.db, () => {
+    const current = prepareCached(s.db, `
+      SELECT * FROM note_candidates WHERE id = ? ${clause.sql}
+    `).get(candidateId, ...clause.params);
+    if (!current) throw new Error('candidate not found or outside the current project');
+    if (String(current.status) !== 'pending') throw new Error(`candidate is already ${current.status}`);
+    accepted = current;
+    const written = writeCandidateNoteInTransaction(s, current);
+    prepareCached(s.db, `
+      UPDATE note_candidates SET status = 'accepted', reviewed_at = ?, note_id = ? WHERE id = ?
+    `).run(now(), Number(written.id), candidateId);
+    return written;
+  });
+  invalidateProfile();
   return {
     action: 'accept', id: candidateId, status: 'accepted',
-    noteId: Number(note.id), deduped: Boolean(note.deduped), scope: row.scope ?? SCOPE_GLOBAL,
+    noteId: Number(note.id), deduped: Boolean(note.deduped), scope: accepted.scope ?? SCOPE_GLOBAL,
   };
 }
 
