@@ -64,4 +64,7 @@ omni scope-alias --list
 ## 发布
 
 - 版本号、CHANGELOG、README、DESIGN、REFERENCE、THREAT-MODEL 同步到 3.9.5。
-- 计划在测试与副本迁移通过后提交并推送 `origin/main`；7788 继续由隐藏计划任务静默拉起。
+- 发布提交 `ab5dc99`（`fix: close semantic reliability debt (3.9.5)`），已推送 `origin/main`；远端 `main` 指向 `ab5dc99`。
+- 7788 服务在提交后重启，`health` 返回 `version:"3.9.5"`、`project:"proj:全息记忆#30534c"`、`tools:25`；`/omni-memory/status` 的 `semantic.gcError` 为空、`embedding.dropped:0`、`backfillDone:true`。
+- 计划任务 `OmniMemory7788` 保持 `Running`；node 与父 PowerShell 的 `MainWindowTitle` 均为空，无 cmd 黑框。注销/关机/休眠仍会停服，常驻化未在本版改变。
+- 真实库 `scope-alias --list` 返回既有两条映射：`proj:全息记忆#deff23 → proj:全息记忆#30534c`、`proj:专业知识#cb9453 → proj:专业知识#967a81`；未执行新的手工合并。
