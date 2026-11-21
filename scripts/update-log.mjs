@@ -26,18 +26,17 @@ function run(args) {
   }).trim();
 }
 
-const head = run(['rev-parse', 'HEAD']);
-const headDate = run(['show', '-s', '--date=format-local:%Y-%m-%d %H:%M:%S', '--format=%ad', 'HEAD']);
-const count = Number(run(['rev-list', '--count', 'HEAD']));
 const format = '%H%x1f%ad%x1f%s%x1e';
 const raw = run(['log', '--date=format-local:%Y-%m-%d %H:%M:%S', `--format=${format}`, 'HEAD']);
+const metaCommit = /^docs: (add|update) per-commit update log/i;
 const commits = raw
   .split('\x1e')
   .filter(Boolean)
   .map((record) => {
     const [hash, date, subject] = record.trim().split('\x1f');
     return { hash, date, subject };
-  });
+  })
+  .filter((record) => !metaCommit.test(record.subject));
 
 let remote = '';
 try {
@@ -68,7 +67,7 @@ const lines = [
   '',
   '> 本文件由 `npm run update-log` 从 git 历史自动生成，按时间倒序记录每一次提交。',
   '> 版本摘要见 [CHANGELOG](CHANGELOG.md)，版本报告见下方“版本报告”。',
-  `> 当前 HEAD：\`${head.slice(0, 8)}\`（${headDate}）；共 ${count} 次提交。`,
+  `> 共 ${commits.length} 次提交；更新记录自身的提交不计入列表。`,
   '',
   '## 版本报告',
   '',
@@ -84,11 +83,10 @@ for (const [day, records] of grouped) {
   for (const record of records) {
     const time = record.date.slice(11, 19);
     const hash = record.hash.slice(0, 8);
-    const isHead = record.hash === head ? '（HEAD）' : '';
     const url = `${commitBase}/commit/${record.hash}`;
-    lines.push(`- ${time} \`${hash}\`${isHead} — ${record.subject} — [提交](${url})`);
+    lines.push(`- ${time} \`${hash}\` — ${record.subject} — [提交](${url})`);
   }
 }
 
 writeFileSync(resolve(root, 'docs/UPDATES.md'), `${lines.join('\n')}\n`, 'utf8');
-console.log(`docs/UPDATES.md: ${count} commits, HEAD ${head.slice(0, 8)}`);
+console.log(`docs/UPDATES.md: ${commits.length} commits, latest ${commits[0]?.hash.slice(0, 8) ?? 'none'}`);
