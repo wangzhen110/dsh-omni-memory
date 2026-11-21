@@ -2,7 +2,7 @@
 
 > 本文件由 `npm run update-log` 从 git 历史自动生成，按时间倒序记录每一次提交。
 > 版本摘要见 [CHANGELOG](CHANGELOG.md)，版本报告见下方“版本报告”。
-> 共 60 次提交；更新记录自身的提交不计入列表。
+> 共 61 次提交；更新记录自身的提交不计入列表。
 
 ## 版本报告
 
@@ -15,6 +15,7 @@
 
 ## 2026-11-21
 
+- 20:02:30 `d8441237` — fix(security): close P0 audit findings and release 3.10.1 — [提交](https://github.com/wangzhen110/omni-memory/commit/bf8d3eda84b7c023975eef16791618b691545830)
 - 18:35:10 `4e6c2131` — fix: order global memory first in project distribution — [提交](https://github.com/wangzhen110/omni-memory/commit/4e6c2131a96352870f0d85c8b2a473a76265b0d2)
 - 18:26:21 `cb621f6e` — feat: real-data memory overview dashboard (3.10.0) — [提交](https://github.com/wangzhen110/omni-memory/commit/cb621f6ea0da13e79c19bc55f129d19a8a930e2d)
 - 16:05:00 `a93221c0` — test: add install and lifecycle coverage — [提交](https://github.com/wangzhen110/omni-memory/commit/a93221c0937f598998383eaa4fa55f435967e228)
