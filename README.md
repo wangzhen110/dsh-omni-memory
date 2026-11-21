@@ -7,7 +7,7 @@
 > **源码/架构**后做商业替代、竞品或商业服务；且**必须署名作者**。
 > 商用请走 [商业授权](#商业授权) 流程。
 
-[![tests](https://img.shields.io/badge/tests-276%2F276-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-280%2F280-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-Personal%20Use%201.1-lightgrey)](LICENSE)
 
 ---
@@ -28,7 +28,7 @@
 
 ## 核心能力
 
-- **混合检索**：词面（FTS5 trigram + 中文二元索引）+ 向量（512 维字符 n-gram，可选接真语义嵌入）+ 图游走，RRF 融合排序；可选 cross-encoder rerank（Jina / Cohere / SiliconFlow / 自建兼容端点）
+- **混合检索**：词面（FTS5 trigram + 中文二元索引）+ 向量（512 维字符 n-gram，可选接真语义嵌入）+ 图游走，RRF 融合排序；可选 cross-encoder rerank（Jina / Cohere / SiliconFlow / 自建兼容端点），只对 top-20 候选做 0..1 归一化后混合，exact problemKey 命中始终优先
 - **会话自动捕获**：`memory_ingest` 把任意宿主的对话轮次落成转录与待审候选；候选先 pending，`memory_candidate` 接受后才成为正式笔记，不让人写库成为唯一入口
 - **经验巩固**：`memory_consolidate` 按 `problemKey` 把多条活跃笔记压成带来源链的摘要；默认 dry-run，应用时只写 `superseded_by`，不删除原行
 - **分层画像**：注入画像显式分为 `## 全局`、`## 当前项目`，事实段单独保留，项目规则不再和全局规则混在一起
@@ -57,7 +57,7 @@
 
 ```bash
 cd /path/to/omni-memory
-npm test          # 276 个用例
+npm test          # 280 个用例
 npm run check     # 语法与 JSON 校验
 ```
 
@@ -111,7 +111,7 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 | `OMNI_EMBED_RETRIES` | `2` | 429/5xx 重试次数（250ms、750ms 退避） |
 | `OMNI_EMBED_TIMEOUT_MS` | `10000` | 远程嵌入超时 |
 | `OMNI_RERANK_PROVIDER` | 未设置 | `cohere` / `jina` / `siliconflow`，自动填 URL 与模型 |
-| `OMNI_RERANK_URL` | 未设置 | 自建或兼容 rerank 端点；未设置则完全跳过重排、零额外延迟 |
+| `OMNI_RERANK_URL` | 未设置 | 自建或兼容 rerank 端点；未设置则完全跳过重排、零额外延迟；只发送 query + top-20 候选正文 |
 | `OMNI_RERANK_KEY` / `OMNI_RERANK_API_KEY` | — | rerank 鉴权 |
 | `OMNI_RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | cross-encoder 模型名 |
 | `OMNI_RERANK_TIMEOUT_MS` | `5000` | rerank 超时；失败时回落到融合排序，不影响主结果 |
@@ -151,12 +151,12 @@ node hosts/cli.mjs context --query "当前任务"   # 给 hooks 拼上下文用
 
 - 数据文件：`$DSH_HOME/memory/omni.db`（SQLite WAL，单文件，备份即复制；**默认明文落盘，未加密**）
 - 所有 HTTP 路由仅绑定 loopback，非本机请求返回 403；写操作只接受 POST，并校验 `Origin` 与 `x-omni-csrf` 头
-- 不主动上传任何内容；只有你显式配置 `OMNI_EMBED_URL` 时，文本才会发送到该嵌入端点；`OMNI_SCOPE_JUDGE` 默认 `off`，不会把写入正文发给模型
+- 不主动上传任何内容；只有显式配置 `OMNI_EMBED_URL`（或远程 `OMNI_EMBED_PROVIDER`）时，文本才会发送到该嵌入端点；只有显式配置 `OMNI_RERANK_*` 时，查询与候选记忆正文才会发送到该重排端点。敏感数据建议用自建端点；默认 hashed 向量 + 无 rerank 完全不出机。`OMNI_SCOPE_JUDGE` 默认 `off`，不会把写入正文发给模型
 - persona 自动刷新默认只用离线规则；只有显式 `useModel: true` 或 `OMNI_PERSONA_MODEL=auto/on` 才调用宿主模型，且证据只取全局层，不读取项目内容
 
 ## 测试与指标
 
-- 自动化用例：**276 / 276 通过**
+- 自动化用例：**280 / 280 通过**
 - 检索延迟（本机复核，Node 22.23.2；标准 bench 已改为 global scope 并断言真实命中）：10,000 行 p95 ≈ **2.4ms**；100,000 行 ≈ 2.4ms；1,000,000 行 ≈ 6.0ms；1M + 5 万向量 + 100 万 bigram ≈ **116.8ms**（两段式有界检索，见 ADR-020）
 - 黄金集（20 语料 / 24 问题）：词面 MRR 0.776 → 混合检索 **0.927**
 
@@ -189,6 +189,7 @@ npm run bench:golden   # 黄金集
 - 远程 embedding 加固与 ANN 边界见 [ADR-025](docs/ADR/025-remote-embedding-and-ann.md)
 - [更新日志](docs/CHANGELOG.md)
 - [3.9.0 自动捕获与巩固完成报告](docs/COMPLETION-2026-11-21.md)
+- [3.9.1 复核问题修复报告](docs/COMPLETION-3.9.1-2026-11-21.md)
 - [架构图](docs/architecture.png)
 
 ## 许可证

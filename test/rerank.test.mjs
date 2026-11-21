@@ -33,6 +33,70 @@ test('rerankRemote sends documents and maps provider scores by index', async () 
   assert.equal(requests[0].headers.authorization, 'Bearer secret');
 });
 
+test('negative rerank logits are normalized instead of silently skipped', async () => {
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const documents = Array.isArray(body.documents) ? body.documents : [];
+      const results = documents.map((text, index) => ({
+        index,
+        relevance_score: String(text).includes('答案乙') ? -0.1 : -0.9,
+      }));
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ results }));
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const oldUrl = process.env.OMNI_RERANK_URL;
+  process.env.OMNI_RERANK_URL = `http://127.0.0.1:${server.address().port}/rerank`;
+  const app = await boot();
+  try {
+    await app.call('memory_write', { kind: 'note', text: '负分查询 答案甲 通用占位', scope: 'proj:alpha' });
+    await app.call('memory_write', { kind: 'note', text: '负分查询 答案乙 精确占位', scope: 'proj:alpha' });
+    const result = await app.call('memory_search', { query: '负分查询 答案甲', scope: 'proj:alpha', limit: 5, rerank: true });
+    assert.equal(result.value.hits[0].text.includes('答案乙'), true);
+  } finally {
+    if (oldUrl === undefined) delete process.env.OMNI_RERANK_URL; else process.env.OMNI_RERANK_URL = oldUrl;
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('an exact problemKey hit is not buried by a reranker preference', async () => {
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const documents = Array.isArray(body.documents) ? body.documents : [];
+      const results = documents.map((text, index) => ({
+        index,
+        relevance_score: String(text).includes('普通结论') ? 0.99 : 0.01,
+      }));
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ results }));
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const oldUrl = process.env.OMNI_RERANK_URL;
+  process.env.OMNI_RERANK_URL = `http://127.0.0.1:${server.address().port}/rerank`;
+  const app = await boot();
+  try {
+    const exact = await app.call('memory_write', {
+      kind: 'note', text: '部署失败 精确结论 检查端口', scope: 'proj:alpha', problemKey: 'deploy.fail',
+    });
+    await app.call('memory_write', { kind: 'note', text: '部署失败 普通结论 无关内容', scope: 'proj:alpha' });
+    const result = await app.call('memory_search', {
+      query: '部署失败 检查端口', problemKey: 'deploy.fail', scope: 'proj:alpha', limit: 5, rerank: true,
+    });
+    assert.equal(result.value.hits[0].id, exact.value.id);
+  } finally {
+    if (oldUrl === undefined) delete process.env.OMNI_RERANK_URL; else process.env.OMNI_RERANK_URL = oldUrl;
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 test('memory_search applies the optional reranker before finalizing hits', async () => {
   const received = [];
   const server = http.createServer((req, res) => {

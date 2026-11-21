@@ -25,3 +25,11 @@ test('extraction is capped at three per chunk and ignores non-dialogue roles', (
   assert.equal(extractCandidateTexts(text, 'user').length, 3);
   assert.equal(extractCandidateTexts(text, 'system').length, 0);
 });
+
+test('English periods split sentences and long English transcripts are not dropped', () => {
+  const short = 'Remember to back up. Always verify restore. Must avoid data loss.';
+  assert.equal(candidateSentences(short).length, 3);
+  const long = Array.from({ length: 20 }, (_, i) => `Rule ${i} must be followed.`).join(' ');
+  assert.ok(long.length > 400);
+  assert.ok(extractCandidateTexts(long, 'user').length >= 1);
+});

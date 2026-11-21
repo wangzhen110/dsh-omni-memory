@@ -192,9 +192,21 @@ function classifyScope(text, project) {
   return { scope: project, reason: 'default-to-project', confidence: 0.55 };
 }
 
+function normalizeScopeInput(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  const lower = raw.toLowerCase();
+  return lower === 'all' || lower === 'project' || lower === 'global' ? lower : raw;
+}
+
 function decideScope(explicit, text, project = currentProject()) {
-  const given = String(explicit ?? '').trim();
+  const given = normalizeScopeInput(explicit);
   if (given === 'all') throw new Error('scope=all is read-only; choose global or a project scope');
+  if (given === 'project') {
+    return project
+      ? { scope: project, reason: 'explicit', confidence: 1 }
+      : { scope: SCOPE_GLOBAL, reason: 'no-project', confidence: 1 };
+  }
   if (given) return { scope: given === SCOPE_GLOBAL ? SCOPE_GLOBAL : given, reason: 'explicit', confidence: 1 };
   return classifyScope(text, project);
 }
@@ -1268,7 +1280,7 @@ function mergeSnapshot(s, snapshot, options = {}) {
   const edgeExists = prepareCached(s.db, "SELECT id FROM edges WHERE src = ? AND rel = ? AND dst = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global')");
   const candidateExists = prepareCached(s.db, `
     SELECT id FROM note_candidates
-    WHERE hash = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global') AND status = 'pending'
+    WHERE hash = ? AND IFNULL(scope, 'global') = IFNULL(?, 'global')
   `);
 
   for (const note of Array.isArray(snapshot.notes) ? snapshot.notes : []) {
@@ -1571,7 +1583,7 @@ function insertChunk(s, input) {
 
 const CANDIDATE_ROLES = new Set(['user', 'assistant', 'system', 'tool', 'note']);
 function resolveTranscriptScope(input, toolContext) {
-  const requested = String(input.scope ?? '').trim();
+  const requested = normalizeScopeInput(input.scope);
   if (requested === 'all') throw new Error('transcripts cannot be written to scope=all');
   if (requested === 'project') return currentProject(toolContext) ?? SCOPE_GLOBAL;
   if (requested) return requested;
@@ -1661,7 +1673,7 @@ export function ingestTranscript(input = {}, toolContext = {}) {
 }
 
 function candidateScope(options = {}, toolContext = {}) {
-  const requested = String(options.scope ?? '').trim();
+  const requested = normalizeScopeInput(options.scope);
   if (requested === 'all') return null;
   if (requested === 'project') return 'project';
   if (requested) return requested;
@@ -1724,7 +1736,12 @@ function writeCandidateNote(row) {
     WHERE scope = ? AND text = ? AND deleted_at IS NULL AND superseded_by IS NULL
   `).get(scope, text);
   if (existing) return { id: Number(existing.id), deduped: true };
-  const ts = now();
+  const candidateTs = Number(row.ts);
+  const ts = Number.isFinite(candidateTs) && candidateTs > 0 ? candidateTs : now();
+  const confidence = Number(row.confidence);
+  const importance = Number.isFinite(confidence)
+    ? Number(Math.min(0.9, Math.max(0.3, 0.4 + confidence * 0.4)).toFixed(3))
+    : 0.55;
   const source = row.source ? `${row.source} · candidate:${row.id}` : `candidate:${row.id}`;
   const result = transaction(s.db, () => {
     const raced = prepareCached(s.db, `
@@ -1735,7 +1752,7 @@ function writeCandidateNote(row) {
     const info = prepareCached(s.db, `
       INSERT INTO notes(ts, scope, text, importance, source)
       VALUES (?, ?, ?, ?, ?)
-    `).run(ts, scope, text, 0.55, source);
+    `).run(ts, scope, text, importance, source);
     const noteId = Number(info.lastInsertRowid);
     if (s.fts.notes) {
       try { prepareCached(s.db, 'INSERT INTO notes_fts(rowid, text) VALUES (?, ?)').run(noteId, text); } catch { /* index best effort */ }
@@ -1789,7 +1806,7 @@ export function consolidateProblemNotes(problemKey, options = {}, toolContext = 
   const s = openStore();
   const key = normalizeProblemKey(problemKey);
   if (!key) throw new Error('problemKey is required');
-  const requested = String(options.scope ?? '').trim();
+  const requested = normalizeScopeInput(options.scope);
   if (requested === 'all' || requested === 'project') {
     throw new Error('consolidation needs one exact scope; all/project would mix layers');
   }
@@ -2654,22 +2671,23 @@ function finalizeHits(ranked, limit) {
   const hits = [];
   // A transcript chunk is evidence, not the conclusion. When an accepted note
   // and its source chunk collapse to the same text, keep the note visible in
-  // search instead of letting the raw chunk shadow it.
+  // search instead of letting the raw chunk shadow it. Do not stop at `limit`:
+  // a higher-priority duplicate may appear later in the ranked list.
   const kindPriority = hit => hit.kind === 'note' ? 3 : hit.kind === 'fact' ? 2 : 1;
+  const textKey = hit => String(hit.text).replace(/\s+/g, '').slice(0, 120);
   for (const hit of ranked) {
-    if (hits.length >= limit) break;
-    const key = String(hit.text).replace(/\s+/g, '').slice(0, 120);
-    if (seen.has(key)) {
-      const existing = hits.findIndex(item => String(item.text).replace(/\s+/g, '').slice(0, 120) === key);
-      if (existing >= 0 && kindPriority(hit) > kindPriority(hits[existing])) {
-        hits[existing] = hit;
-      }
+    const key = textKey(hit);
+    const existing = hits.findIndex(item => textKey(item) === key);
+    if (existing >= 0) {
+      if (kindPriority(hit) > kindPriority(hits[existing])) hits[existing] = hit;
       continue;
     }
-    seen.add(key);
-    hits.push(hit);
+    if (hits.length < limit) {
+      seen.add(key);
+      hits.push(hit);
+    }
   }
-  return { total: hits.length, hits };
+  return { total: hits.length, hits: hits.sort((a, b) => Number(b.score ?? 0) - Number(a.score ?? 0)) };
 }
 
 /** Reciprocal rank fusion of the lexical and vector routes. */
@@ -2856,24 +2874,56 @@ function graphExpand(s, hits, limit, scope) {
 let lastSearchProfile = null;
 
 /**
- * Optional cross-encoder pass. No endpoint means no extra latency. Scores are
- * blended with the fused rank so a reranker cannot erase a strong exact hit
- * (problemKey matches already carry an explicit boost).
+ * Normalize a score vector to 0..1. A constant vector carries no ranking
+ * signal and maps to 0.5; non-finite values are rejected by the caller.
+ */
+function normalizeScoreVector(values) {
+  const numbers = values.map(value => Number(value));
+  if (!numbers.length || !numbers.every(Number.isFinite)) return null;
+  const min = Math.min(...numbers);
+  const max = Math.max(...numbers);
+  if (max === min) return numbers.map(() => 0.5);
+  return numbers.map(value => (value - min) / (max - min));
+}
+
+function compareRerankedHits(a, b) {
+  // An exact problemKey hit is a hard priority, not a soft bonus: a paid
+  // reranker must not bury the one note that matches the caller's problem.
+  const exact = Number(Boolean(b.exactProblem)) - Number(Boolean(a.exactProblem));
+  if (exact) return exact;
+  return Number(b.score ?? 0) - Number(a.score ?? 0);
+}
+
+const MAX_RERANK_CANDIDATES = 20;
+
+/**
+ * Optional cross-encoder pass. No endpoint means no extra latency. Only the
+ * top candidates are sent (cost bound), both score scales are normalized to
+ * 0..1 before blending, and exact problemKey hits sort first regardless of the
+ * reranker. Failure falls back to the original fused order.
  */
 async function maybeRerank(query, ranked, limit, options = {}) {
   if (options.rerank === false) return ranked;
   const config = rerankConfig();
   if (config.kind !== 'remote' || ranked.length < 2) return ranked;
+  const top = ranked.slice(0, MAX_RERANK_CANDIDATES);
+  const rest = ranked.slice(MAX_RERANK_CANDIDATES);
   try {
-    const scores = await rerankRemote(query, ranked.map(hit => String(hit.text ?? '')), config);
-    if (!scores || !scores.some(score => score > 0)) return ranked;
-    return ranked
-      .map((hit, index) => ({
-        ...hit,
-        rerankScore: Number((scores[index] ?? 0).toFixed(6)),
-        score: Number(((Number(hit.score ?? 0) * 0.25) + ((scores[index] ?? 0) * 0.75) + (hit.exactProblem ? 0.25 : 0)).toFixed(6)),
-      }))
-      .sort((a, b) => b.score - a.score);
+    const scores = await rerankRemote(query, top.map(hit => String(hit.text ?? '')), config);
+    if (!Array.isArray(scores) || scores.length !== top.length) return ranked;
+    const finite = scores.map(value => Number(value)).filter(Number.isFinite);
+    // All-zero or all-equal outputs mean the provider produced no ranking
+    // signal; negative logits are valid and get normalized below.
+    if (!finite.length || finite.every(value => value === finite[0]) || finite.every(value => value === 0)) return ranked;
+    const rerankNorm = normalizeScoreVector(scores);
+    const baseNorm = normalizeScoreVector(top.map(hit => Number(hit.score ?? 0)));
+    if (!rerankNorm || !baseNorm) return ranked;
+    const reranked = top.map((hit, index) => ({
+      ...hit,
+      rerankScore: Number((Number(scores[index] ?? 0)).toFixed(6)),
+      score: Number((baseNorm[index] * 0.25 + rerankNorm[index] * 0.75 + (hit.exactProblem ? 0.25 : 0)).toFixed(6)),
+    })).sort(compareRerankedHits);
+    return [...reranked, ...rest].sort(compareRerankedHits);
   } catch {
     return ranked;
   }
@@ -3287,6 +3337,11 @@ function capProfileLines(lines) {
     lines.pop();
     text = lines.join('\n');
   }
+  // Budget pressure must not leave a section heading with no rows beneath it.
+  while (lines.length && /^##\s/.test(lines[lines.length - 1])) {
+    lines.pop();
+    text = lines.join('\n');
+  }
   return text;
 }
 
@@ -3331,23 +3386,23 @@ function buildProfileText(projectKey, options = {}) {
   const projectRows = projectKey
     ? visible.filter(row => String(row.scope ?? SCOPE_GLOBAL) === projectKey)
     : [];
-  if (globalRows.length) {
-    addLine('## 全局');
-    for (const row of globalRows) addLine(`- ${row.text}`);
-  }
-  if (projectRows.length) {
-    addLine('## 当前项目');
-    for (const row of projectRows) addLine(`- ${row.text}`);
-  }
+  const addSection = (title, items) => {
+    if (!items.length) return;
+    // Don't spend budget on a heading unless at least one row can follow it.
+    if (used + title.length + `- ${items[0].text}`.length > PROFILE_BUDGET) return;
+    addLine(title);
+    for (const row of items) {
+      if (addLine(`- ${row.text}`) === false) break;
+    }
+  };
+  addSection('## 全局', globalRows);
+  addSection('## 当前项目', projectRows);
   if (includeAll) {
     const otherRows = visible.filter(row => {
       const scope = String(row.scope ?? SCOPE_GLOBAL);
       return scope !== SCOPE_GLOBAL && scope !== projectKey;
     });
-    if (otherRows.length) {
-      addLine('## 其他项目');
-      for (const row of otherRows) addLine(`- ${row.text}`);
-    }
+    addSection('## 其他项目', otherRows);
   }
 
   for (const line of profileFactLines(s.db, projectKey || SCOPE_GLOBAL, PROFILE_BUDGET - used)) {
@@ -4193,7 +4248,7 @@ function defineTools(ctx) {
       if (!['all', 'note', 'fact', 'chunk'].includes(requestedKind)) {
         throw new Error('kind must be all, note, fact, or chunk');
       }
-      const requested = String(args.scope ?? '').trim();
+      const requested = normalizeScopeInput(args.scope);
       // Retrieval judgement: an explicit request wins; otherwise scope to the
       // current project (plus the global layer), never to every project.
       const scope = requested === 'all' ? null : (requested || currentProject(toolContext) || SCOPE_GLOBAL);
@@ -4328,7 +4383,7 @@ function defineTools(ctx) {
       if (!Number.isFinite(id) || id <= 0) throw new Error('id is required');
       const rating = String(args.rating ?? '').trim().toLowerCase();
       if (rating !== 'useful' && rating !== 'misleading') throw new Error('rating must be useful or misleading');
-      const requestedScope = String(args.scope ?? '').trim();
+      const requestedScope = normalizeScopeInput(args.scope);
       if (requestedScope && requestedScope !== 'all') throw new Error('scope only supports all; omit it for the current project plus global');
       const scope = requestedScope === 'all' ? null : (currentProject(toolContext) || SCOPE_GLOBAL);
       const s = openStore();
@@ -4405,7 +4460,7 @@ function defineTools(ctx) {
       const items = Array.isArray(args.items) ? args.items : [];
       if (!items.length) throw new Error('items must contain at least one item');
       if (items.length > 20) throw new Error('items may contain at most 20 entries');
-      const requested = String(args.scope ?? '').trim();
+      const requested = normalizeScopeInput(args.scope);
       const scope = requested === 'all' ? null : (requested || currentProject(toolContext) || SCOPE_GLOBAL);
       const s = openStore();
       const loaded = [];
@@ -4492,7 +4547,7 @@ function defineTools(ctx) {
       const text = String(args.text ?? '').trim();
       if (!text) throw new Error('text is required');
       if (text.length > 4000) throw new Error(`note is ${text.length} characters; split it into smaller notes (max 4000)`);
-      const requestedScope = String(args.scope ?? '').trim();
+      const requestedScope = normalizeScopeInput(args.scope);
       if (requestedScope && requestedScope !== 'all') throw new Error('scope only supports all; omit it for the current project plus global');
       const scope = requestedScope === 'all' ? null : (currentProject(toolContext) || SCOPE_GLOBAL);
       const s = openStore();
@@ -4806,7 +4861,7 @@ function defineTools(ctx) {
     },
     async execute(args = {}, toolContext = {}) {
       const s = openStore();
-      const requested = String(args.scope ?? '').trim();
+      const requested = normalizeScopeInput(args.scope);
       const includeAll = requested === 'all';
       const projectKey = requested === 'all' || requested === 'global'
         ? null
@@ -4864,7 +4919,7 @@ function defineTools(ctx) {
       // Facts are stored under their canonical subject; object values are not
       // canonicalised, so both spellings are matched.
       const name = canonicalEntity(s.db, rawName);
-      const requested = String(args.scope ?? '').trim();
+      const requested = normalizeScopeInput(args.scope);
       const scope = requested === 'all' ? null : (requested || currentProject(toolContext) || SCOPE_GLOBAL);
       const factFilter = scope ? scopeClause('scope', scope) : { sql: '', params: [] };
       const noteFilter = scope ? scopeClause('scope', scope, false) : { sql: '', params: [] };
@@ -5098,7 +5153,7 @@ function registerRoutes(ctx) {
         return json(res, 405, { ok: false, error: 'packet requires GET' });
       }
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-      const requestedScope = String(url.searchParams.get('scope') ?? '').trim();
+      const requestedScope = normalizeScopeInput(url.searchParams.get('scope'));
       const cwd = String(url.searchParams.get('cwd') ?? '').trim();
       const scopeLabel = requestedScope || (cwd ? projectKeyFromCwd(cwd) : SCOPE_GLOBAL);
       const scope = requestedScope === 'all' ? null : (requestedScope || (cwd ? projectKeyFromCwd(cwd) : SCOPE_GLOBAL));
@@ -5294,7 +5349,7 @@ function registerRoutes(ctx) {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit') ?? 40)));
       const offset = Math.max(0, Number(url.searchParams.get('offset') ?? 0));
-      const scopeFilter = String(url.searchParams.get('scope') ?? 'all');
+      const scopeFilter = normalizeScopeInput(url.searchParams.get('scope') || 'all');
       // The working list shows live memory; `audit=1` keeps superseded notes and
       // expired facts browsable for review without mixing them into recall.
       const audit = String(url.searchParams.get('audit') ?? '') === '1';
@@ -5436,7 +5491,7 @@ function registerRoutes(ctx) {
       if (!isLoopback(req)) return json(res, 403, { ok: false });
       const s = openStore();
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-      const requested = String(url.searchParams.get('scope') ?? 'global').trim();
+      const requested = normalizeScopeInput(url.searchParams.get('scope') || 'global');
 
       // One map per layer: the global map and one per project. `all` merges them.
       const clause = requested === 'all'
@@ -5537,7 +5592,7 @@ function registerRoutes(ctx) {
       const s = openStore();
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       const node = String(url.searchParams.get('node') ?? '').trim();
-      const requestedScope = String(url.searchParams.get('scope') ?? '').trim();
+      const requestedScope = normalizeScopeInput(url.searchParams.get('scope'));
       const scope = requestedScope === 'all' ? null : (requestedScope || SCOPE_GLOBAL);
       const noteFilter = scope ? scopeClause('scope', scope, false) : { sql: '', params: [] };
       const factFilter = scope ? scopeClause('scope', scope) : { sql: '', params: [] };
@@ -5750,7 +5805,7 @@ function registerRoutes(ctx) {
       const query = url.searchParams.get('q') ?? '';
       if (!queryTerms(query).length) return json(res, 200, { ok: true, hits: [] });
       const limit = Math.min(60, Math.max(1, Number(url.searchParams.get('limit') ?? 30)));
-      const requestedScope = String(url.searchParams.get('scope') ?? '').trim();
+      const requestedScope = normalizeScopeInput(url.searchParams.get('scope'));
       // A bare HTTP request gets global only. "all" is an explicit audit choice;
       // project keys include that project plus global.
       const scope = requestedScope === 'all' ? null : (requestedScope || SCOPE_GLOBAL);

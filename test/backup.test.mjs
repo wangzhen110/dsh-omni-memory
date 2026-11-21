@@ -117,6 +117,14 @@ test('export and import keep pending candidates', async () => {
     id: listed.value.candidates.find(candidate => candidate.text.includes('备份候选')).id,
   });
   assert.equal(accepted.value.status, 'accepted');
+
+  await target.call('memory_import', { path: file, dryRun: false });
+  const after = await target.call('memory_candidate', { action: 'list', status: 'all', scope: 'all' });
+  assert.equal(
+    after.value.candidates.filter(candidate => candidate.status === 'pending' && candidate.text.includes('备份候选')).length,
+    0,
+    're-importing a stale pending snapshot must not revive a reviewed candidate',
+  );
 });
 
 test('import remaps superseded_by pointers instead of keeping stale ids', async () => {

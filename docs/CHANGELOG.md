@@ -2,6 +2,19 @@
 
 格式遵循 Keep a Changelog；版本遵循语义化。可靠性 = `npm test` 通过率。
 
+## [3.9.1] — 2026-11-21
+
+### 修复 · 复核发现的边界问题
+- **英文自动捕获（B1）**：`lib/capture-rules.mjs` 改用 `Intl.Segmenter` 分句，英文句点、缩写和中文标点都能正确拆分；长英文转录不再被当成单条 >400 字符整段丢弃。
+- **备份候选幂等（B2）**：`memory_import` 的候选去重改为按 `hash + scope` 查任意状态，旧 pending 快照不会把本地已接受/已拒绝的候选重新灌回队列。
+- **scope 大小写（B3）**：`all` / `project` / `global` 在写入、ingest、候选、巩固、搜索、列表等入口统一大小写归一化；`ALL`、`All` 不再能绕过 `scope=all` 拒写。
+- **rerank 分数（M-2）**：原融合分与 rerank 分先各自归一化到 0..1，再按 25/75 混合；exact `problemKey` 命中改为硬优先排序，不再被高分弱命中反超。负 logits 不再被 `score > 0` 误判为无信号；只对 top-20 候选调用重排，成本有上限。
+- **隐私告知（M-1）**：README、DESIGN NFR-08、THREAT-MODEL 明确说明 `OMNI_RERANK_*` 会外发 query 与候选正文，敏感数据建议自建端点。
+- **候选字段保真（F1）**：accept 落 note 时保留候选原始 `ts`，并用 `confidence` 映射 `importance`，不再硬编码 0.55 / now()。
+- **满结果去重（低）**：`finalizeHits` 不再在达到 limit 时提前退出，排位靠后的 note/fact 仍可替换同文本 chunk，替换后按分数重排。
+- **画像边界（低）**：`capProfileLines` 清理尾部空标题；`addSection` 只有标题加首条内容能放下时才写标题，避免空的 `## 当前项目`。
+- 测试：新增英文拆句 1、scope 大小写 1、rerank 负分 1、exact 保护 1；完整 `npm test` **280/280** 通过；`npm run check` 文档计数同步为 23 工具、20 路由、schema v13、3.9.1。
+
 ## [3.9.0] — 2026-11-21
 
 ### 新增 · 自动捕获、经验巩固与检索重排

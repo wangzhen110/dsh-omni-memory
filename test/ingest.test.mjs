@@ -18,6 +18,16 @@ test('memory_ingest stores a transcript and parks pending candidates', async () 
   assert.match(queue.value.candidates[0].text, /7788/);
 });
 
+test('scope=all guard is case-insensitive for transcripts', async () => {
+  const app = await boot();
+  for (const scope of ['ALL', 'All']) {
+    await assert.rejects(
+      () => app.call('memory_ingest', { text: '记住：这条不应写入。', role: 'user', scope }),
+      /scope=all/,
+    );
+  }
+});
+
 test('candidate acceptance writes a normal note with provenance', async () => {
   const app = await boot();
   const result = await app.call('memory_ingest', {
@@ -35,6 +45,10 @@ test('candidate acceptance writes a normal note with provenance', async () => {
   const note = await app.call('memory_get', { items: [{ kind: 'note', id: accepted.value.noteId }], scope: 'global' });
   assert.equal(note.value.items[0].text, candidate.text);
   assert.match(note.value.items[0].source, /chunk:/);
+  const queue = await app.call('memory_candidate', { action: 'list', status: 'all', scope: 'global' });
+  const reviewed = queue.value.candidates.find(item => item.id === candidate.id);
+  assert.equal(note.value.items[0].ts, reviewed.ts, 'accepted note must keep the candidate timestamp');
+  assert.ok(note.value.items[0].importance >= 0.3, 'candidate confidence must map to importance');
   const search = await app.call('memory_search', { query: '候选队列先确认再入库', scope: 'global' });
   assert.ok(search.value.hits.some(hit => hit.kind === 'note' && hit.id === accepted.value.noteId), 'accepted note should not be shadowed by its source chunk');
 });
